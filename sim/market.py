@@ -10,8 +10,8 @@ Impact model
   net_order  = sum(all agent orders)
   impact     = net_order / total_capital * impact_coeff + drift_per_bar
   next_open  = last_close * exp(impact)
-  intra-bar  = ATR-based t-distributed noise  (df=4, fat tails)
-  close      = open + intra_bar_noise
+  intra-bar  = ATR-based t-dist noise, clipped to [-3, 3] sigma  (fat tails, no explosion)
+  close      = open + intra_bar_noise  (floored at last_close * 0.5)
   high/low   = body +/- t-distributed wick
 """
 
@@ -39,6 +39,12 @@ def total_capital(agents) -> float:
     return sum(abs(a.capital) for a in agents)
 
 
+# Normalisation constant: std of t(df=4) = sqrt(df/(df-2)) = sqrt(2)
+_T4_STD = float(np.sqrt(2.0))
+# Hard clip for t-draws: preserves fat tails up to 3-sigma, prevents runaway
+_T_CLIP = 3.0
+
+
 class MarketEngine:
     """
     Advances the market by one bar per step() call.
@@ -46,13 +52,11 @@ class MarketEngine:
     Parameters
     ----------
     impact_coeff : float
-        Sensitivity of price to net order flow.
-        Reasonable range: 0.0001 ~ 0.005
+        Sensitivity of price to net order flow.  Range: 0.0001 ~ 0.005
     intra_noise_scale : float
-        ATR multiplier for intra-bar volatility (controls High/Low spread).
+        ATR multiplier for intra-bar volatility.
     drift_per_bar : float
         Per-bar log-return drift estimated from warmup history.
-        Injected by simulation.py so the engine tracks the underlying trend.
     volume_base : float
         Base volume for simulated bars.
     """
@@ -60,7 +64,7 @@ class MarketEngine:
     def __init__(
         self,
         agents: list,
-        impact_coeff: float = 0.0005,
+        impact_coeff: float = 0.001,
         intra_noise_scale: float = 1.0,
         drift_per_bar: float = 0.0,
         volume_base: float = 1e6,
@@ -73,6 +77,11 @@ class MarketEngine:
         self.volume_base       = volume_base
         self.rng               = np.random.default_rng(seed)
         self._total_cap        = total_capital(agents)
+
+    def _t_draw(self) -> float:
+        """Draw from t(df=4), clip to [-_T_CLIP, _T_CLIP], normalise to unit std."""
+        raw = float(self.rng.standard_t(df=4))
+        return np.clip(raw, -_T_CLIP, _T_CLIP) / _T4_STD
 
     def step(
         self,
@@ -100,7 +109,7 @@ class MarketEngine:
         }
 
         # Collect orders
-        orders = np.array([a.decide(state) for a in self.agents], dtype=float)
+        orders    = np.array([a.decide(state) for a in self.agents], dtype=float)
         net_order = float(np.sum(orders))
 
         # Market impact + drift -> next open
@@ -109,22 +118,23 @@ class MarketEngine:
         last_close   = float(close_history[-1])
         new_open     = last_close * np.exp(total_impact)
 
-        # Intra-bar noise: t-distribution (df=4) for fat tails
-        intra_vol   = atr * self.intra_noise_scale
-        t_draw      = float(self.rng.standard_t(df=4))
-        # Scale t-draw so its std matches intra_vol
-        # std of t(df=4) = sqrt(df/(df-2)) = sqrt(2)
-        intra_move  = t_draw / np.sqrt(2.0) * intra_vol
-        new_close   = new_open + intra_move
+        # Intra-bar noise: clipped t(df=4), normalised to unit std
+        intra_vol  = atr * self.intra_noise_scale
+        intra_move = self._t_draw() * intra_vol
+        new_close  = new_open + intra_move
+        # Guard: close must stay above 50% of last close (prevents negative / runaway)
+        new_close  = max(new_close, last_close * 0.5)
 
-        # High / Low: body + t-distributed wick
-        body_high = max(new_open, new_close)
-        body_low  = min(new_open, new_close)
+        # High / Low: body + clipped-t wick
+        body_high  = max(new_open, new_close)
+        body_low   = min(new_open, new_close)
         wick_scale = atr * 0.3
-        upper_wick = abs(float(self.rng.standard_t(df=4)) / np.sqrt(2.0) * wick_scale)
-        lower_wick = abs(float(self.rng.standard_t(df=4)) / np.sqrt(2.0) * wick_scale)
+        upper_wick = abs(self._t_draw() * wick_scale)
+        lower_wick = abs(self._t_draw() * wick_scale)
         new_high   = body_high + upper_wick
         new_low    = body_low  - lower_wick
+        # Low can't go negative
+        new_low    = max(new_low, last_close * 0.01)
 
         # Volume: proportional to |net_order|
         vol_factor = 1.0 + abs(net_order) / max(self._total_cap, 1e-6) * 5

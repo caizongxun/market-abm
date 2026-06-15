@@ -6,6 +6,7 @@ Main entry point: fetch data -> run simulation -> print stats -> (optional) plot
 Usage
 -----
   python run_sim.py --symbol AAPL --bars 200 --plot
+  python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-01-01 --bars 60 --plot
   python run_sim.py --symbol TSLA --bars 150 --warmup 120 --seed 0
   python run_sim.py --symbol SPY  --bars 200 --impact 0.001 --noise 1.0 --plot
 """
@@ -20,7 +21,6 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 
@@ -36,7 +36,14 @@ def parse_args():
     p.add_argument("--symbol",  default="AAPL",  help="Ticker symbol")
     p.add_argument("--bars",    type=int, default=200,   help="Number of bars to simulate")
     p.add_argument("--warmup",  type=int, default=100,   help="Warm-up history bars")
-    p.add_argument("--years",   type=int, default=3,     help="Years of history to download")
+    p.add_argument("--years",   type=int, default=3,     help="Years of history to download (ignored if --start/--end given)")
+    # Date range (optional; overrides --years)
+    p.add_argument("--start",   default=None,
+                   help="Fetch start date YYYY-MM-DD.  "
+                        "The first (total - bars) rows become warmup+train; "
+                        "the last (bars) rows are the real comparison target.")
+    p.add_argument("--end",     default=None,
+                   help="Fetch end date YYYY-MM-DD (default: today)")
     p.add_argument("--impact",  type=float, default=0.001,  help="Market impact coefficient")
     p.add_argument("--noise",   type=float, default=1.0,    help="Intra-bar ATR noise scale")
     p.add_argument("--seed",    type=int,   default=42,     help="Random seed")
@@ -174,18 +181,27 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Fetch historical data
-    end_date   = date.today().strftime("%Y-%m-%d")
-    start_date = (date.today() - timedelta(days=args.years * 365 + 60)).strftime("%Y-%m-%d")
+    # 1. Resolve date range
+    end_date = args.end if args.end else date.today().strftime("%Y-%m-%d")
+    if args.start:
+        start_date = args.start
+    else:
+        start_date = (date.today() - timedelta(days=args.years * 365 + 60)).strftime("%Y-%m-%d")
+
+    print(f"[fetch] range: {start_date} ~ {end_date}")
     df_all = fetch_ohlcv(args.symbol, start_date, end_date)
 
     if len(df_all) < args.warmup + args.bars:
         print(f"[warn] Not enough data: need {args.warmup + args.bars} bars, got {len(df_all)}")
-        print("       Increase --years or reduce --bars / --warmup")
+        print("       Increase --years or widen --start/--end, or reduce --bars / --warmup")
         sys.exit(1)
 
+    # Split: everything except last (bars) rows -> train; last (bars) rows -> real comparison
     df_train       = df_all.iloc[:-(args.bars)].copy()
     df_real_future = df_all.iloc[-(args.bars):].copy().reset_index(drop=True)
+    print(f"[data] train rows: {len(df_train)}  "
+          f"real comparison rows: {len(df_real_future)}  "
+          f"({df_real_future['Date'].iloc[0].date()} ~ {df_real_future['Date'].iloc[-1].date()})")
 
     # 2. Run simulation
     print(f"\n[sim] {args.symbol}  warmup={args.warmup}  sim_bars={args.bars}  "
