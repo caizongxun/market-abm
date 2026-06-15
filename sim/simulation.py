@@ -26,7 +26,12 @@ auto_drift 模式（預設開啟）
 Rolling calibration
 -------------------
 見 sim/regime.py 的 RegimeCalibrator。
-run_simulation_rolling() 是藄藄的 wrapper，讓 run_sim.py 用 --rolling flag 呼叫。
+run_simulation_rolling() 是薄 wrapper，讓 run_sim.py 用 --rolling flag 呼叫。
+
+Window 接縫對齊
+---------------
+initial_price 參數讓 MarketEngine 以指定價格作為第一根 bar 的 last_close，
+消除 rolling window 拼接時的價格跳層。
 """
 
 from __future__ import annotations
@@ -94,6 +99,7 @@ def run_simulation(
     seed: int | None = 42,
     agents: list[BaseAgent] | None = None,
     path_floor_pct: float = 0.30,
+    initial_price: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     執行一次 ABM 模擬。
@@ -109,6 +115,10 @@ def run_simulation(
         自動把 momentum_bias 注入 drift schedule（逐 bar 歸零）。
     path_floor_pct : float
         路徑級別 floor：任何 bar 的 close 不得低於起始 close * (1 - path_floor_pct)。
+    initial_price : float | None
+        若指定，MarketEngine 以此價格作為第一根 bar 的 last_close，
+        覆蓋 close_history[-1]。用於 rolling window 接縫對齊：
+        傳入前一個 window 最後一根真實收盤價，確保模擬路徑從正確水位出發。
 
     Returns
     -------
@@ -125,8 +135,7 @@ def run_simulation(
     start_close    = float(closes[-1])
     path_min_price = start_close * (1.0 - path_floor_pct) if path_floor_pct > 0 else 0.0
 
-    # --- 取最後一根 bar 的日期，公尤兩種封載格式 ---
-    # df_real 可能是 DatetimeIndex 或是含 Date 欄的整數 index
+    # --- 取最後一根 bar 的日期，支援兩種載入格式 ---
     _tail = df_real.tail(1)
     if isinstance(_tail.index, pd.DatetimeIndex):
         last_date = pd.Timestamp(_tail.index[-1])
@@ -171,6 +180,7 @@ def run_simulation(
         intra_noise_scale=intra_noise_scale,
         drift_per_bar=drift_per_bar,
         seed=int(rng.integers(0, 2**31)),
+        initial_price=initial_price,   # 接縫對齊
     )
 
     rows = []

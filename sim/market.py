@@ -59,6 +59,9 @@ class MarketEngine:
         Per-bar log-return drift estimated from warmup history.
     volume_base : float
         Base volume for simulated bars.
+    initial_price : float | None
+        若指定，則 MarketEngine 以此價格作為第一根 bar 的 last_close，
+        覆蓋 close_history[-1]。用於 rolling window 接縫對齊。
     """
 
     def __init__(
@@ -69,6 +72,7 @@ class MarketEngine:
         drift_per_bar: float = 0.0,
         volume_base: float = 1e6,
         seed: int | None = None,
+        initial_price: float | None = None,
     ):
         self.agents            = agents
         self.impact_coeff      = impact_coeff
@@ -77,6 +81,8 @@ class MarketEngine:
         self.volume_base       = volume_base
         self.rng               = np.random.default_rng(seed)
         self._total_cap        = total_capital(agents)
+        self._initial_price    = initial_price   # 接縫對齊用，只在第一根 bar 生效
+        self._first_step_done  = False
 
     def _t_draw(self) -> float:
         """Draw from t(df=4), clip to [-_T_CLIP, _T_CLIP], normalise to unit std."""
@@ -115,7 +121,14 @@ class MarketEngine:
         # Market impact + drift -> next open
         order_impact = (net_order / max(self._total_cap, 1e-6)) * self.impact_coeff
         total_impact = order_impact + self.drift_per_bar
-        last_close   = float(close_history[-1])
+
+        # 接縫對齊：第一根 bar 使用 initial_price 覆蓋 close_history[-1]
+        if self._initial_price is not None and not self._first_step_done:
+            last_close = self._initial_price
+            self._first_step_done = True
+        else:
+            last_close = float(close_history[-1])
+
         new_open     = last_close * np.exp(total_impact)
 
         # Intra-bar noise: clipped t(df=4), normalised to unit std
