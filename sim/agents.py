@@ -41,35 +41,57 @@ class BaseAgent(ABC):
         self.pnl += self.position * price_change
 
     def reset_state(self) -> None:
-        """Reset internal memory buffers to neutral.
-        Called before simulation starts so warmup regime doesn't bias agents.
-        Subclasses override if they carry stateful buffers.
-        """
         self.position = 0.0
         self.pnl      = 0.0
 
 
 # ---------------------------------------------------------------------------
-# 1. InstitutionAgent  —  均值回歸
+# 1. InstitutionAgent  —  均值回歸 + trend_guard
 # ---------------------------------------------------------------------------
 class InstitutionAgent(BaseAgent):
+    """
+    均值回歸法人。
+
+    trend_guard_window / trend_guard_threshold
+    ------------------------------------------
+    計算最近 trend_guard_window 根的累積 log-return。
+    若絕對值超過 trend_guard_threshold，代表短期趨勢明確，
+    Institution 此時不逆勢做均值回歸，直接觀望（return 0）。
+
+    這防止了「价格連跌 → Institution 持續買進 → 結構性托底」的問題。
+    設 trend_guard_window=0 可完全關閉此功能（向後相容）。
+    """
+
     def __init__(
         self,
         capital: float = 10.0,
         ma_window: int = 20,
         threshold: float = 0.01,
         max_order: float = 3.0,
+        trend_guard_window: int = 5,
+        trend_guard_threshold: float = 0.015,
         agent_id: str = "inst",
     ):
         super().__init__(capital, agent_id)
-        self.ma_window  = ma_window
-        self.threshold  = threshold
-        self.max_order  = max_order
+        self.ma_window             = ma_window
+        self.threshold             = threshold
+        self.max_order             = max_order
+        self.trend_guard_window    = trend_guard_window
+        self.trend_guard_threshold = trend_guard_threshold
 
     def decide(self, state: dict) -> float:
         closes = state["close_history"]
         if len(closes) < self.ma_window:
             return 0.0
+
+        # --- trend guard: 短期趨勢確立時靜觀 ---
+        if self.trend_guard_window > 0 and len(closes) >= self.trend_guard_window + 1:
+            recent = closes[-(self.trend_guard_window + 1):]
+            cum_logret = float(np.log(recent[-1] / recent[0]))
+            if abs(cum_logret) > self.trend_guard_threshold:
+                return 0.0  # 趨勢中不逆向
+
+        # --- 均值回歸 ---
         ma    = float(np.mean(closes[-self.ma_window:]))
         price = float(closes[-1])
         dev   = (price - ma) / ma
@@ -87,8 +109,7 @@ class MomentumTrader(BaseAgent):
     """
     動能散戶。
     `bias` 是外部注入的每根初始偏移（float），由 momentum-init drift 設定，
-    透過 exponential decay 逐根遞減。MomentumTrader 在 decide() 時把
-    當前 bias 加進 signal，使方向性偏移在模擬初期有效，後期自然消退。
+    透過 exponential decay 逐根遞減。
     """
 
     def __init__(
@@ -97,8 +118,8 @@ class MomentumTrader(BaseAgent):
         lookback: int = 3,
         strength: float = 1.0,
         noise: float = 0.2,
-        bias: float = 0.0,          # 初始方向偏移（由 momentum-init 注入）
-        bias_decay: float = 0.95,   # 每根 bar 的衰減係數（0.9 ~ 0.98）
+        bias: float = 0.0,
+        bias_decay: float = 0.95,
         agent_id: str = "mom",
     ):
         super().__init__(capital, agent_id)
@@ -107,17 +128,16 @@ class MomentumTrader(BaseAgent):
         self.noise      = noise
         self.bias       = bias
         self.bias_decay = bias_decay
-        self._cur_bias  = bias      # 每次 step 後衰減的即時值
+        self._cur_bias  = bias
 
     def reset_state(self) -> None:
         super().reset_state()
-        self._cur_bias = self.bias  # 重置到初始偏移（不是 0）
+        self._cur_bias = self.bias
 
     def decide(self, state: dict) -> float:
         closes = state["close_history"]
         rng    = state["rng"]
         if len(closes) < self.lookback + 1:
-            # bias 仍需衰減
             self._cur_bias *= self.bias_decay
             return self._cur_bias * self.capital
 
@@ -125,8 +145,6 @@ class MomentumTrader(BaseAgent):
         signal = float(np.sum(np.sign(rets)))
         noisy  = signal + rng.normal(0, self.noise * self.lookback)
         order  = float(np.clip(noisy * self.strength, -self.lookback, self.lookback))
-
-        # 加入衰減中的動能偏移
         total  = order + self._cur_bias
         self._cur_bias *= self.bias_decay
         return total * self.capital
@@ -204,14 +222,8 @@ def build_default_agents(
     """
     建立預設 agent 群。
 
-    Parameters
-    ----------
-    momentum_bias : float
-        初始方向偏移，注入所有 MomentumTrader。
-        正值 → 初始做多偏向；負值 → 初始做空偏向。
-        由 run_sim.py 從近期動能自動計算，或透過 --drift 手動指定。
-    bias_decay : float
-        每根 bar 的衰減係數（0.9 ~ 0.98）。
+    momentum_bias 注入所有 MomentumTrader。
+    InstitutionAgent 現在帶 trend_guard，趨勢明確時不逆向。
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -223,6 +235,8 @@ def build_default_agents(
             capital=10.0,
             ma_window=int(rng.integers(15, 30)),
             threshold=float(rng.uniform(0.008, 0.02)),
+            trend_guard_window=5,
+            trend_guard_threshold=float(rng.uniform(0.010, 0.020)),
             agent_id=f"inst_{i}",
         ))
 
