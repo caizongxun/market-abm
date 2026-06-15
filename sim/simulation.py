@@ -13,7 +13,15 @@ Momentum-init 策略（雙窗口）
   - fast 與 slow 反向 → 使用 fast drift（已發生反轉，以短期為準）
   - fast 接近 0       → 不注入偏移（市場橫盤）
 
-這樣無論是趨勢延續還是趨勢反轉，都能用最新的方向信號。
+auto_drift 模式（預設開啟）
+-----------------------------
+當 use_momentum_init=True 且 drift_per_bar=0.0 時，自動把 momentum_bias
+注入 drift_per_bar（逐 bar 歸零）而不是透過 agent 訂單量。
+這樣能避免 bias 被 total_capital 稼釋成幾乎零。
+
+  effective_drift[bar_i] = momentum_bias * decay^i
+
+這個 drift 直接加進 new_open = last_close * exp(order_impact + drift[i])。
 """
 
 from __future__ import annotations
@@ -30,14 +38,6 @@ def estimate_momentum_drift(
     window: int = 5,
     scale: float = 1.0,
 ) -> float:
-    """
-    從最近 window 根收盤價估算動能 drift（平均每根 log-return）。
-
-    Parameters
-    ----------
-    window : int   建議 3~10（短窗口抓轉折）
-    scale  : float 放大係數
-    """
     if len(close_history) < window + 1:
         return 0.0
     recent = close_history[-(window + 1):]
@@ -52,19 +52,6 @@ def estimate_momentum_drift_dual(
     scale:        float = 1.0,
     flat_threshold: float = 1e-5,
 ) -> tuple[float, str]:
-    """
-    雙窗口動能估算，回傳最終使用的 drift 和決策理由。
-
-    決策邏輯
-    --------
-    1. fast drift 接近 0（< flat_threshold）→ 橫盤，不注入偏移，回傳 0
-    2. fast 與 slow 同向 → 趨勢確立，使用 fast drift
-    3. fast 與 slow 反向 → 趨勢反轉，以 fast 為準（更新鮮）
-
-    Returns
-    -------
-    (drift, reason_str)
-    """
     drift_fast = estimate_momentum_drift(close_history, window=window_fast, scale=scale)
     drift_slow = estimate_momentum_drift(close_history, window=window_slow, scale=scale)
 
@@ -92,8 +79,9 @@ def run_simulation(
     momentum_window_fast: int = 5,
     momentum_window_slow: int = 20,
     momentum_scale: float = 1.0,
-    bias_decay: float = 0.95,
+    bias_decay: float = 0.97,
     use_momentum_init: bool = False,
+    auto_drift: bool = True,
     n_institution: int = 5,
     n_momentum:    int = 40,
     n_random:      int = 100,
@@ -107,13 +95,12 @@ def run_simulation(
 
     Parameters
     ----------
-    momentum_window_fast : int
-        短窗口（抓轉折），預設 5 根。
-    momentum_window_slow : int
-        長窗口（確認趨勢），預設 20 根。
+    auto_drift : bool
+        當 True 且 use_momentum_init=True 且 drift_per_bar==0 時，
+        自動把 momentum_bias 注入 drift schedule（逗 bar 歸零）。
+        這樣能避免 bias 被 total_capital 稼釋。預設 True。
     path_floor_pct : float
         路徑級別 floor：任何 bar 的 close 不得低於起始 close * (1 - path_floor_pct)。
-        預設 0.30，即不得跌超過 30%。設 0 停用。
 
     Returns
     -------
@@ -127,12 +114,11 @@ def run_simulation(
     lows    = df_ctx["Low"].values.astype(float)
     volumes = df_ctx["Volume"].values.astype(float)
 
-    # 路徑起始價格 floor
-    start_close   = float(closes[-1])
+    start_close    = float(closes[-1])
     path_min_price = start_close * (1.0 - path_floor_pct) if path_floor_pct > 0 else 0.0
 
-    # 動能初始偏移
-    momentum_bias  = 0.0
+    # Momentum bias
+    momentum_bias   = 0.0
     momentum_reason = "off"
     if use_momentum_init:
         momentum_bias, momentum_reason = estimate_momentum_drift_dual(
@@ -141,6 +127,13 @@ def run_simulation(
             window_slow=momentum_window_slow,
             scale=momentum_scale,
         )
+
+    # Auto-drift: convert momentum_bias -> per-bar drift schedule
+    # drift_schedule[i] = momentum_bias * decay^i
+    # This bypasses total_capital dilution in the impact formula.
+    drift_schedule: np.ndarray | None = None
+    if use_momentum_init and auto_drift and drift_per_bar == 0.0 and momentum_bias != 0.0:
+        drift_schedule = momentum_bias * (bias_decay ** np.arange(sim_bars))
 
     if agents is None:
         agents = build_default_agents(
@@ -160,7 +153,7 @@ def run_simulation(
         agents=agents,
         impact_coeff=impact_coeff,
         intra_noise_scale=intra_noise_scale,
-        drift_per_bar=drift_per_bar,
+        drift_per_bar=drift_per_bar,   # 0.0 when auto_drift; overridden per-bar below
         seed=int(rng.integers(0, 2**31)),
     )
 
@@ -168,6 +161,10 @@ def run_simulation(
     last_date = pd.Timestamp(df_ctx["Date"].iloc[-1])
 
     for i in range(sim_bars):
+        # Per-bar drift override when using auto_drift schedule
+        if drift_schedule is not None:
+            engine.drift_per_bar = float(drift_schedule[i])
+
         bar = engine.step(
             close_history=closes,
             high_history=highs,
@@ -176,7 +173,6 @@ def run_simulation(
             bar_idx=warmup_bars + i,
         )
 
-        # Path-level floor：防止連續 floor 導致路徑崩潰
         if path_min_price > 0 and bar["close"] < path_min_price:
             bar["close"] = path_min_price
             bar["low"]   = min(bar["low"], path_min_price)
