@@ -7,7 +7,7 @@ Usage
 -----
   python run_sim.py --symbol AAPL --bars 200 --plot
   python run_sim.py --symbol TSLA --bars 150 --warmup 120 --seed 0
-  python run_sim.py --symbol SPY  --bars 200 --impact 0.0008 --noise 0.7 --plot
+  python run_sim.py --symbol SPY  --bars 200 --impact 0.001 --noise 1.0 --plot
 """
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ from sim.metrics import compare
 def parse_args():
     p = argparse.ArgumentParser(description="Agent-Based Market Simulation")
     p.add_argument("--symbol",  default="AAPL",  help="Ticker symbol")
-    p.add_argument("--bars",    type=int, default=200, help="Number of bars to simulate")
-    p.add_argument("--warmup",  type=int, default=100, help="Warm-up history bars")
-    p.add_argument("--years",   type=int, default=3,   help="Years of history to download")
-    p.add_argument("--impact",  type=float, default=0.0005, help="Market impact coefficient")
-    p.add_argument("--noise",   type=float, default=0.6,    help="Intra-bar ATR noise scale")
+    p.add_argument("--bars",    type=int, default=200,   help="Number of bars to simulate")
+    p.add_argument("--warmup",  type=int, default=100,   help="Warm-up history bars")
+    p.add_argument("--years",   type=int, default=3,     help="Years of history to download")
+    p.add_argument("--impact",  type=float, default=0.001,  help="Market impact coefficient")
+    p.add_argument("--noise",   type=float, default=1.0,    help="Intra-bar ATR noise scale")
     p.add_argument("--seed",    type=int,   default=42,     help="Random seed")
     p.add_argument("--plot",    action="store_true", help="Generate comparison plot")
     p.add_argument("--out-dir", default="results",   help="Output directory")
@@ -69,7 +69,7 @@ def plot_comparison(
         ax.yaxis.label.set_color("#71717a")
         ax.title.set_color("#d4d4d8")
 
-    # ── 1. Close Price ────────────────────────────────────
+    # -- 1. Close Price
     ax = axes[0, 0]
     ax.plot(df_warmup["Date"], df_warmup["Close"],  color="#6b7280", lw=1.2, label="History (warm-up)")
     ax.plot(df_sim["Date"],    df_sim["Close"],     color="#4f98a3", lw=1.2, label="Simulated")
@@ -78,7 +78,7 @@ def plot_comparison(
     ax.set_title("Close Price")
     ax.legend(fontsize=8, framealpha=0.3)
 
-    # ── 2. Daily Return Distribution ────────────────────────────────────
+    # -- 2. Daily Return Distribution
     ax = axes[0, 1]
     real_rets = np.diff(np.log(df_real_future["Close"].values)) if not df_real_future.empty else np.array([])
     sim_rets  = np.diff(np.log(df_sim["Close"].values))
@@ -89,7 +89,7 @@ def plot_comparison(
     ax.set_title("Daily Return Distribution")
     ax.legend(fontsize=8, framealpha=0.3)
 
-    # ── 3. Volatility Autocorrelation ──────────────────────────────────
+    # -- 3. Volatility Autocorrelation
     from sim.metrics import vol_autocorr
     ax = axes[1, 0]
     lags = range(1, 21)
@@ -103,7 +103,7 @@ def plot_comparison(
     ax.set_xlabel("Lag")
     ax.legend(fontsize=8, framealpha=0.3)
 
-    # ── 4. NetOrder (market sentiment proxy) ────────────────
+    # -- 4. NetOrder
     ax = axes[1, 1]
     ax.bar(range(len(df_sim)), df_sim["NetOrder"],
            color=np.where(df_sim["NetOrder"] > 0, "#26a69a", "#ef5350"),
@@ -127,21 +127,18 @@ def print_ohlcv_comparison(df_real: pd.DataFrame, df_sim: pd.DataFrame, n: int =
     real_disp = df_real[real_cols].copy().reset_index(drop=True)
     sim_disp  = df_sim[sim_cols].copy().reset_index(drop=True)
 
-    # align lengths
     length = min(len(real_disp), len(sim_disp))
     real_disp = real_disp.iloc[:length]
     sim_disp  = sim_disp.iloc[:length]
 
-    # rename columns for side-by-side display
     real_disp.columns = [f"real_{c}" if c != "Date" else "Date" for c in real_disp.columns]
     sim_disp.columns  = [f"sim_{c}"  if c != "Date" else "Date" for c in sim_disp.columns]
 
     combined = pd.concat(
-        [real_disp.add_suffix(""), sim_disp.drop(columns=["Date"], errors="ignore")],
+        [real_disp, sim_disp.drop(columns=["Date"], errors="ignore")],
         axis=1,
     )
 
-    # show first n and last n rows
     display_n = min(n, length)
     head = combined.head(display_n)
     tail = combined.tail(display_n) if length > display_n else pd.DataFrame()
@@ -163,7 +160,6 @@ def print_ohlcv_comparison(df_real: pd.DataFrame, df_sim: pd.DataFrame, n: int =
         print(tail.to_string(index=True, formatters=fmt))
     print(f"{'='*120}\n")
 
-    # also print summary stats
     print("  Summary stats (Close)")
     stat_df = pd.DataFrame({
         "real_Close": df_real["Close"].describe() if "Close" in df_real.columns else pd.Series(dtype=float),
@@ -188,8 +184,7 @@ def main():
         print("       Increase --years or reduce --bars / --warmup")
         sys.exit(1)
 
-    # Split: train (warm-up) vs real future (comparison target)
-    df_train = df_all.iloc[:-(args.bars)].copy()
+    df_train       = df_all.iloc[:-(args.bars)].copy()
     df_real_future = df_all.iloc[-(args.bars):].copy().reset_index(drop=True)
 
     # 2. Run simulation
@@ -215,10 +210,10 @@ def main():
     print(f"\n[metrics] Comparing simulated vs. real ({args.bars} bars each)")
     report = compare(df_real_future, df_sim, print_report=True)
 
-    # 4. OHLCV side-by-side comparison printout
+    # 4. OHLCV side-by-side
     print_ohlcv_comparison(df_real_future, df_sim, n=10)
 
-    # Save simulated bars
+    # Save
     sim_csv = out_dir / f"{args.symbol}_sim.csv"
     df_sim.to_csv(sim_csv, index=False)
     print(f"[out] Simulated bars -> {sim_csv}")
