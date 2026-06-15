@@ -13,14 +13,26 @@ Usage examples
   # 停用 auto_drift（對比實驗用）
   python run_sim.py --symbol AAPL --bars 60 --momentum-init --no-auto-drift --plot
 
-  # 用 calibrator 找最佳參數
+  # 用 calibrator 找最佳靜態參數
   python -m sim.calibrate --symbol AAPL --start 2024-01-01 --end 2025-06-01
+
+  # Rolling calibration（每段重新估參數）
+  python run_sim.py --symbol AAPL --start 2023-01-01 --bars 200 \\
+      --rolling --lookback 60 --step 20 --plot
+
+Rolling calibration 說明
+------------------------
+--rolling        : 開啟 rolling mode
+--lookback N     : 每個 window 用前 N 根 K 棒估參數（預設 60）
+--step N         : 每隔 N 根 K 棒重新校準（預設 20）
+--ema-alpha α    : EMA 平滑係數，0.4 = 新估值佔 40%（預設 0.4）
+--rolling-sims N : 每組參數的路徑數（預設 10，越多越慢）
 
 Decay guide (bias residual at bar N)
 -------------------------------------
-  decay=0.97  bar 20: 55%   bar 40: 30%   bar 60: 16%   <- default, good for 60-bar sims
-  decay=0.95  bar 20: 36%   bar 40: 13%   bar 60:  5%   <- too fast for 60-bar
-  decay=0.99  bar 20: 82%   bar 40: 67%   bar 60: 55%   <- persistent, use for 120+ bar sims
+  decay=0.97  bar 20: 55%   bar 40: 30%   bar 60: 16%   <- default
+  decay=0.95  bar 20: 36%   bar 40: 13%   bar 60:  5%
+  decay=0.99  bar 20: 82%   bar 40: 67%   bar 60: 55%   <- 120+ bar sims
 """
 
 from __future__ import annotations
@@ -39,7 +51,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.fetch import fetch_ohlcv
-from sim.simulation import run_simulation, estimate_momentum_drift_dual
+from sim.simulation import run_simulation, run_simulation_rolling, estimate_momentum_drift_dual
 from sim.metrics import compare
 
 
@@ -58,24 +70,17 @@ def parse_args():
     p.add_argument("--warmup",  type=int,   default=100)
     p.add_argument("--n-sims",  type=int,   default=1,
                    help="Paths to run. >1 generates fan chart.")
-    p.add_argument("--impact",  type=float, default=0.0015,
-                   help="Market impact coefficient (default 0.0015).")
+    p.add_argument("--impact",  type=float, default=0.0015)
     p.add_argument("--noise",   type=float, default=1.0)
-    p.add_argument("--drift",   type=float, default=0.0,
-                   help="Manual per-bar log drift (default 0.0).")
+    p.add_argument("--drift",   type=float, default=0.0)
     p.add_argument("--seed",    type=int,   default=42)
     # Momentum init
-    p.add_argument("--momentum-init", action="store_true",
-                   help="Enable dual-window momentum bias injection.")
-    p.add_argument("--no-auto-drift", action="store_true",
-                   help="Disable auto_drift (bias goes through agent orders instead of "
-                        "drift_per_bar). Use for comparison experiments.")
+    p.add_argument("--momentum-init", action="store_true")
+    p.add_argument("--no-auto-drift", action="store_true")
     p.add_argument("--momentum-window-fast", type=int,   default=5)
     p.add_argument("--momentum-window-slow", type=int,   default=20)
     p.add_argument("--momentum-scale",       type=float, default=1.0)
-    p.add_argument("--decay",                type=float, default=0.97,
-                   help="Per-bar exponential decay for momentum bias. "
-                        "0.97 leaves ~16%% residual at bar 60. (default 0.97)")
+    p.add_argument("--decay",                type=float, default=0.97)
     # Price floor
     p.add_argument("--path-floor", type=float, default=0.30)
     # Agents
@@ -86,6 +91,17 @@ def parse_args():
     # Output
     p.add_argument("--plot",    action="store_true")
     p.add_argument("--out-dir", default="results")
+    # Rolling calibration
+    p.add_argument("--rolling",       action="store_true",
+                   help="Enable rolling calibration mode.")
+    p.add_argument("--lookback",      type=int,   default=60,
+                   help="Bars used to estimate params per window (default 60).")
+    p.add_argument("--step",          type=int,   default=20,
+                   help="Re-calibrate every N bars (default 20).")
+    p.add_argument("--ema-alpha",     type=float, default=0.4,
+                   help="EMA smoothing: 0.4 = new estimate 40%% (default 0.4).")
+    p.add_argument("--rolling-sims",  type=int,   default=10,
+                   help="Paths per combo in rolling grid search (default 10).")
     return p.parse_args()
 
 
@@ -132,6 +148,60 @@ def _dark(fig, axes_flat):
         ax.xaxis.label.set_color("#71717a")
         ax.yaxis.label.set_color("#71717a")
         ax.title.set_color("#d4d4d8")
+
+
+def plot_rolling(df_all, df_result, param_log, symbol, out_path):
+    """Rolling mode 專用圖：價格 + 每個 window 的 impact / scale / decay 變化。"""
+    fig, axes = plt.subplots(4, 1, figsize=(14, 14),
+                             gridspec_kw={"height_ratios": [3, 1, 1, 1]})
+    _dark(fig, axes)
+    fig.suptitle(f"Rolling Calibration  |  {symbol}  |  "
+                 f"{len(param_log)} windows  step={param_log[0]['bar_end']-param_log[0]['bar_start']}",
+                 fontsize=12, fontweight="bold")
+
+    # --- Price ---
+    ax = axes[0]
+    lookback = param_log[0]["bar_start"]
+    df_ctx = df_all.iloc[:lookback]
+    ax.plot(df_ctx["Date"], df_ctx["Close"], color="#6b7280", lw=1.0, label="History")
+    ax.plot(df_result["Date"], df_result["Close"], color="#4f98a3", lw=1.2, label="Rolling sim")
+    # Real (後半段)
+    df_real_cmp = df_all.iloc[lookback:].reset_index(drop=True)
+    if len(df_real_cmp) >= len(df_result):
+        df_real_cmp = df_real_cmp.iloc[:len(df_result)]
+    ax.plot(df_real_cmp["Date"], df_real_cmp["Close"],
+            color="#f0c040", lw=1.2, label="Real", ls="--")
+    # Window boundaries
+    for pl in param_log:
+        bar_idx = pl["bar_start"]
+        if bar_idx < len(df_all):
+            ax.axvline(df_all.iloc[bar_idx]["Date"], color="#3a3a45", lw=0.7, ls=":")
+    ax.set_title("Close Price (history + rolling sim vs real)")
+    ax.legend(fontsize=8, framealpha=0.3)
+
+    # --- Param traces ---
+    windows    = [pl["window"] + 1 for pl in param_log]
+    impacts    = [pl["impact_coeff"] for pl in param_log]
+    scales     = [pl["momentum_scale"] for pl in param_log]
+    decays     = [pl["decay"] for pl in param_log]
+
+    axes[1].plot(windows, impacts, color="#4f98a3", marker="o", ms=4, lw=1.5)
+    axes[1].set_title("impact_coeff (EMA smoothed)")
+    axes[1].set_ylabel("impact")
+
+    axes[2].plot(windows, scales, color="#f97316", marker="o", ms=4, lw=1.5)
+    axes[2].set_title("momentum_scale (EMA smoothed)")
+    axes[2].set_ylabel("scale")
+
+    axes[3].plot(windows, decays, color="#a78bfa", marker="o", ms=4, lw=1.5)
+    axes[3].set_title("decay (EMA smoothed)")
+    axes[3].set_ylabel("decay")
+    axes[3].set_xlabel("Window")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"[plot] saved -> {out_path}")
 
 
 def plot_fan_chart(df_warmup, paths, df_real_future, symbol, out_path):
@@ -316,6 +386,62 @@ def main():
     print(f"[fetch] range: {start_date} ~ {end_date}")
     df_all = fetch_ohlcv(args.symbol, start_date, end_date)
 
+    # -----------------------------------------------------------------------
+    # Rolling calibration mode
+    # -----------------------------------------------------------------------
+    if args.rolling:
+        min_needed = args.lookback + args.step
+        if len(df_all) < min_needed:
+            print(f"[error] rolling mode needs >= {min_needed} bars, got {len(df_all)}")
+            sys.exit(1)
+
+        print(f"[rolling] {args.symbol}  total={len(df_all)}  "
+              f"lookback={args.lookback}  step={args.step}  "
+              f"ema_alpha={args.ema_alpha}  rolling_sims={args.rolling_sims}")
+        n_windows = (len(df_all) - args.lookback) // args.step
+        print(f"[rolling] estimated windows: {n_windows}  "
+              f"(~{n_windows * 27 * args.rolling_sims} sim runs)")
+
+        df_result, param_log = run_simulation_rolling(
+            df_all=df_all,
+            lookback=args.lookback,
+            step=args.step,
+            n_sims=args.rolling_sims,
+            warmup_bars=min(args.warmup, args.lookback),
+            ema_alpha=args.ema_alpha,
+            seed=args.seed,
+            verbose=True,
+        )
+
+        # Save outputs
+        out_csv = out_dir / f"{args.symbol}_rolling_sim.csv"
+        df_result.to_csv(out_csv, index=False)
+        print(f"[out] -> {out_csv}")
+
+        import json
+        out_log = out_dir / f"{args.symbol}_param_log.json"
+        with open(out_log, "w") as f:
+            json.dump(param_log, f, indent=2, default=float)
+        print(f"[out] -> {out_log}  ({len(param_log)} windows)")
+
+        # Metrics vs real (後半段)
+        df_real_cmp = df_all.iloc[args.lookback:].reset_index(drop=True)
+        n_cmp = min(len(df_real_cmp), len(df_result))
+        if n_cmp > 5:
+            print(f"\n[metrics] rolling sim vs. real ({n_cmp} bars)")
+            compare(df_real_cmp.iloc[:n_cmp], df_result.iloc[:n_cmp], print_report=True)
+
+        if args.plot:
+            plot_rolling(
+                df_all, df_result, param_log, args.symbol,
+                out_dir / f"{args.symbol}_rolling.png",
+            )
+        print("\n[done]")
+        return
+
+    # -----------------------------------------------------------------------
+    # Static mode (original)
+    # -----------------------------------------------------------------------
     if len(df_all) < args.warmup + args.bars:
         print(f"[warn] Need {args.warmup + args.bars} bars, got {len(df_all)}")
         sys.exit(1)
@@ -327,7 +453,6 @@ def main():
           f"({df_real_future['Date'].iloc[0].date()} ~ "
           f"{df_real_future['Date'].iloc[-1].date()})")
 
-    # 2. Momentum estimate (for display)
     if args.momentum_init:
         ctx_closes = df_train.tail(args.warmup)["Close"].values.astype(float)
         mom_drift, reason = estimate_momentum_drift_dual(
@@ -349,9 +474,8 @@ def main():
         if auto_drift:
             print(f"               [auto_drift=ON] bias routed to drift_per_bar schedule")
         else:
-            print(f"               [auto_drift=OFF] bias routed through agent orders (diluted by capital)")
+            print(f"               [auto_drift=OFF] bias routed through agent orders")
 
-    # 3. Sim config summary
     print(f"\n[sim] {args.symbol}  warmup={args.warmup}  bars={args.bars}  "
           f"n_sims={args.n_sims}  impact={args.impact}  noise={args.noise}  "
           f"seed={args.seed}  path_floor={args.path_floor:.0%}")
@@ -418,8 +542,7 @@ def main():
         )
 
         print(f"\n[multi-sim]  {args.n_sims} paths  /  {args.bars} bars")
-        print(f"  P(final close > start)  : {prob_up:.1%}  "
-              f"({'UP' if prob_up >= 0.5 else 'DOWN'} majority)")
+        print(f"  P(final close > start)  : {prob_up:.1%}")
         print(f"  Median total return     : {med_ret:+.2%}")
         print(f"  10th / 90th pct return  : {p10_ret:+.2%} / {p90_ret:+.2%}")
         print(f"  Highest-vol path #{hv_idx:<3}   : {hv_ret:+.2%}")
@@ -428,10 +551,8 @@ def main():
             in_band = p10_ret <= real_ret <= p90_ret
             match   = (prob_up >= 0.5) == (real_ret > 0)
             print(f"  Direction match         : {'YES' if match else 'NO'}")
-            print(f"  Real in 10-90th band    : {'YES' if in_band else 'NO'}  "
-                  f"[{p10_ret:+.2%}, {p90_ret:+.2%}]")
+            print(f"  Real in 10-90th band    : {'YES' if in_band else 'NO'}")
 
-        # Median path metrics (Hurst / kurtosis / direction_hit)
         med_close = np.median(close_mat, axis=0)
         df_med    = paths[0].copy()
         df_med["Close"] = med_close

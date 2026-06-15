@@ -22,6 +22,11 @@ auto_drift 模式（預設開啟）
   effective_drift[bar_i] = momentum_bias * decay^i
 
 這個 drift 直接加進 new_open = last_close * exp(order_impact + drift[i])。
+
+Rolling calibration
+-------------------
+見 sim/regime.py 的 RegimeCalibrator。
+run_simulation_rolling() 是薄薄的 wrapper，讓 run_sim.py 用 --rolling flag 呼叫。
 """
 
 from __future__ import annotations
@@ -129,8 +134,6 @@ def run_simulation(
         )
 
     # Auto-drift: convert momentum_bias -> per-bar drift schedule
-    # drift_schedule[i] = momentum_bias * decay^i
-    # Bypasses total_capital dilution in the impact formula.
     drift_schedule: np.ndarray | None = None
     if use_momentum_init and auto_drift and drift_per_bar == 0.0 and momentum_bias != 0.0:
         drift_schedule = momentum_bias * (bias_decay ** np.arange(sim_bars))
@@ -193,3 +196,32 @@ def run_simulation(
         volumes = np.append(volumes, bar["volume"])
 
     return df_ctx, pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Rolling wrapper (thin, delegates to RegimeCalibrator)
+# ---------------------------------------------------------------------------
+def run_simulation_rolling(
+    df_all: pd.DataFrame,
+    lookback: int = 60,
+    step: int = 20,
+    n_sims: int = 10,
+    warmup_bars: int = 60,
+    ema_alpha: float = 0.4,
+    seed: int = 42,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Thin wrapper around RegimeCalibrator.run().
+    回傳拼接後的模擬 DataFrame 和每個 window 的參數記錄。
+    """
+    from .regime import RegimeCalibrator
+    cal = RegimeCalibrator(
+        lookback=lookback,
+        step=step,
+        n_sims=n_sims,
+        warmup_bars=warmup_bars,
+        ema_alpha=ema_alpha,
+        verbose=verbose,
+    )
+    return cal.run(df_all, seed=seed)
