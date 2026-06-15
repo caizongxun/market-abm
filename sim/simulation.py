@@ -3,13 +3,17 @@ simulation.py
 =============
 主迴圈：用真實歷史 K 棒初始化 agent 狀態，然後模擬 N 根 K 棒。
 
-Drift / Momentum-init 策略
---------------------------
-不自動從 warmup 估算 drift（會帶入歷史偏差）。
-改由呼叫方傳入 `drift_per_bar`：
-  - 若為 0.0（預設）→ 純 agent 決策
-  - 若由 estimate_momentum_drift() 計算 → 近期動能初始偏移（exponential decay）
-  - 若手動指定 → 使用者自己負責
+Momentum-init 策略（雙窗口）
+-----------------------------
+短窗口（fast, 預設 5 根）抓轉折敏感度。
+長窗口（slow, 預設 20 根）確認趨勢一致性。
+
+決策邏輯：
+  - fast 與 slow 同向 → 使用 fast drift（趨勢確立）
+  - fast 與 slow 反向 → 使用 fast drift（已發生反轉，以短期為準）
+  - fast 接近 0       → 不注入偏移（市場橫盤）
+
+這樣無論是趨勢延續還是趨勢反轉，都能用最新的方向信號。
 """
 
 from __future__ import annotations
@@ -23,27 +27,59 @@ from .market import MarketEngine
 
 def estimate_momentum_drift(
     close_history: np.ndarray,
-    window: int = 20,
+    window: int = 5,
     scale: float = 1.0,
 ) -> float:
     """
-    從最近 window 根收盤價估算動能 drift。
-
-    計算方式：window 根的平均每根 log-return，乘上 scale。
-    正值代表近期上漲動能；負值代表近期下跌動能。
+    從最近 window 根收盤價估算動能 drift（平均每根 log-return）。
 
     Parameters
     ----------
-    window : int
-        看幾根來估動能（建議 10 ~ 30）
-    scale  : float
-        放大係數（1.0 = 原始動能；>1 = 誇大；<1 = 縮小）
+    window : int   建議 3~10（短窗口抓轉折）
+    scale  : float 放大係數
     """
     if len(close_history) < window + 1:
         return 0.0
     recent = close_history[-(window + 1):]
     rets   = np.diff(np.log(recent))
     return float(np.mean(rets) * scale)
+
+
+def estimate_momentum_drift_dual(
+    close_history: np.ndarray,
+    window_fast:  int   = 5,
+    window_slow:  int   = 20,
+    scale:        float = 1.0,
+    flat_threshold: float = 1e-5,
+) -> tuple[float, str]:
+    """
+    雙窗口動能估算，回傳最終使用的 drift 和決策理由。
+
+    決策邏輯
+    --------
+    1. fast drift 接近 0（< flat_threshold）→ 橫盤，不注入偏移，回傳 0
+    2. fast 與 slow 同向 → 趨勢確立，使用 fast drift
+    3. fast 與 slow 反向 → 趨勢反轉，以 fast 為準（更新鮮）
+
+    Returns
+    -------
+    (drift, reason_str)
+    """
+    drift_fast = estimate_momentum_drift(close_history, window=window_fast, scale=scale)
+    drift_slow = estimate_momentum_drift(close_history, window=window_slow, scale=scale)
+
+    if abs(drift_fast) < flat_threshold:
+        return 0.0, f"flat (fast={drift_fast:+.6f}, slow={drift_slow:+.6f})"
+
+    same_direction = (drift_fast > 0) == (drift_slow > 0)
+    if same_direction:
+        reason = (f"trend confirmed (fast={drift_fast:+.6f}, "
+                  f"slow={drift_slow:+.6f}) → using fast")
+    else:
+        reason = (f"REVERSAL detected (fast={drift_fast:+.6f}, "
+                  f"slow={drift_slow:+.6f}) → using fast (more recent)")
+
+    return drift_fast, reason
 
 
 def run_simulation(
@@ -53,7 +89,8 @@ def run_simulation(
     impact_coeff: float = 0.001,
     intra_noise_scale: float = 1.0,
     drift_per_bar: float = 0.0,
-    momentum_window: int = 20,
+    momentum_window_fast: int = 5,
+    momentum_window_slow: int = 20,
     momentum_scale: float = 1.0,
     bias_decay: float = 0.95,
     use_momentum_init: bool = False,
@@ -63,27 +100,24 @@ def run_simulation(
     n_contrarian:  int = 15,
     seed: int | None = 42,
     agents: list[BaseAgent] | None = None,
+    path_floor_pct: float = 0.30,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     執行一次 ABM 模擬。
 
     Parameters
     ----------
-    use_momentum_init : bool
-        若為 True，自動從 warmup 最後 momentum_window 根估算動能 drift，
-        注入 MomentumTrader 的 bias（exponential decay）。
-        此時 drift_per_bar 的全局 drift 仍然獨立運作（建議維持 0.0）。
-    momentum_window : int
-        估算近期動能的窗口長度。
-    momentum_scale : float
-        動能強度放大係數。
-    bias_decay : float
-        MomentumTrader bias 的每根衰減係數。
+    momentum_window_fast : int
+        短窗口（抓轉折），預設 5 根。
+    momentum_window_slow : int
+        長窗口（確認趨勢），預設 20 根。
+    path_floor_pct : float
+        路徑級別 floor：任何 bar 的 close 不得低於起始 close * (1 - path_floor_pct)。
+        預設 0.30，即不得跌超過 30%。設 0 停用。
 
     Returns
     -------
-    df_warmup : 用作 context 的真實歷史（最後 warmup_bars 根）
-    df_sim    : 模擬 OHLCV DataFrame
+    df_warmup, df_sim
     """
     rng = np.random.default_rng(seed)
 
@@ -93,11 +127,19 @@ def run_simulation(
     lows    = df_ctx["Low"].values.astype(float)
     volumes = df_ctx["Volume"].values.astype(float)
 
-    # 計算動能初始偏移
-    momentum_bias = 0.0
+    # 路徑起始價格 floor
+    start_close   = float(closes[-1])
+    path_min_price = start_close * (1.0 - path_floor_pct) if path_floor_pct > 0 else 0.0
+
+    # 動能初始偏移
+    momentum_bias  = 0.0
+    momentum_reason = "off"
     if use_momentum_init:
-        momentum_bias = estimate_momentum_drift(
-            closes, window=momentum_window, scale=momentum_scale
+        momentum_bias, momentum_reason = estimate_momentum_drift_dual(
+            closes,
+            window_fast=momentum_window_fast,
+            window_slow=momentum_window_slow,
+            scale=momentum_scale,
         )
 
     if agents is None:
@@ -111,7 +153,6 @@ def run_simulation(
             rng=rng,
         )
     else:
-        # 重置 agent 狀態，防止上一次模擬的記憶污染
         for a in agents:
             a.reset_state()
 
@@ -123,7 +164,7 @@ def run_simulation(
         seed=int(rng.integers(0, 2**31)),
     )
 
-    rows = []
+    rows      = []
     last_date = pd.Timestamp(df_ctx["Date"].iloc[-1])
 
     for i in range(sim_bars):
@@ -134,6 +175,12 @@ def run_simulation(
             volume_history=volumes,
             bar_idx=warmup_bars + i,
         )
+
+        # Path-level floor：防止連續 floor 導致路徑崩潰
+        if path_min_price > 0 and bar["close"] < path_min_price:
+            bar["close"] = path_min_price
+            bar["low"]   = min(bar["low"], path_min_price)
+
         next_date = last_date + pd.offsets.BDay(1)
         last_date = next_date
         rows.append({
