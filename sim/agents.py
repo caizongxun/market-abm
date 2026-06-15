@@ -52,14 +52,8 @@ class InstitutionAgent(BaseAgent):
     """
     均值回歸法人。
 
-    trend_guard_window / trend_guard_threshold
-    ------------------------------------------
-    計算最近 trend_guard_window 根的累積 log-return。
-    若絕對值超過 trend_guard_threshold，代表短期趨勢明確，
-    Institution 此時不逆勢做均值回歸，直接觀望（return 0）。
-
-    這防止了「价格連跌 → Institution 持續買進 → 結構性托底」的問題。
-    設 trend_guard_window=0 可完全關閉此功能（向後相容）。
+    trend_guard: 計算最近 trend_guard_window 根累積 log-return。
+    若絕對值 > trend_guard_threshold，代表短期趨勢明確，不逆向。
     """
 
     def __init__(
@@ -84,14 +78,12 @@ class InstitutionAgent(BaseAgent):
         if len(closes) < self.ma_window:
             return 0.0
 
-        # --- trend guard: 短期趨勢確立時靜觀 ---
         if self.trend_guard_window > 0 and len(closes) >= self.trend_guard_window + 1:
             recent = closes[-(self.trend_guard_window + 1):]
             cum_logret = float(np.log(recent[-1] / recent[0]))
             if abs(cum_logret) > self.trend_guard_threshold:
-                return 0.0  # 趨勢中不逆向
+                return 0.0
 
-        # --- 均值回歸 ---
         ma    = float(np.mean(closes[-self.ma_window:]))
         price = float(closes[-1])
         dev   = (price - ma) / ma
@@ -107,9 +99,7 @@ class InstitutionAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 class MomentumTrader(BaseAgent):
     """
-    動能散戶。
-    `bias` 是外部注入的每根初始偏移（float），由 momentum-init drift 設定，
-    透過 exponential decay 逐根遞減。
+    動能散戶。bias 由 momentum-init 注入，透過 exponential decay 逐根遞減。
     """
 
     def __init__(
@@ -175,27 +165,50 @@ class RandomTrader(BaseAgent):
 
 
 # ---------------------------------------------------------------------------
-# 4. ContrarianTrader  —  逆勢
+# 4. ContrarianTrader  —  逆勢 + trend_guard
 # ---------------------------------------------------------------------------
 class ContrarianTrader(BaseAgent):
+    """
+    逆勢交易者。
+
+    trend_guard: 如果更長期的趨勢依然確立（trend_guard_window 根累積
+    log-return 絕對值 > trend_guard_threshold），抑制逆勢下單。
+
+    實際市場行為：
+    - 短期振等：逆勢商會活踴（正常行為）
+    - 持續趨勢：逆勢商對模擬序列貿猫，應被抑制到趨勢消退再進場
+    """
+
     def __init__(
         self,
         capital: float = 1.5,
         window: int = 5,
         atr_mult: float = 1.5,
         max_order: float = 2.0,
+        trend_guard_window: int = 15,
+        trend_guard_threshold: float = 0.03,
         agent_id: str = "cont",
     ):
         super().__init__(capital, agent_id)
-        self.window    = window
-        self.atr_mult  = atr_mult
-        self.max_order = max_order
+        self.window                = window
+        self.atr_mult              = atr_mult
+        self.max_order             = max_order
+        self.trend_guard_window    = trend_guard_window
+        self.trend_guard_threshold = trend_guard_threshold
 
     def decide(self, state: dict) -> float:
         closes = state["close_history"]
         atr    = state["atr"]
         if len(closes) < self.window + 1 or atr <= 0:
             return 0.0
+
+        # trend_guard: 更長窗口趨勢明確時，不逆向下單
+        if self.trend_guard_window > 0 and len(closes) >= self.trend_guard_window + 1:
+            long_recent = closes[-(self.trend_guard_window + 1):]
+            long_logret = float(np.log(long_recent[-1] / long_recent[0]))
+            if abs(long_logret) > self.trend_guard_threshold:
+                return 0.0
+
         cum_move  = float(closes[-1] - closes[-self.window - 1])
         threshold = self.atr_mult * atr
         if cum_move > threshold:
@@ -222,8 +235,9 @@ def build_default_agents(
     """
     建立預設 agent 群。
 
-    momentum_bias 注入所有 MomentumTrader。
-    InstitutionAgent 現在帶 trend_guard，趨勢明確時不逆向。
+    InstitutionAgent  趨勢明確時靜觀（trend_guard_window=5,  threshold~1-2%）
+    ContrarianTrader  趨勢持續時靜觀（trend_guard_window=15, threshold~3-5%）
+    MomentumTrader    接收 momentum_bias。
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -262,6 +276,8 @@ def build_default_agents(
             capital=1.5,
             window=int(rng.integers(3, 8)),
             atr_mult=float(rng.uniform(1.0, 2.5)),
+            trend_guard_window=15,
+            trend_guard_threshold=float(rng.uniform(0.030, 0.050)),
             agent_id=f"cont_{i}",
         ))
 
