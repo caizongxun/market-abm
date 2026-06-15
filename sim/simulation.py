@@ -1,24 +1,15 @@
 """
 simulation.py
 =============
-Main loop: use real historical bars as initial context,
-then let the agent pool simulate N forward bars.
+主迴圈：用真實歷史 K 棒初始化 agent 狀態，然後模擬 N 根 K 棒。
 
-Flow
-----
-1. Load real OHLCV (warmup context)
-2. Call MarketEngine.step() for each bar
-3. Each new bar is appended to the rolling history
-4. Return simulated bar DataFrame
-
-Drift policy
-------------
-Drift is NOT estimated automatically from warmup history.
-Warmup drift reflects the past regime, not the future window,
-and injecting it causes systematic directional bias.
-Pass an explicit drift value via the `drift_per_bar` argument
-(or --drift in run_sim.py) only when you have a principled reason.
-Default is 0.0 (agents determine direction through net order flow).
+Drift / Momentum-init 策略
+--------------------------
+不自動從 warmup 估算 drift（會帶入歷史偏差）。
+改由呼叫方傳入 `drift_per_bar`：
+  - 若為 0.0（預設）→ 純 agent 決策
+  - 若由 estimate_momentum_drift() 計算 → 近期動能初始偏移（exponential decay）
+  - 若手動指定 → 使用者自己負責
 """
 
 from __future__ import annotations
@@ -30,6 +21,31 @@ from .agents import BaseAgent, build_default_agents
 from .market import MarketEngine
 
 
+def estimate_momentum_drift(
+    close_history: np.ndarray,
+    window: int = 20,
+    scale: float = 1.0,
+) -> float:
+    """
+    從最近 window 根收盤價估算動能 drift。
+
+    計算方式：window 根的平均每根 log-return，乘上 scale。
+    正值代表近期上漲動能；負值代表近期下跌動能。
+
+    Parameters
+    ----------
+    window : int
+        看幾根來估動能（建議 10 ~ 30）
+    scale  : float
+        放大係數（1.0 = 原始動能；>1 = 誇大；<1 = 縮小）
+    """
+    if len(close_history) < window + 1:
+        return 0.0
+    recent = close_history[-(window + 1):]
+    rets   = np.diff(np.log(recent))
+    return float(np.mean(rets) * scale)
+
+
 def run_simulation(
     df_real: pd.DataFrame,
     sim_bars: int = 200,
@@ -37,6 +53,10 @@ def run_simulation(
     impact_coeff: float = 0.001,
     intra_noise_scale: float = 1.0,
     drift_per_bar: float = 0.0,
+    momentum_window: int = 20,
+    momentum_scale: float = 1.0,
+    bias_decay: float = 0.95,
+    use_momentum_init: bool = False,
     n_institution: int = 5,
     n_momentum:    int = 40,
     n_random:      int = 100,
@@ -45,25 +65,40 @@ def run_simulation(
     agents: list[BaseAgent] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Run ABM simulation.
+    執行一次 ABM 模擬。
 
     Parameters
     ----------
-    df_real           : Real historical OHLCV (Date/Open/High/Low/Close/Volume)
-    sim_bars          : Number of bars to simulate
-    warmup_bars       : History bars used to initialise agent state
-    impact_coeff      : Market impact coefficient
-    intra_noise_scale : ATR multiplier for intra-bar noise
-    drift_per_bar     : Per-bar log-return drift (default 0.0 = no forced trend)
-    seed              : Random seed
-    agents            : Custom agent list; None uses build_default_agents()
+    use_momentum_init : bool
+        若為 True，自動從 warmup 最後 momentum_window 根估算動能 drift，
+        注入 MomentumTrader 的 bias（exponential decay）。
+        此時 drift_per_bar 的全局 drift 仍然獨立運作（建議維持 0.0）。
+    momentum_window : int
+        估算近期動能的窗口長度。
+    momentum_scale : float
+        動能強度放大係數。
+    bias_decay : float
+        MomentumTrader bias 的每根衰減係數。
 
     Returns
     -------
-    df_warmup : Real history used as context (last warmup_bars rows)
-    df_sim    : Simulated OHLCV DataFrame
+    df_warmup : 用作 context 的真實歷史（最後 warmup_bars 根）
+    df_sim    : 模擬 OHLCV DataFrame
     """
     rng = np.random.default_rng(seed)
+
+    df_ctx  = df_real.tail(warmup_bars).reset_index(drop=True)
+    closes  = df_ctx["Close"].values.astype(float)
+    highs   = df_ctx["High"].values.astype(float)
+    lows    = df_ctx["Low"].values.astype(float)
+    volumes = df_ctx["Volume"].values.astype(float)
+
+    # 計算動能初始偏移
+    momentum_bias = 0.0
+    if use_momentum_init:
+        momentum_bias = estimate_momentum_drift(
+            closes, window=momentum_window, scale=momentum_scale
+        )
 
     if agents is None:
         agents = build_default_agents(
@@ -71,18 +106,14 @@ def run_simulation(
             n_momentum=n_momentum,
             n_random=n_random,
             n_contrarian=n_contrarian,
+            momentum_bias=momentum_bias,
+            bias_decay=bias_decay,
             rng=rng,
         )
-
-    # Warmup context
-    df_ctx  = df_real.tail(warmup_bars).reset_index(drop=True)
-    closes  = df_ctx["Close"].values.astype(float)
-    highs   = df_ctx["High"].values.astype(float)
-    lows    = df_ctx["Low"].values.astype(float)
-    volumes = df_ctx["Volume"].values.astype(float)
-
-    print(f"[sim] drift_per_bar: {drift_per_bar:.6f}  "
-          f"(annualised ~{drift_per_bar * 252:.2%})")
+    else:
+        # 重置 agent 狀態，防止上一次模擬的記憶污染
+        for a in agents:
+            a.reset_state()
 
     engine = MarketEngine(
         agents=agents,
@@ -103,10 +134,8 @@ def run_simulation(
             volume_history=volumes,
             bar_idx=warmup_bars + i,
         )
-
         next_date = last_date + pd.offsets.BDay(1)
         last_date = next_date
-
         rows.append({
             "Date":     next_date,
             "Open":     bar["open"],
@@ -116,11 +145,9 @@ def run_simulation(
             "Volume":   bar["volume"],
             "NetOrder": bar["net_order"],
         })
-
         closes  = np.append(closes,  bar["close"])
         highs   = np.append(highs,   bar["high"])
         lows    = np.append(lows,    bar["low"])
         volumes = np.append(volumes, bar["volume"])
 
-    df_sim = pd.DataFrame(rows)
-    return df_ctx, df_sim
+    return df_ctx, pd.DataFrame(rows)
