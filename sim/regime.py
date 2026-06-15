@@ -11,7 +11,7 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
 - loss 加入 p_up penalty + vol_err，同時控制方向偏差和波動率
-- std_ratio 超過 1.5 的組合 loss 直接加倍淤汰不合理高波動
+- std_ratio 對稱 penalty：sim_std/real_std > cap 或 < 1/cap 時 loss *= 2.0
 
 EMA 公式
 ---------
@@ -22,10 +22,11 @@ loss 公式
   loss = w_hurst * |hurst_err|
        + w_dir   * (1 - dir_hit)
        + w_kurt  * |kurt_err| / (|real_kurt| + 1)
-       + w_vol   * |std_err|  / (real_std + 1e-8)
+       + w_vol   * |std_err|  / (real_std + 1e-8)   <- w_vol=3.0
        + w_pup   * p_up penalty
 
-  若 sim_std / real_std > std_ratio_cap (1.5) → loss *= 2.0
+  ratio = sim_std / real_std
+  若 ratio > std_ratio_cap (1.5) 或 ratio < 1/std_ratio_cap (0.667) → loss *= 2.0
 
   波動率目標用 lookback 窗口的 real_std，而非 step（20 根），
   避免短序列估算不穩定。
@@ -51,13 +52,12 @@ from .metrics import compare, hurst_exponent, log_returns
 # ---------------------------------------------------------------------------
 # Small grid for per-window search
 # 3x3x3x3 = 81 combos, ~10 sims each = 810 paths per window
-# intra_noise_scale 上界擴展到 1.5，讓 noise 不再一直貿頂
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
     "impact_coeff":      [0.0008, 0.0015, 0.0025],
     "momentum_scale":    [0.5,    1.0,    2.0   ],
     "decay":             [0.90,   0.93,   0.97  ],
-    "intra_noise_scale": [0.7,    1.0,    1.5   ],  # 上界: 1.0 -> 1.5
+    "intra_noise_scale": [0.7,    1.0,    1.5   ],
 }
 
 
@@ -82,7 +82,7 @@ class RegimeCalibrator:
     p_up_lo, p_up_hi : float
         p_up 合理範圍，超出會加 penalty。
     std_ratio_cap : float
-        sim_std / real_std 超過此値時 loss 乘以 2.0。預設 1.5。
+        sim_std/real_std 超出 (cap, 1/cap) 區間時 loss 乘以 2.0。預設 1.5。
     verbose : bool
         是否印每個 window 的搜尋結果。
     """
@@ -98,7 +98,7 @@ class RegimeCalibrator:
         w_hurst: float = 1.0,
         w_dir:   float = 1.0,
         w_kurt:  float = 0.5,
-        w_vol:   float = 1.5,
+        w_vol:   float = 3.0,   # 1.5 -> 3.0
         w_pup:   float = 1.5,
         p_up_lo: float = 0.25,
         p_up_hi: float = 0.60,
@@ -146,9 +146,11 @@ class RegimeCalibrator:
             + self.w_pup  * pup_pen
         )
 
-        # std_ratio penalty: 超高波動的組合直接淤汰
-        if real_std > 1e-8 and (sim_std / real_std) > self.std_ratio_cap:
-            loss *= 2.0
+        # 對稱 std_ratio penalty：波動過高或過低的組合都直接淤汰
+        if real_std > 1e-8:
+            ratio = sim_std / real_std
+            if ratio > self.std_ratio_cap or ratio < (1.0 / self.std_ratio_cap):
+                loss *= 2.0
 
         return loss
 
@@ -163,7 +165,6 @@ class RegimeCalibrator:
         在 df_target（長度 = step）上做小 grid search。
         波動率目標用 df_train（lookback 窗口）估算，不用 20 根的 df_target。
         """
-        # --- targets from LOOKBACK window (stable) ---
         train_rets = log_returns(df_train["Close"].values)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
