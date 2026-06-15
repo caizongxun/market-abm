@@ -6,9 +6,11 @@ Main entry point: fetch data -> run simulation -> print stats -> (optional) plot
 Usage
 -----
   python run_sim.py --symbol AAPL --bars 200 --plot
-  python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-01-01 --bars 60 --plot
+  python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-06-01 --bars 60 --plot
   python run_sim.py --symbol TSLA --bars 150 --warmup 120 --seed 0
   python run_sim.py --symbol SPY  --bars 200 --impact 0.001 --noise 1.0 --plot
+  # Manually inject a drift (use only when you have a principled estimate):
+  python run_sim.py --symbol AAPL --bars 200 --drift 0.0005 --plot
 """
 
 from __future__ import annotations
@@ -37,19 +39,18 @@ def parse_args():
     p.add_argument("--bars",    type=int, default=200,   help="Number of bars to simulate")
     p.add_argument("--warmup",  type=int, default=100,   help="Warm-up history bars")
     p.add_argument("--years",   type=int, default=3,     help="Years of history to download (ignored if --start/--end given)")
-    # Date range (optional; overrides --years)
     p.add_argument("--start",   default=None,
-                   help="Fetch start date YYYY-MM-DD.  "
-                        "The first (total - bars) rows become warmup+train; "
-                        "the last (bars) rows are the real comparison target.")
+                   help="Fetch start date YYYY-MM-DD. Last (bars) rows become real comparison target.")
     p.add_argument("--end",     default=None,
                    help="Fetch end date YYYY-MM-DD (default: today)")
     p.add_argument("--impact",  type=float, default=0.001,  help="Market impact coefficient")
     p.add_argument("--noise",   type=float, default=1.0,    help="Intra-bar ATR noise scale")
+    p.add_argument("--drift",   type=float, default=0.0,
+                   help="Per-bar log-return drift injected into the engine (default 0.0). "
+                        "Example: 0.0005 ~ +13%% annualised. Use only with a principled estimate.")
     p.add_argument("--seed",    type=int,   default=42,     help="Random seed")
     p.add_argument("--plot",    action="store_true", help="Generate comparison plot")
     p.add_argument("--out-dir", default="results",   help="Output directory")
-    # agent counts
     p.add_argument("--n-inst", type=int, default=5,   help="Institution agent count")
     p.add_argument("--n-mom",  type=int, default=40,  help="Momentum trader count")
     p.add_argument("--n-rand", type=int, default=100, help="Random trader count")
@@ -196,7 +197,6 @@ def main():
         print("       Increase --years or widen --start/--end, or reduce --bars / --warmup")
         sys.exit(1)
 
-    # Split: everything except last (bars) rows -> train; last (bars) rows -> real comparison
     df_train       = df_all.iloc[:-(args.bars)].copy()
     df_real_future = df_all.iloc[-(args.bars):].copy().reset_index(drop=True)
     print(f"[data] train rows: {len(df_train)}  "
@@ -215,6 +215,7 @@ def main():
         warmup_bars=args.warmup,
         impact_coeff=args.impact,
         intra_noise_scale=args.noise,
+        drift_per_bar=args.drift,
         n_institution=args.n_inst,
         n_momentum=args.n_mom,
         n_random=args.n_rand,

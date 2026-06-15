@@ -7,10 +7,18 @@ then let the agent pool simulate N forward bars.
 Flow
 ----
 1. Load real OHLCV (warmup context)
-2. Estimate drift_per_bar from warmup log-returns
-3. From the start point, call MarketEngine.step() each iteration
-4. Each new bar is appended to the rolling history
-5. Return simulated bar DataFrame
+2. Call MarketEngine.step() for each bar
+3. Each new bar is appended to the rolling history
+4. Return simulated bar DataFrame
+
+Drift policy
+------------
+Drift is NOT estimated automatically from warmup history.
+Warmup drift reflects the past regime, not the future window,
+and injecting it causes systematic directional bias.
+Pass an explicit drift value via the `drift_per_bar` argument
+(or --drift in run_sim.py) only when you have a principled reason.
+Default is 0.0 (agents determine direction through net order flow).
 """
 
 from __future__ import annotations
@@ -26,8 +34,9 @@ def run_simulation(
     df_real: pd.DataFrame,
     sim_bars: int = 200,
     warmup_bars: int = 100,
-    impact_coeff: float = 0.0005,
+    impact_coeff: float = 0.001,
     intra_noise_scale: float = 1.0,
+    drift_per_bar: float = 0.0,
     n_institution: int = 5,
     n_momentum:    int = 40,
     n_random:      int = 100,
@@ -45,6 +54,7 @@ def run_simulation(
     warmup_bars       : History bars used to initialise agent state
     impact_coeff      : Market impact coefficient
     intra_noise_scale : ATR multiplier for intra-bar noise
+    drift_per_bar     : Per-bar log-return drift (default 0.0 = no forced trend)
     seed              : Random seed
     agents            : Custom agent list; None uses build_default_agents()
 
@@ -71,10 +81,7 @@ def run_simulation(
     lows    = df_ctx["Low"].values.astype(float)
     volumes = df_ctx["Volume"].values.astype(float)
 
-    # Estimate drift from warmup log-returns
-    log_rets = np.diff(np.log(closes))
-    drift_per_bar = float(np.mean(log_rets)) if len(log_rets) > 0 else 0.0
-    print(f"[sim] drift_per_bar estimated from warmup: {drift_per_bar:.6f}  "
+    print(f"[sim] drift_per_bar: {drift_per_bar:.6f}  "
           f"(annualised ~{drift_per_bar * 252:.2%})")
 
     engine = MarketEngine(
@@ -110,7 +117,6 @@ def run_simulation(
             "NetOrder": bar["net_order"],
         })
 
-        # Rolling append
         closes  = np.append(closes,  bar["close"])
         highs   = np.append(highs,   bar["high"])
         lows    = np.append(lows,    bar["low"])
