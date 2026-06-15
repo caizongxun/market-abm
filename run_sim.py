@@ -8,7 +8,7 @@ Usage examples
 
   # 雙窗口動能初始化（建議預設）
   python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-06-01 \\
-      --bars 60 --momentum-init --plot
+      --bars 60 --momentum-init --n-sims 50 --plot
 
   # 多路徑 fan chart
   python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-06-01 \\
@@ -16,7 +16,13 @@ Usage examples
 
   # 調整窗口
   python run_sim.py --symbol AAPL --bars 60 --momentum-init \\
-      --momentum-window-fast 5 --momentum-window-slow 20 --decay 0.93 --plot
+      --momentum-window-fast 5 --momentum-window-slow 20 --decay 0.97 --plot
+
+Decay guide (bias residual at bar N)
+-------------------------------------
+  decay=0.97  bar 20: 55%   bar 40: 30%   bar 60: 16%   <- default, good for 60-bar sims
+  decay=0.95  bar 20: 36%   bar 40: 13%   bar 60:  5%   <- too fast for 60-bar
+  decay=0.99  bar 20: 82%   bar 40: 67%   bar 60: 55%   <- persistent, use for 120+ bar sims
 """
 
 from __future__ import annotations
@@ -54,7 +60,8 @@ def parse_args():
     p.add_argument("--warmup",  type=int,   default=100)
     p.add_argument("--n-sims",  type=int,   default=1,
                    help="Paths to run. >1 generates fan chart.")
-    p.add_argument("--impact",  type=float, default=0.001)
+    p.add_argument("--impact",  type=float, default=0.0015,
+                   help="Market impact coefficient (default 0.0015).")
     p.add_argument("--noise",   type=float, default=1.0)
     p.add_argument("--drift",   type=float, default=0.0,
                    help="Manual per-bar log drift (default 0.0).")
@@ -67,8 +74,9 @@ def parse_args():
     p.add_argument("--momentum-window-slow", type=int,   default=20,
                    help="Slow window for trend confirmation (default 20).")
     p.add_argument("--momentum-scale",       type=float, default=1.0)
-    p.add_argument("--decay",                type=float, default=0.95,
-                   help="Per-bar exponential decay for momentum bias.")
+    p.add_argument("--decay",                type=float, default=0.97,
+                   help="Per-bar exponential decay for momentum bias. "
+                        "0.97 leaves ~16%% residual at bar 60. (default 0.97)")
     # Price floor
     p.add_argument("--path-floor", type=float, default=0.30,
                    help="Path-level price floor: close cannot drop more than this "
@@ -143,7 +151,6 @@ def plot_fan_chart(df_warmup, paths, df_real_future, symbol, out_path):
     fig.suptitle(f"ABM Fan Chart  |  {symbol}  |  {n_sims} paths",
                  fontsize=13, fontweight="bold")
 
-    # Panel 1: Price fan
     ax = axes[0, 0]
     ax.plot(df_warmup["Date"], df_warmup["Close"], color="#6b7280", lw=1.0, label="History")
     for p in paths:
@@ -158,7 +165,6 @@ def plot_fan_chart(df_warmup, paths, df_real_future, symbol, out_path):
     ax.set_title("Close Price Fan Chart")
     ax.legend(fontsize=8, framealpha=0.3)
 
-    # Panel 2: Return distribution
     ax = axes[0, 1]
     all_rets = np.concatenate([np.diff(np.log(p["Close"].values)) for p in paths])
     real_rets = (np.diff(np.log(df_real_future["Close"].values))
@@ -170,7 +176,6 @@ def plot_fan_chart(df_warmup, paths, df_real_future, symbol, out_path):
     ax.set_title("Return Distribution")
     ax.legend(fontsize=8, framealpha=0.3)
 
-    # Panel 3: P(Up) per bar
     ax = axes[1, 0]
     dir_mat  = (close_mat[:, 1:] > close_mat[:, :-1]).astype(float)
     prob_up  = dir_mat.mean(axis=0)
@@ -191,7 +196,6 @@ def plot_fan_chart(df_warmup, paths, df_real_future, symbol, out_path):
     ax.set_title("P(Up) per Bar  (above 0 = majority bullish)")
     ax.set_xlabel("Bar")
 
-    # Panel 4: Indexed performance
     ax = axes[1, 1]
     if not df_real_future.empty:
         rn = df_real_future["Close"].values / df_real_future["Close"].values[0] * 100
@@ -333,11 +337,16 @@ def main():
             scale=args.momentum_scale,
         )
         direction = "UP" if mom_drift > 0 else ("DOWN" if mom_drift < 0 else "FLAT")
+        # Bias half-life and residual at sim end
+        half_life = -np.log(2) / np.log(args.decay) if args.decay < 1.0 else float("inf")
+        residual_at_end = args.decay ** args.bars * 100
         print(f"[momentum-init] {reason}")
         print(f"               => {direction} bias  "
               f"{mom_drift:+.6f}/bar  "
               f"(annualised ~{mom_drift * 252:.2%})  "
-              f"decay={args.decay}")
+              f"decay={args.decay}  "
+              f"half-life={half_life:.1f} bars  "
+              f"residual@bar{args.bars}={residual_at_end:.1f}%")
 
     # 3. Sim config summary
     print(f"\n[sim] {args.symbol}  warmup={args.warmup}  bars={args.bars}  "
@@ -391,6 +400,8 @@ def main():
         final_rets = (close_mat[:, -1] - close_mat[:, 0]) / close_mat[:, 0]
         prob_up    = float((final_rets > 0).mean())
         med_ret    = float(np.median(final_rets))
+        p10_ret    = float(np.percentile(final_rets, 10))
+        p90_ret    = float(np.percentile(final_rets, 90))
         hv_idx     = int(np.argmax(vol_mat.sum(axis=1)))
         hv_ret     = float(
             (paths[hv_idx]["Close"].iloc[-1] - paths[hv_idx]["Close"].iloc[0])
@@ -406,11 +417,15 @@ def main():
         print(f"  P(final close > start)  : {prob_up:.1%}  "
               f"({'UP' if prob_up >= 0.5 else 'DOWN'} majority)")
         print(f"  Median total return     : {med_ret:+.2%}")
+        print(f"  10th / 90th pct return  : {p10_ret:+.2%} / {p90_ret:+.2%}")
         print(f"  Highest-vol path #{hv_idx:<3}   : {hv_ret:+.2%}")
         if not np.isnan(real_ret):
             print(f"  Real total return       : {real_ret:+.2%}")
-            match = (prob_up >= 0.5) == (real_ret > 0)
+            in_band = p10_ret <= real_ret <= p90_ret
+            match   = (prob_up >= 0.5) == (real_ret > 0)
             print(f"  Direction match         : {'YES' if match else 'NO'}")
+            print(f"  Real in 10-90th band    : {'YES' if in_band else 'NO'}  "
+                  f"[{p10_ret:+.2%}, {p90_ret:+.2%}]")
 
         med_close = np.median(close_mat, axis=0)
         df_med    = paths[0].copy()
