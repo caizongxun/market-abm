@@ -10,8 +10,8 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 - EMA 平滑（alpha=0.4）：新估値影響 40%，歷史殘留 60%
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
-- loss 加入 p_up penalty + vol_err，同時控制方向偏差和波動率
-- std_ratio 對稱 penalty：sim_std/real_std > cap 或 < 1/cap 時 loss *= 2.0
+- loss 加入 p_up penalty + vol_err + abs_vol_pen
+- std_ratio 對稱 penalty：sim_std/real_std 超出 (cap, 1/cap) 區間時 loss *= 2.0
 
 EMA 公式
 ---------
@@ -22,14 +22,14 @@ loss 公式
   loss = w_hurst * |hurst_err|
        + w_dir   * (1 - dir_hit)
        + w_kurt  * |kurt_err| / (|real_kurt| + 1)
-       + w_vol   * |std_err|  / (real_std + 1e-8)   <- w_vol=3.0
+       + w_vol   * |std_err|  / (real_std + 1e-8)
+       + w_vol   * max(0, sim_std - 2*real_std) / (real_std + 1e-8)  <- abs_vol_pen
        + w_pup   * p_up penalty
 
   ratio = sim_std / real_std
   若 ratio > std_ratio_cap (1.5) 或 ratio < 1/std_ratio_cap (0.667) → loss *= 2.0
 
-  波動率目標用 lookback 窗口的 real_std，而非 step（20 根），
-  避免短序列估算不穩定。
+  impact_coeff grid 收縮到 [0.0005, 0.0010, 0.0015]，抑制 sim_std 偏高。
 
 使用方式
 --------
@@ -52,9 +52,10 @@ from .metrics import compare, hurst_exponent, log_returns
 # ---------------------------------------------------------------------------
 # Small grid for per-window search
 # 3x3x3x3 = 81 combos, ~10 sims each = 810 paths per window
+# impact_coeff 收縮到 [0.0005, 0.0010, 0.0015]，不再給大値空間浪費
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
-    "impact_coeff":      [0.0008, 0.0015, 0.0025],
+    "impact_coeff":      [0.0005, 0.0010, 0.0015],  # 上界: 0.0025 -> 0.0015
     "momentum_scale":    [0.5,    1.0,    2.0   ],
     "decay":             [0.90,   0.93,   0.97  ],
     "intra_noise_scale": [0.7,    1.0,    1.5   ],
@@ -98,7 +99,7 @@ class RegimeCalibrator:
         w_hurst: float = 1.0,
         w_dir:   float = 1.0,
         w_kurt:  float = 0.5,
-        w_vol:   float = 3.0,   # 1.5 -> 3.0
+        w_vol:   float = 3.0,
         w_pup:   float = 1.5,
         p_up_lo: float = 0.25,
         p_up_hi: float = 0.60,
@@ -138,11 +139,15 @@ class RegimeCalibrator:
         dir_term  = 1.0 - metrics["direction_hit_rate"]
         pup_pen   = max(0.0, p_up - self.p_up_hi) + max(0.0, self.p_up_lo - p_up)
 
+        # 絕對波動率超顏懲罰：sim_std 超過 2x real_std 的部分額外加分
+        abs_vol_pen = max(0.0, sim_std - 2.0 * real_std) / (real_std + 1e-8)
+
         loss = (
             self.w_hurst * hurst_err
             + self.w_dir  * dir_term
             + self.w_kurt * kurt_err
             + self.w_vol  * vol_err
+            + self.w_vol  * abs_vol_pen
             + self.w_pup  * pup_pen
         )
 
