@@ -26,7 +26,7 @@ auto_drift 模式（預設開啟）
 Rolling calibration
 -------------------
 見 sim/regime.py 的 RegimeCalibrator。
-run_simulation_rolling() 是薄薄的 wrapper，讓 run_sim.py 用 --rolling flag 呼叫。
+run_simulation_rolling() 是藄藄的 wrapper，讓 run_sim.py 用 --rolling flag 呼叫。
 """
 
 from __future__ import annotations
@@ -98,12 +98,15 @@ def run_simulation(
     """
     執行一次 ABM 模擬。
 
+    df_real 接受兩種格式：
+      (a) DatetimeIndex + OHLCV 欄位（fetch.py 回傳的原始格式）
+      (b) 整數 index + Date 欄位（舊快取檔或手動建立的 DataFrame）
+
     Parameters
     ----------
     auto_drift : bool
         當 True 且 use_momentum_init=True 且 drift_per_bar==0 時，
         自動把 momentum_bias 注入 drift schedule（逐 bar 歸零）。
-        這樣能避免 bias 被 total_capital 稀釋。預設 True。
     path_floor_pct : float
         路徑級別 floor：任何 bar 的 close 不得低於起始 close * (1 - path_floor_pct)。
 
@@ -121,6 +124,16 @@ def run_simulation(
 
     start_close    = float(closes[-1])
     path_min_price = start_close * (1.0 - path_floor_pct) if path_floor_pct > 0 else 0.0
+
+    # --- 取最後一根 bar 的日期，公尤兩種封載格式 ---
+    # df_real 可能是 DatetimeIndex 或是含 Date 欄的整數 index
+    _tail = df_real.tail(1)
+    if isinstance(_tail.index, pd.DatetimeIndex):
+        last_date = pd.Timestamp(_tail.index[-1])
+    elif "Date" in df_real.columns:
+        last_date = pd.Timestamp(df_real["Date"].iloc[-1])
+    else:
+        last_date = pd.Timestamp("2000-01-01")  # fallback
 
     # Momentum bias
     momentum_bias   = 0.0
@@ -160,8 +173,7 @@ def run_simulation(
         seed=int(rng.integers(0, 2**31)),
     )
 
-    rows      = []
-    last_date = pd.Timestamp(df_ctx["Date"].iloc[-1])
+    rows = []
 
     for i in range(sim_bars):
         if drift_schedule is not None:
