@@ -6,15 +6,26 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 
 設計原則
 --------
-- grid 比 ParamCalibrator 小（3x3x3 = 27 組），快速估算
-- EMA 平滑（alpha=0.4）：新估值影響 40%，歷史殘留 60%
+- grid 比 ParamCalibrator 小（3x3x3x3 = 81 組）
+- EMA 平滑（alpha=0.4）：新估値影響 40%，歷史殘留 60%
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
-- loss 加入 p_up penalty，防止 scale 過大讓模擬單方向崩潰
+- loss 加入 p_up penalty + vol_err，同時控制方向偏差和波動率
 
 EMA 公式
 ---------
   param_ema[t] = alpha * param_new[t] + (1 - alpha) * param_ema[t-1]
+
+loss 公式
+---------
+  loss = w_hurst * |hurst_err|
+       + w_dir   * (1 - dir_hit)
+       + w_kurt  * |kurt_err| / (|real_kurt| + 1)
+       + w_vol   * |std_err|  / (real_std + 1e-8)   <- NEW
+       + w_pup   * p_up penalty
+
+  波動率目標用 lookback 窗口的 real_std，而非 step（只 20 根），
+  避免短序列估算不穩定。
 
 使用方式
 --------
@@ -35,12 +46,15 @@ from .simulation import run_simulation
 from .metrics import compare, hurst_exponent, log_returns
 
 # ---------------------------------------------------------------------------
-# Small grid for per-window search (27 combos, ~10 sims each = 270 paths)
+# Small grid for per-window search
+# 3x3x3x3 = 81 combos, ~10 sims each = 810 paths per window
+# intra_noise_scale added: directly controls intra-bar volatility
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
-    "impact_coeff":   [0.0008, 0.0015, 0.0025],
-    "momentum_scale": [0.5,    1.0,    2.0   ],
-    "decay":          [0.90,   0.93,   0.97   ],
+    "impact_coeff":      [0.0008, 0.0015, 0.0025],
+    "momentum_scale":    [0.5,    1.0,    2.0   ],
+    "decay":             [0.90,   0.93,   0.97  ],
+    "intra_noise_scale": [0.4,    0.7,    1.0   ],
 }
 
 
@@ -57,10 +71,10 @@ class RegimeCalibrator:
     warmup_bars : int
         run_simulation 的 warmup context。預設 60。
     ema_alpha : float
-        EMA 平滑係數。0.4 = 新估值佔 40%，建議範圍 0.3–0.6。
+        EMA 平滑係數。建議範圍 0.3–0.6。
     grid : dict
-        參數搜尋網格，預設 ROLLING_GRID（3x3x3）。
-    w_hurst, w_dir, w_kurt, w_pup : float
+        參數搜尋網格，預設 ROLLING_GRID（3x3x3x3 = 81）。
+    w_hurst, w_dir, w_kurt, w_vol, w_pup : float
         loss 各項權重。
     p_up_lo, p_up_hi : float
         p_up 合理範圍，超出會加 penalty。
@@ -79,6 +93,7 @@ class RegimeCalibrator:
         w_hurst: float = 1.0,
         w_dir:   float = 1.0,
         w_kurt:  float = 0.5,
+        w_vol:   float = 1.5,
         w_pup:   float = 1.5,
         p_up_lo: float = 0.25,
         p_up_hi: float = 0.60,
@@ -93,6 +108,7 @@ class RegimeCalibrator:
         self.w_hurst     = w_hurst
         self.w_dir       = w_dir
         self.w_kurt      = w_kurt
+        self.w_vol       = w_vol
         self.w_pup       = w_pup
         self.p_up_lo     = p_up_lo
         self.p_up_hi     = p_up_hi
@@ -104,18 +120,20 @@ class RegimeCalibrator:
         metrics: dict,
         real_hurst: float,
         real_kurtosis: float,
+        real_std: float,
         p_up: float,
     ) -> float:
-        from scipy import stats as scipy_stats
         sim = metrics["sim"]
         hurst_err = abs(sim["hurst"] - real_hurst)
         kurt_err  = abs(sim["kurtosis"] - real_kurtosis) / (abs(real_kurtosis) + 1.0)
+        vol_err   = abs(sim["std"] - real_std) / (real_std + 1e-8)
         dir_term  = 1.0 - metrics["direction_hit_rate"]
         pup_pen   = max(0.0, p_up - self.p_up_hi) + max(0.0, self.p_up_lo - p_up)
         return (
             self.w_hurst * hurst_err
             + self.w_dir  * dir_term
             + self.w_kurt * kurt_err
+            + self.w_vol  * vol_err
             + self.w_pup  * pup_pen
         )
 
@@ -127,15 +145,17 @@ class RegimeCalibrator:
         seed: int = 0,
     ) -> dict[str, Any]:
         """
-        在 df_target（長度 = step）上做小 grid search，
-        返回最佳參數 dict。
+        在 df_target（長度 = step）上做小 grid search。
+        波動率目標用 df_train（lookback 窗口）估算，不用 20 根的 df_target。
         """
-        real_rets = log_returns(df_target["Close"].values)
+        # --- targets from LOOKBACK window (stable) ---
+        train_rets = log_returns(df_train["Close"].values)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            real_hurst = hurst_exponent(real_rets)
+            real_hurst = hurst_exponent(train_rets)
         from scipy import stats as scipy_stats
-        real_kurtosis = float(scipy_stats.kurtosis(real_rets))
+        real_kurtosis = float(scipy_stats.kurtosis(train_rets))
+        real_std      = float(np.std(train_rets))
 
         keys   = list(self.grid.keys())
         combos = list(itertools.product(*[self.grid[k] for k in keys]))
@@ -154,6 +174,7 @@ class RegimeCalibrator:
                     impact_coeff=params["impact_coeff"],
                     momentum_scale=params["momentum_scale"],
                     bias_decay=params["decay"],
+                    intra_noise_scale=params["intra_noise_scale"],
                     use_momentum_init=True,
                     auto_drift=True,
                     seed=seed + i,
@@ -164,17 +185,19 @@ class RegimeCalibrator:
             med_close  = np.median(close_mat, axis=0)
             df_med     = paths[0].copy()
             df_med["Close"] = med_close
-            m = compare(df_target, df_med, print_report=False)
+            m = compare(df_train, df_med, print_report=False)
 
             final_rets = (close_mat[:, -1] - close_mat[:, 0]) / close_mat[:, 0]
             p_up = float((final_rets > 0).mean())
 
-            loss = self._loss(m, real_hurst, real_kurtosis, p_up)
+            loss = self._loss(m, real_hurst, real_kurtosis, real_std, p_up)
             if loss < best_loss:
                 best_loss   = loss
                 best_params = {**params, "loss": loss, "p_up": p_up,
                                "hurst_sim": m["sim"]["hurst"],
-                               "real_hurst": real_hurst}
+                               "real_hurst": real_hurst,
+                               "real_std": real_std,
+                               "sim_std": m["sim"]["std"]}
 
         return best_params
 
@@ -185,7 +208,7 @@ class RegimeCalibrator:
         new: dict[str, float],
         alpha: float,
     ) -> dict[str, float]:
-        keys = ["impact_coeff", "momentum_scale", "decay"]
+        keys = ["impact_coeff", "momentum_scale", "decay", "intra_noise_scale"]
         return {k: alpha * new[k] + (1 - alpha) * current[k] for k in keys}
 
     # ------------------------------------------------------------------
@@ -209,21 +232,21 @@ class RegimeCalibrator:
         df_result : pd.DataFrame
             每根模擬 bar 的 OHLCV（拼接所有 window）。
         param_log : list[dict]
-            每個 window 的參數記錄（window_start, params, loss, hurst_sim, real_hurst）。
+            每個 window 的參數記錄。
         """
-        n_total    = len(df_all)
-        sim_start  = self.lookback   # 前 lookback 根作為第一個 warmup
+        n_total   = len(df_all)
+        sim_start = self.lookback
 
         if n_total < sim_start + self.step:
             raise ValueError(
                 f"df_all 長度 ({n_total}) 不足 lookback ({self.lookback}) + step ({self.step})"
             )
 
-        # 初始參數：grid 中點
         current_params = {
-            "impact_coeff":   float(np.median(self.grid["impact_coeff"])),
-            "momentum_scale": float(np.median(self.grid["momentum_scale"])),
-            "decay":          float(np.median(self.grid["decay"])),
+            "impact_coeff":      float(np.median(self.grid["impact_coeff"])),
+            "momentum_scale":    float(np.median(self.grid["momentum_scale"])),
+            "decay":             float(np.median(self.grid["decay"])),
+            "intra_noise_scale": float(np.median(self.grid["intra_noise_scale"])),
         }
 
         all_bars:  list[pd.DataFrame] = []
@@ -231,19 +254,17 @@ class RegimeCalibrator:
         window_idx = 0
 
         pos = sim_start
+        n_combos = len(list(itertools.product(*self.grid.values())))
         while pos + self.step <= n_total:
             df_train  = df_all.iloc[max(0, pos - self.lookback): pos].copy().reset_index(drop=True)
             df_target = df_all.iloc[pos: pos + self.step].copy().reset_index(drop=True)
 
-            # --- small grid search on this window ---
             best = self._search_window(
                 df_train  = df_train,
                 df_target = df_target,
-                seed      = seed + window_idx * self.n_sims * len(list(itertools.product(
-                    *self.grid.values()))),
+                seed      = seed + window_idx * self.n_sims * n_combos,
             )
 
-            # --- EMA smooth ---
             smoothed = self._ema_update(current_params, best, self.ema_alpha)
             current_params = smoothed
 
@@ -253,25 +274,28 @@ class RegimeCalibrator:
                     f"bars [{pos}:{pos+self.step}]  "
                     f"impact={smoothed['impact_coeff']:.4f}  "
                     f"scale={smoothed['momentum_scale']:.2f}  "
+                    f"noise={smoothed['intra_noise_scale']:.2f}  "
                     f"decay={smoothed['decay']:.3f}  "
                     f"loss={best.get('loss', float('nan')):.4f}  "
-                    f"hurst sim/real={best.get('hurst_sim', 0):.3f}/{best.get('real_hurst', 0):.3f}"
+                    f"std sim/real={best.get('sim_std', 0)*100:.3f}%/{best.get('real_std', 0)*100:.3f}%"
                 )
 
             param_log.append({
-                "window":        window_idx,
-                "bar_start":     pos,
-                "bar_end":       pos + self.step,
-                "impact_coeff":  smoothed["impact_coeff"],
-                "momentum_scale": smoothed["momentum_scale"],
-                "decay":         smoothed["decay"],
-                "loss":          best.get("loss", float("nan")),
-                "p_up":          best.get("p_up", float("nan")),
-                "hurst_sim":     best.get("hurst_sim", float("nan")),
-                "real_hurst":    best.get("real_hurst", float("nan")),
+                "window":            window_idx,
+                "bar_start":         pos,
+                "bar_end":           pos + self.step,
+                "impact_coeff":      smoothed["impact_coeff"],
+                "momentum_scale":    smoothed["momentum_scale"],
+                "intra_noise_scale": smoothed["intra_noise_scale"],
+                "decay":             smoothed["decay"],
+                "loss":              best.get("loss",       float("nan")),
+                "p_up":              best.get("p_up",       float("nan")),
+                "hurst_sim":         best.get("hurst_sim",  float("nan")),
+                "real_hurst":        best.get("real_hurst", float("nan")),
+                "sim_std":           best.get("sim_std",    float("nan")),
+                "real_std":          best.get("real_std",   float("nan")),
             })
 
-            # --- simulate this window with smoothed params ---
             _, df_window_sim = run_simulation(
                 df_real=df_train,
                 sim_bars=self.step,
@@ -279,6 +303,7 @@ class RegimeCalibrator:
                 impact_coeff=smoothed["impact_coeff"],
                 momentum_scale=smoothed["momentum_scale"],
                 bias_decay=smoothed["decay"],
+                intra_noise_scale=smoothed["intra_noise_scale"],
                 use_momentum_init=True,
                 auto_drift=True,
                 seed=seed + window_idx,
