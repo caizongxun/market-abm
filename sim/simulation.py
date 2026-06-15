@@ -17,7 +17,7 @@ auto_drift 模式（預設開啟）
 -----------------------------
 當 use_momentum_init=True 且 drift_per_bar=0.0 時，自動把 momentum_bias
 注入 drift_per_bar（逐 bar 歸零）而不是透過 agent 訂單量。
-這樣能避免 bias 被 total_capital 稼釋成幾乎零。
+這樣能避免 bias 被 total_capital 稀釋成幾乎零。
 
   effective_drift[bar_i] = momentum_bias * decay^i
 
@@ -73,7 +73,7 @@ def run_simulation(
     df_real: pd.DataFrame,
     sim_bars: int = 200,
     warmup_bars: int = 100,
-    impact_coeff: float = 0.001,
+    impact_coeff: float = 0.0015,
     intra_noise_scale: float = 1.0,
     drift_per_bar: float = 0.0,
     momentum_window_fast: int = 5,
@@ -97,8 +97,8 @@ def run_simulation(
     ----------
     auto_drift : bool
         當 True 且 use_momentum_init=True 且 drift_per_bar==0 時，
-        自動把 momentum_bias 注入 drift schedule（逗 bar 歸零）。
-        這樣能避免 bias 被 total_capital 稼釋。預設 True。
+        自動把 momentum_bias 注入 drift schedule（逐 bar 歸零）。
+        這樣能避免 bias 被 total_capital 稀釋。預設 True。
     path_floor_pct : float
         路徑級別 floor：任何 bar 的 close 不得低於起始 close * (1 - path_floor_pct)。
 
@@ -130,7 +130,7 @@ def run_simulation(
 
     # Auto-drift: convert momentum_bias -> per-bar drift schedule
     # drift_schedule[i] = momentum_bias * decay^i
-    # This bypasses total_capital dilution in the impact formula.
+    # Bypasses total_capital dilution in the impact formula.
     drift_schedule: np.ndarray | None = None
     if use_momentum_init and auto_drift and drift_per_bar == 0.0 and momentum_bias != 0.0:
         drift_schedule = momentum_bias * (bias_decay ** np.arange(sim_bars))
@@ -153,7 +153,7 @@ def run_simulation(
         agents=agents,
         impact_coeff=impact_coeff,
         intra_noise_scale=intra_noise_scale,
-        drift_per_bar=drift_per_bar,   # 0.0 when auto_drift; overridden per-bar below
+        drift_per_bar=drift_per_bar,
         seed=int(rng.integers(0, 2**31)),
     )
 
@@ -161,7 +161,6 @@ def run_simulation(
     last_date = pd.Timestamp(df_ctx["Date"].iloc[-1])
 
     for i in range(sim_bars):
-        # Per-bar drift override when using auto_drift schedule
         if drift_schedule is not None:
             engine.drift_per_bar = float(drift_schedule[i])
 

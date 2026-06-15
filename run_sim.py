@@ -8,15 +8,13 @@ Usage examples
 
   # 雙窗口動能初始化（建議預設）
   python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-06-01 \\
-      --bars 60 --momentum-init --n-sims 50 --plot
+      --bars 60 --momentum-init --n-sims 200 --plot
 
-  # 多路徑 fan chart
-  python run_sim.py --symbol AAPL --start 2024-01-01 --end 2025-06-01 \\
-      --bars 60 --momentum-init --n-sims 50 --plot
+  # 停用 auto_drift（對比實驗用）
+  python run_sim.py --symbol AAPL --bars 60 --momentum-init --no-auto-drift --plot
 
-  # 調整窗口
-  python run_sim.py --symbol AAPL --bars 60 --momentum-init \\
-      --momentum-window-fast 5 --momentum-window-slow 20 --decay 0.97 --plot
+  # 用 calibrator 找最佳參數
+  python -m sim.calibrate --symbol AAPL --start 2024-01-01 --end 2025-06-01
 
 Decay guide (bias residual at bar N)
 -------------------------------------
@@ -69,18 +67,17 @@ def parse_args():
     # Momentum init
     p.add_argument("--momentum-init", action="store_true",
                    help="Enable dual-window momentum bias injection.")
-    p.add_argument("--momentum-window-fast", type=int,   default=5,
-                   help="Fast window for reversal detection (default 5).")
-    p.add_argument("--momentum-window-slow", type=int,   default=20,
-                   help="Slow window for trend confirmation (default 20).")
+    p.add_argument("--no-auto-drift", action="store_true",
+                   help="Disable auto_drift (bias goes through agent orders instead of "
+                        "drift_per_bar). Use for comparison experiments.")
+    p.add_argument("--momentum-window-fast", type=int,   default=5)
+    p.add_argument("--momentum-window-slow", type=int,   default=20)
     p.add_argument("--momentum-scale",       type=float, default=1.0)
     p.add_argument("--decay",                type=float, default=0.97,
                    help="Per-bar exponential decay for momentum bias. "
                         "0.97 leaves ~16%% residual at bar 60. (default 0.97)")
     # Price floor
-    p.add_argument("--path-floor", type=float, default=0.30,
-                   help="Path-level price floor: close cannot drop more than this "
-                        "fraction from start_close (default 0.30 = -30%%). Set 0 to disable.")
+    p.add_argument("--path-floor", type=float, default=0.30)
     # Agents
     p.add_argument("--n-inst",  type=int, default=5)
     p.add_argument("--n-mom",   type=int, default=40)
@@ -96,6 +93,7 @@ def parse_args():
 # Multi-sim
 # ---------------------------------------------------------------------------
 def run_multi_sim(df_train, n_sims, args):
+    auto_drift = not args.no_auto_drift
     paths = []
     for i in range(n_sims):
         _, df_sim = run_simulation(
@@ -110,6 +108,7 @@ def run_multi_sim(df_train, n_sims, args):
             momentum_scale=args.momentum_scale,
             bias_decay=args.decay,
             use_momentum_init=args.momentum_init,
+            auto_drift=auto_drift,
             n_institution=args.n_inst,
             n_momentum=args.n_mom,
             n_random=args.n_rand,
@@ -305,6 +304,7 @@ def print_ohlcv_comparison(df_real, df_sim, n=10):
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
+    auto_drift = not args.no_auto_drift
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -327,7 +327,7 @@ def main():
           f"({df_real_future['Date'].iloc[0].date()} ~ "
           f"{df_real_future['Date'].iloc[-1].date()})")
 
-    # 2. Momentum estimate
+    # 2. Momentum estimate (for display)
     if args.momentum_init:
         ctx_closes = df_train.tail(args.warmup)["Close"].values.astype(float)
         mom_drift, reason = estimate_momentum_drift_dual(
@@ -337,7 +337,6 @@ def main():
             scale=args.momentum_scale,
         )
         direction = "UP" if mom_drift > 0 else ("DOWN" if mom_drift < 0 else "FLAT")
-        # Bias half-life and residual at sim end
         half_life = -np.log(2) / np.log(args.decay) if args.decay < 1.0 else float("inf")
         residual_at_end = args.decay ** args.bars * 100
         print(f"[momentum-init] {reason}")
@@ -347,6 +346,10 @@ def main():
               f"decay={args.decay}  "
               f"half-life={half_life:.1f} bars  "
               f"residual@bar{args.bars}={residual_at_end:.1f}%")
+        if auto_drift:
+            print(f"               [auto_drift=ON] bias routed to drift_per_bar schedule")
+        else:
+            print(f"               [auto_drift=OFF] bias routed through agent orders (diluted by capital)")
 
     # 3. Sim config summary
     print(f"\n[sim] {args.symbol}  warmup={args.warmup}  bars={args.bars}  "
@@ -366,6 +369,7 @@ def main():
         momentum_scale=args.momentum_scale,
         bias_decay=args.decay,
         use_momentum_init=args.momentum_init,
+        auto_drift=auto_drift,
         n_institution=args.n_inst,
         n_momentum=args.n_mom,
         n_random=args.n_rand,
@@ -427,6 +431,7 @@ def main():
             print(f"  Real in 10-90th band    : {'YES' if in_band else 'NO'}  "
                   f"[{p10_ret:+.2%}, {p90_ret:+.2%}]")
 
+        # Median path metrics (Hurst / kurtosis / direction_hit)
         med_close = np.median(close_mat, axis=0)
         df_med    = paths[0].copy()
         df_med["Close"] = med_close
@@ -434,6 +439,10 @@ def main():
         paths[hv_idx].to_csv(out_dir / f"{args.symbol}_sim_highvol.csv", index=False)
         print(f"[out] -> {out_dir}/{args.symbol}_sim_median.csv")
         print(f"[out] -> {out_dir}/{args.symbol}_sim_highvol.csv")
+
+        if not df_real_future.empty:
+            print(f"\n[metrics] median path vs. real ({args.bars} bars)")
+            compare(df_real_future, df_med, print_report=True)
 
         if args.plot:
             plot_fan_chart(df_warmup, paths, df_real_future, args.symbol,
