@@ -11,6 +11,7 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
 - loss 加入 p_up penalty + vol_err，同時控制方向偏差和波動率
+- std_ratio 超過 1.5 的組合 loss 直接加倍淤汰不合理高波動
 
 EMA 公式
 ---------
@@ -21,10 +22,12 @@ loss 公式
   loss = w_hurst * |hurst_err|
        + w_dir   * (1 - dir_hit)
        + w_kurt  * |kurt_err| / (|real_kurt| + 1)
-       + w_vol   * |std_err|  / (real_std + 1e-8)   <- NEW
+       + w_vol   * |std_err|  / (real_std + 1e-8)
        + w_pup   * p_up penalty
 
-  波動率目標用 lookback 窗口的 real_std，而非 step（只 20 根），
+  若 sim_std / real_std > std_ratio_cap (1.5) → loss *= 2.0
+
+  波動率目標用 lookback 窗口的 real_std，而非 step（20 根），
   避免短序列估算不穩定。
 
 使用方式
@@ -48,13 +51,13 @@ from .metrics import compare, hurst_exponent, log_returns
 # ---------------------------------------------------------------------------
 # Small grid for per-window search
 # 3x3x3x3 = 81 combos, ~10 sims each = 810 paths per window
-# intra_noise_scale added: directly controls intra-bar volatility
+# intra_noise_scale 上界擴展到 1.5，讓 noise 不再一直貿頂
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
     "impact_coeff":      [0.0008, 0.0015, 0.0025],
     "momentum_scale":    [0.5,    1.0,    2.0   ],
     "decay":             [0.90,   0.93,   0.97  ],
-    "intra_noise_scale": [0.4,    0.7,    1.0   ],
+    "intra_noise_scale": [0.7,    1.0,    1.5   ],  # 上界: 1.0 -> 1.5
 }
 
 
@@ -78,6 +81,8 @@ class RegimeCalibrator:
         loss 各項權重。
     p_up_lo, p_up_hi : float
         p_up 合理範圍，超出會加 penalty。
+    std_ratio_cap : float
+        sim_std / real_std 超過此値時 loss 乘以 2.0。預設 1.5。
     verbose : bool
         是否印每個 window 的搜尋結果。
     """
@@ -97,22 +102,24 @@ class RegimeCalibrator:
         w_pup:   float = 1.5,
         p_up_lo: float = 0.25,
         p_up_hi: float = 0.60,
+        std_ratio_cap: float = 1.5,
         verbose: bool = True,
     ):
-        self.lookback    = lookback
-        self.step        = step
-        self.n_sims      = n_sims
-        self.warmup_bars = warmup_bars
-        self.ema_alpha   = ema_alpha
-        self.grid        = grid if grid is not None else ROLLING_GRID
-        self.w_hurst     = w_hurst
-        self.w_dir       = w_dir
-        self.w_kurt      = w_kurt
-        self.w_vol       = w_vol
-        self.w_pup       = w_pup
-        self.p_up_lo     = p_up_lo
-        self.p_up_hi     = p_up_hi
-        self.verbose     = verbose
+        self.lookback      = lookback
+        self.step          = step
+        self.n_sims        = n_sims
+        self.warmup_bars   = warmup_bars
+        self.ema_alpha     = ema_alpha
+        self.grid          = grid if grid is not None else ROLLING_GRID
+        self.w_hurst       = w_hurst
+        self.w_dir         = w_dir
+        self.w_kurt        = w_kurt
+        self.w_vol         = w_vol
+        self.w_pup         = w_pup
+        self.p_up_lo       = p_up_lo
+        self.p_up_hi       = p_up_hi
+        self.std_ratio_cap = std_ratio_cap
+        self.verbose       = verbose
 
     # ------------------------------------------------------------------
     def _loss(
@@ -124,18 +131,26 @@ class RegimeCalibrator:
         p_up: float,
     ) -> float:
         sim = metrics["sim"]
+        sim_std   = sim["std"]
         hurst_err = abs(sim["hurst"] - real_hurst)
         kurt_err  = abs(sim["kurtosis"] - real_kurtosis) / (abs(real_kurtosis) + 1.0)
-        vol_err   = abs(sim["std"] - real_std) / (real_std + 1e-8)
+        vol_err   = abs(sim_std - real_std) / (real_std + 1e-8)
         dir_term  = 1.0 - metrics["direction_hit_rate"]
         pup_pen   = max(0.0, p_up - self.p_up_hi) + max(0.0, self.p_up_lo - p_up)
-        return (
+
+        loss = (
             self.w_hurst * hurst_err
             + self.w_dir  * dir_term
             + self.w_kurt * kurt_err
             + self.w_vol  * vol_err
             + self.w_pup  * pup_pen
         )
+
+        # std_ratio penalty: 超高波動的組合直接淤汰
+        if real_std > 1e-8 and (sim_std / real_std) > self.std_ratio_cap:
+            loss *= 2.0
+
+        return loss
 
     # ------------------------------------------------------------------
     def _search_window(
