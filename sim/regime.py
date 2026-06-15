@@ -14,12 +14,15 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 - std_ratio 對稱 penalty：sim_std/real_std 超出 (cap, 1/cap) 區間時 loss *= 2.0
 - impact_coeff grid 收縮到 [0.0005, 0.0010, 0.0015]，抑制 sim_std 偏高
 
-Window 接縫對齊
----------------
-每個 window 的最終模擬（all_bars 拼接用）會把前一個 window 最後一根
-真實收盤價傳入 run_simulation(initial_price=...)，MarketEngine 以此
-覆蓋 close_history[-1] 作為第一根 bar 的起始價格，消除跨 window
-的跳層漂移，讓 global std 從結構上接近 real_std。
+Window 接縫對齊（價格平移）
+--------------------------
+用對數報酬還原法把整個 window 的模擬路徑平移到 anchor_close：
+
+  scale = anchor_close / df_window_sim["Close"].iloc[0]
+  df_window_sim[["Open","High","Low","Close"]] *= scale
+
+這保留內部對數報酬的分佈（std / hurst / kurtosis 不變），
+同時消除跨 window 的價格跳層漂移，讓 global std 從結構上接近 real_std。
 
 EMA 公式
 ---------
@@ -58,7 +61,6 @@ from .metrics import compare, hurst_exponent, log_returns
 # ---------------------------------------------------------------------------
 # Small grid for per-window search
 # 3x3x3x3 = 81 combos, ~10 sims each = 810 paths per window
-# impact_coeff 收縮到 [0.0005, 0.0010, 0.0015]，不再給大值空間浪費
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
     "impact_coeff":      [0.0005, 0.0010, 0.0015],
@@ -145,7 +147,6 @@ class RegimeCalibrator:
         dir_term  = 1.0 - metrics["direction_hit_rate"]
         pup_pen   = max(0.0, p_up - self.p_up_hi) + max(0.0, self.p_up_lo - p_up)
 
-        # 絕對波動率超額懲罰：sim_std 超過 2x real_std 的部分額外加分
         abs_vol_pen = max(0.0, sim_std - 2.0 * real_std) / (real_std + 1e-8)
 
         loss = (
@@ -157,7 +158,6 @@ class RegimeCalibrator:
             + self.w_pup  * pup_pen
         )
 
-        # 對稱 std_ratio penalty：波動過高或過低的組合都直接淘汰
         if real_std > 1e-8:
             ratio = sim_std / real_std
             if ratio > self.std_ratio_cap or ratio < (1.0 / self.std_ratio_cap):
@@ -172,10 +172,6 @@ class RegimeCalibrator:
         df_target: pd.DataFrame,
         seed: int = 0,
     ) -> dict[str, Any]:
-        """
-        在 df_target（長度 = step）上做小 grid search。
-        波動率目標用 df_train（lookback 窗口）估算，不用 20 根的 df_target。
-        """
         train_rets = log_returns(df_train["Close"].values)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -205,7 +201,6 @@ class RegimeCalibrator:
                     use_momentum_init=True,
                     auto_drift=True,
                     seed=seed + i,
-                    # grid search 階段不需要 initial_price（評估局部統計特性）
                 )
                 paths.append(df_sim)
 
@@ -240,6 +235,29 @@ class RegimeCalibrator:
         return {k: alpha * new[k] + (1 - alpha) * current[k] for k in keys}
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _rescale_window(
+        df_window: pd.DataFrame,
+        anchor_close: float,
+    ) -> pd.DataFrame:
+        """
+        把整個 window 的 OHLC 乘上同一個 scale，
+        讓第一根 bar 的 Open == anchor_close。
+
+        用對數報酬還原法：內部每根 bar 的 log-return 完全不變，
+        只是整體水位平移，消除跨 window 的價格跳層。
+        """
+        df = df_window.copy()
+        first_open = float(df["Open"].iloc[0])
+        if first_open <= 0:
+            return df
+        scale = anchor_close / first_open
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in df.columns:
+                df[col] = df[col] * scale
+        return df
+
+    # ------------------------------------------------------------------
     def run(
         self,
         df_all: pd.DataFrame,
@@ -248,9 +266,9 @@ class RegimeCalibrator:
         """
         Rolling calibration 主迴圈。
 
-        每個 window 的最終模擬（用於拼接 all_bars）會傳入
-        initial_price = df_all.iloc[pos - 1]["Close"]，
-        讓模擬路徑從前一個真實收盤價出發，消除跨 window 跳層漂移。
+        每個 window 的最終模擬路徑會經過 _rescale_window() 平移，
+        確保第一根 bar 的 Open 等於前一個 window 的真實收盤價，
+        消除跨 window 跳層對 global std 的新增展。
 
         Parameters
         ----------
@@ -329,10 +347,13 @@ class RegimeCalibrator:
             })
 
             # -------------------------------------------------------
-            # 接縫對齊：取前一個 window 最後一根真實收盤價作為起始價格
-            # pos - 1 即 df_train 最後一根 bar 的位置
+            # 接縫對齊：取前一個 window 最後一根真實收盤價
+            # window_idx == 0 時用 df_train 最後一根 Close
             # -------------------------------------------------------
-            anchor_close = float(df_all.iloc[pos - 1]["Close"])
+            if window_idx == 0:
+                anchor_close = float(df_train["Close"].iloc[-1])
+            else:
+                anchor_close = float(all_bars[-1]["Close"].iloc[-1])
 
             _, df_window_sim = run_simulation(
                 df_real=df_train,
@@ -345,8 +366,11 @@ class RegimeCalibrator:
                 use_momentum_init=True,
                 auto_drift=True,
                 seed=seed + window_idx,
-                initial_price=anchor_close,   # 接縫對齊
             )
+
+            # 對數報酬平移：內部 log-return 不變，只消除跨 window 價格跳層
+            df_window_sim = self._rescale_window(df_window_sim, anchor_close)
+
             all_bars.append(df_window_sim)
 
             pos        += self.step

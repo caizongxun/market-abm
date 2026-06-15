@@ -9,29 +9,20 @@ Momentum-init 策略（雙窗口）
 長窗口（slow, 預設 20 根）確認趨勢一致性。
 
 決策邏輯：
-  - fast 與 slow 同向 → 使用 fast drift（趨勢確立）
-  - fast 與 slow 反向 → 使用 fast drift（已發生反轉，以短期為準）
-  - fast 接近 0       → 不注入偏移（市場橫盤）
+  - fast 與 slow 同向 → 使用 fast drift
+  - fast 與 slow 反向 → 使用 fast drift（以短期為準）
+  - fast 接近 0       → 不注入偏移
 
 auto_drift 模式（預設開啟）
 -----------------------------
 當 use_momentum_init=True 且 drift_per_bar=0.0 時，自動把 momentum_bias
 注入 drift_per_bar（逐 bar 歸零）而不是透過 agent 訂單量。
-這樣能避免 bias 被 total_capital 稀釋成幾乎零。
 
   effective_drift[bar_i] = momentum_bias * decay^i
-
-這個 drift 直接加進 new_open = last_close * exp(order_impact + drift[i])。
 
 Rolling calibration
 -------------------
 見 sim/regime.py 的 RegimeCalibrator。
-run_simulation_rolling() 是薄 wrapper，讓 run_sim.py 用 --rolling flag 呼叫。
-
-Window 接縫對齊
----------------
-initial_price 參數讓 MarketEngine 以指定價格作為第一根 bar 的 last_close，
-消除 rolling window 拼接時的價格跳層。
 """
 
 from __future__ import annotations
@@ -70,11 +61,9 @@ def estimate_momentum_drift_dual(
 
     same_direction = (drift_fast > 0) == (drift_slow > 0)
     if same_direction:
-        reason = (f"trend confirmed (fast={drift_fast:+.6f}, "
-                  f"slow={drift_slow:+.6f}) → using fast")
+        reason = f"trend confirmed (fast={drift_fast:+.6f}, slow={drift_slow:+.6f}) → using fast"
     else:
-        reason = (f"REVERSAL detected (fast={drift_fast:+.6f}, "
-                  f"slow={drift_slow:+.6f}) → using fast (more recent)")
+        reason = f"REVERSAL detected (fast={drift_fast:+.6f}, slow={drift_slow:+.6f}) → using fast"
 
     return drift_fast, reason
 
@@ -99,7 +88,6 @@ def run_simulation(
     seed: int | None = 42,
     agents: list[BaseAgent] | None = None,
     path_floor_pct: float = 0.30,
-    initial_price: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     執行一次 ABM 模擬。
@@ -107,18 +95,6 @@ def run_simulation(
     df_real 接受兩種格式：
       (a) DatetimeIndex + OHLCV 欄位（fetch.py 回傳的原始格式）
       (b) 整數 index + Date 欄位（舊快取檔或手動建立的 DataFrame）
-
-    Parameters
-    ----------
-    auto_drift : bool
-        當 True 且 use_momentum_init=True 且 drift_per_bar==0 時，
-        自動把 momentum_bias 注入 drift schedule（逐 bar 歸零）。
-    path_floor_pct : float
-        路徑級別 floor：任何 bar 的 close 不得低於起始 close * (1 - path_floor_pct)。
-    initial_price : float | None
-        若指定，MarketEngine 以此價格作為第一根 bar 的 last_close，
-        覆蓋 close_history[-1]。用於 rolling window 接縫對齊：
-        傳入前一個 window 最後一根真實收盤價，確保模擬路徑從正確水位出發。
 
     Returns
     -------
@@ -135,16 +111,14 @@ def run_simulation(
     start_close    = float(closes[-1])
     path_min_price = start_close * (1.0 - path_floor_pct) if path_floor_pct > 0 else 0.0
 
-    # --- 取最後一根 bar 的日期，支援兩種載入格式 ---
     _tail = df_real.tail(1)
     if isinstance(_tail.index, pd.DatetimeIndex):
         last_date = pd.Timestamp(_tail.index[-1])
     elif "Date" in df_real.columns:
         last_date = pd.Timestamp(df_real["Date"].iloc[-1])
     else:
-        last_date = pd.Timestamp("2000-01-01")  # fallback
+        last_date = pd.Timestamp("2000-01-01")
 
-    # Momentum bias
     momentum_bias   = 0.0
     momentum_reason = "off"
     if use_momentum_init:
@@ -155,7 +129,6 @@ def run_simulation(
             scale=momentum_scale,
         )
 
-    # Auto-drift: convert momentum_bias -> per-bar drift schedule
     drift_schedule: np.ndarray | None = None
     if use_momentum_init and auto_drift and drift_per_bar == 0.0 and momentum_bias != 0.0:
         drift_schedule = momentum_bias * (bias_decay ** np.arange(sim_bars))
@@ -180,7 +153,6 @@ def run_simulation(
         intra_noise_scale=intra_noise_scale,
         drift_per_bar=drift_per_bar,
         seed=int(rng.integers(0, 2**31)),
-        initial_price=initial_price,   # 接縫對齊
     )
 
     rows = []
@@ -220,9 +192,6 @@ def run_simulation(
     return df_ctx, pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Rolling wrapper (thin, delegates to RegimeCalibrator)
-# ---------------------------------------------------------------------------
 def run_simulation_rolling(
     df_all: pd.DataFrame,
     lookback: int = 60,
@@ -233,10 +202,6 @@ def run_simulation_rolling(
     seed: int = 42,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """
-    Thin wrapper around RegimeCalibrator.run().
-    回傳拼接後的模擬 DataFrame 和每個 window 的參數記錄。
-    """
     from .regime import RegimeCalibrator
     cal = RegimeCalibrator(
         lookback=lookback,
