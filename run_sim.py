@@ -33,7 +33,7 @@ import pandas as pd
 
 from data.fetch import get_ohlcv
 from sim.simulation import run_simulation
-from sim.metrics import compute_metrics
+from sim.metrics import compare
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +211,6 @@ def main():
 
     # --- fetch data ---
     df_real = get_ohlcv(args.symbol, start=args.start)
-    print(f"[fetch] range: {df_real.index[0].date()} ~ {df_real.index[-1].date()}")
 
     if args.rolling:
         # --- rolling calibration mode ---
@@ -221,7 +220,7 @@ def main():
         n_sim = len(df_result)
         df_real_tail = df_real.iloc[-n_sim:].copy().reset_index(drop=True)
         print(f"\n[metrics] rolling sim vs. real ({n_sim} bars)")
-        compute_metrics(df_real_tail, df_result)
+        compare(df_real_tail, df_result, print_report=True)
 
         if args.plot:
             plot_rolling(args.symbol, df_real, df_result, param_log)
@@ -232,7 +231,11 @@ def main():
         save_results_static(args.symbol, df_sim)
 
         print(f"\n[metrics] sim vs. real ({args.bars} bars)")
-        compute_metrics(df_real.iloc[-args.bars:].copy().reset_index(drop=True), df_sim)
+        compare(
+            df_real.iloc[-args.bars:].copy().reset_index(drop=True),
+            df_sim,
+            print_report=True,
+        )
 
         if args.plot:
             plot_static(args.symbol, df_real, df_sim)
