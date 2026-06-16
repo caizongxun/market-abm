@@ -1,15 +1,15 @@
 """
-stat_process.py  v41
+stat_process.py  v41b
 ====================
 純統計過程模型，完全不使用 agent。
 
+v41b: 修復 OnlineRidgePredictor._ridge_predict 中的括號 typo
+      self._y_ek] → np.array(self._y_ek)  （導致 module import 失敗，100/100 error）
+
 v41 patch（三項）：
-  Patch-1  target_ek 上限 30 → 15（fit() 與 fit() 的 np.clip 同步收緊）
-  Patch-2  HIGH_EK_THRESH  20 → 12（高 ek 路徑提早切換到 t-mixture，
-           同時把 chi2 amp 上限 4.0 → 2.5，防止尾部爆炸）
-  Patch-3  context 正規化：build_context 改在 calibrator.py，
-           stat_process 端在送入 calibrator 前不再需要改動；
-           但 fit() 的 target_ek clip 上限已反映 Patch-1。
+  Patch-1  target_ek 上限 30 → 15（fit() 的 np.clip 收緊）
+  Patch-2  HIGH_EK_THRESH  20 → 12，chi2 amp 上限 4.0 → 2.5
+  Patch-3  context 正規化移至 calibrator.py 的 build_context()
 
 v40 (不變)：AdaptiveCalibrator 整合
 v1-v39 : 見舊 docstring
@@ -189,8 +189,6 @@ def _path_corr(real_closes, sim_closes):
 # 1. FIT  (Patch-1: target_ek clip 上限 30 → 15)
 # ---------------------------------------------------------------------------
 
-# Patch-1: 收緊 target_ek 上限，防止 NVDA/GOOGL 等高波動股把
-# kurtosis 目標放大到無法合理模擬的程度。
 _TARGET_EK_MAX = 15.0   # v40: 30.0 → v41: 15.0
 
 
@@ -219,7 +217,6 @@ def fit(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ek = float(stats.kurtosis(log_rets))
-    # Patch-1: 上限收緊為 _TARGET_EK_MAX
     target_ek = float(max(np.clip(ek, 0.5, _TARGET_EK_MAX), ek_global_floor))
 
     if apply_trend_bias:
@@ -249,7 +246,6 @@ def fit(
 
 _AR1_WARMUP = 50
 
-# Patch-2: 高 ek 路徑提早切換閾值，且 chi2 放大係數上限收緊
 _HIGH_EK_THRESH = 12.0   # v40: 20.0 → v41: 12.0
 _CHI2_AMP_MAX   = 2.5    # v40: 4.0  → v41: 2.5
 
@@ -278,7 +274,6 @@ def generate(
 
     total = n_bars + _AR1_WARMUP
 
-    # Patch-2: 使用模組常數而非 hardcode 20.0
     HIGH_EK_THRESH = _HIGH_EK_THRESH
 
     if target_ek > HIGH_EK_THRESH:
@@ -406,7 +401,6 @@ def generate(
                 np.clip(chi2_norm, 0.5, 5.0),
                 np.clip(chi2_norm, 0.5, 3.5),
             )
-            # Patch-2: amp 上限 4.0 → _CHI2_AMP_MAX (2.5)
             amp = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, _CHI2_AMP_MAX)
             sign_mask = np.sign(z_scaled[tail_mask] - ret_mu)
             z_scaled[tail_mask] = (
@@ -444,7 +438,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. OnlineRidgePredictor  (保留相容)
+# 3. OnlineRidgePredictor  (v41b: 修復括號 typo)
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
@@ -495,7 +489,7 @@ class OnlineRidgePredictor:
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
         new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
