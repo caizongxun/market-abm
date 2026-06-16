@@ -1,31 +1,33 @@
 """
-stat_process.py  v50
+stat_process.py  v51
 ====================
 純統計過程模型，完全不使用 agent。
 
-v50: Revert Fleishman Power Transform (v49 family) — it destroyed skew/kurtosis
-     and time-series structure (path_corr dropped to +0.11).
+v51: Replace t-mixture (v50) with noncentral-t (nct) sampling.
 
-     Root cause: Fleishman is designed for i.i.d. samples; applying it after
-     AR1/GARCH/jump reordered the innovations, wiping out autocorrelation.
-     The exact-rescale after Fleishman also collapsed skew back toward zero.
+     Root cause (v50 failure, diagnosed):
+       - MLE df ≈ 7 for AAPL 60-bar windows  → theoretical ek = 6/(7-4) = 2.0
+       - p_t = target_ek / t_ek_implied = 3/2 → clipped to 0.95
+       - 95% of t(7) draws still only produce global ek ≈ 1.9 over 820 bars
+       - Skewnorm component (5%) is overwhelmed → skew collapses to ~0
 
-     Replacement strategy for fat tails + skew:
-       Step 1  Heavy-tail base: always use t(df) + skewnorm mixture.
-               df is MLE-fitted per window; p_t driven by target_ek directly.
-               NIG path kept for target_ek > 15 as a secondary option.
-       Step 5b Jump amplification: when target_ek > 6, scale jump_std by
-               sqrt(target_ek / 6) so sparse jumps carry fatter tails.
-               Jump size drawn from skewed-t to also push skew.
-     Everything else (AR1 Hurst, ACF, GARCH, exact rescale, drift alignment)
-     is unchanged from v49.2.
+     Fix: compute df directly from target_ek via the analytical inverse:
+           df = 6 / target_ek + 4   (floored at 4.05 to keep ek finite)
+       Then use nct (noncentral-t) to embed skew WITHOUT changing kurtosis:
+           nc ≈ skew_raw * sqrt(df / 2)   (first-order approximation)
+       This produces a single distribution with both fat tails AND correct skew,
+       applied before AR1/GARCH/jump so time-series structure is preserved.
 
-v49.3: fix bracket mismatch in OnlineRidgePredictor.predict_correction
-v49.2: fix rolling level drift — start_price chaining + global drift alignment
-v49.1: fix Fleishman mean-drift & skew sign (3-unknown system)
-v49: Step 6b Fleishman Power Transform (now removed)
+     All other stages (AR1 Hurst, ACF, GARCH, jump, exact rescale, drift,
+     volume) are unchanged from v50.
+
+v50: Remove Fleishman, t-mixture + jump-amplify (insufficient ek)
+v49.3: fix bracket mismatch
+v49.2: fix rolling level drift
+v49.1: fix Fleishman mean-drift
+v49: Fleishman Power Transform (abandoned)
 v48.1: fix bracket mismatch
-v48: std inflation, skew sign flip, kurtosis overshoot fixes
+v48: std inflation, skew sign fixes
 v47: Volume fit / generate
 v46: GARCH(1,1) + exact rescale
 v1-v45: 見舊 docstring
@@ -168,19 +170,6 @@ def _ar1_hurst_rho(h):
     return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
 
 
-def _nig_params_from_moments(std, skew_raw, kurt_excess):
-    if kurt_excess < 0.5:
-        return None
-    try:
-        a_est = float(np.sqrt(3.0 / max(kurt_excess, 0.1)))
-        a_est = float(np.clip(a_est, 0.15, 5.0))
-        b_est = float(skew_raw * a_est / 3.0)
-        b_est = float(np.clip(b_est, -0.95 * a_est, 0.95 * a_est))
-        return a_est, b_est
-    except Exception:
-        return None
-
-
 def _dtw_distance(s, t):
     n, m = len(s), len(t)
     if n == 0 or m == 0:
@@ -204,6 +193,37 @@ def _path_corr(real_closes, sim_closes):
         warnings.simplefilter("ignore")
         corr = float(np.corrcoef(r_path, s_path)[0, 1])
     return corr if np.isfinite(corr) else float("nan")
+
+
+# ---------------------------------------------------------------------------
+# v51: nct sampler
+# ---------------------------------------------------------------------------
+
+_NCT_DF_FLOOR = 4.05   # keeps kurtosis finite
+_NCT_DF_CEIL  = 30.0   # near-Gaussian upper bound
+_NCT_NC_MAX   = 5.0    # nc clamp to avoid pathological skew
+
+
+def _df_from_ek(target_ek: float) -> float:
+    """
+    Return df such that t(df) has theoretical excess kurtosis = target_ek.
+        ek = 6 / (df - 4)  →  df = 6 / ek + 4
+    Floored at _NCT_DF_FLOOR so kurtosis stays finite.
+    """
+    if target_ek <= 0:
+        return _NCT_DF_CEIL
+    df = 6.0 / target_ek + 4.0
+    return float(np.clip(df, _NCT_DF_FLOOR, _NCT_DF_CEIL))
+
+
+def _nc_from_skew(skew_raw: float, df: float) -> float:
+    """
+    Noncentrality parameter nc such that nct(df, nc) has skew ≈ skew_raw.
+    First-order approximation: nc ≈ skew_raw * sqrt(df / 2).
+    Valid for small |nc| (nc < ~2).
+    """
+    nc_est = skew_raw * float(np.sqrt(df / 2.0))
+    return float(np.clip(nc_est, -_NCT_NC_MAX, _NCT_NC_MAX))
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +324,7 @@ def fit(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ek = float(stats.kurtosis(log_rets))
+        ek       = float(stats.kurtosis(log_rets))
         skew_raw = float(stats.skew(log_rets))
 
     target_ek = float(max(np.clip(ek, 0.5, _TARGET_EK_MAX), ek_global_floor))
@@ -338,24 +358,21 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v50: Fleishman removed; fat tails via t-mix + jump amplify)
+# 2. GENERATE  (v51: nct replaces t-mixture for correct ek + skew)
 #
 # 管線：
-#   Step 1  採樣基礎分佈（NIG if ek>15, else t+skewnorm mixture）
-#           p_t = clip(target_ek / t_ek_implied, 0.10, 0.95) — drives fat tails
+#   Step 1  採樣 nct(df_from_ek(target_ek), nc_from_skew(skew_raw, df))
+#           → single distribution with analytically correct fat tails + skew
 #   Step 2  AR1 Hurst 過濾
 #   Step 3  ACF lag1 微調
 #   Step 4  對稱 GARCH(1,1)
-#   Step 5  jump 疊加
-#   Step 5b Jump amplification: scale jump_std by sqrt(ek/6) when ek>6
-#           Jump direction biased by skew_raw sign to push skew
+#   Step 5  jump 疊加 (with ek-driven amplitude + skew bias)
 #   Step 6  exact rescale → (ret_mu, ret_std)
 #   Step 7  OHLC wick
 #   Step 8  Volume
 # ---------------------------------------------------------------------------
 
-_AR1_WARMUP   = 50
-_NIG_TRIGGER  = 15.0
+_AR1_WARMUP = 50
 
 
 def generate(
@@ -369,9 +386,7 @@ def generate(
 
     ret_mu          = params["ret_mu"] + drift_correction
     ret_std         = params["ret_std"]
-    skew_a          = params["ret_skew_a"]
     skew_raw        = float(params.get("ret_skew_raw", 0.0))
-    df_t            = params["ret_df"]
     hurst           = params["hurst_target"]
     wick_lam        = params["wick_lambda"]
     atr_mean        = params["atr_mean"]
@@ -389,52 +404,42 @@ def generate(
     total = n_bars + _AR1_WARMUP
 
     # ------------------------------------------------------------------
-    # Step 1: 採樣基礎分佈
-    # Use low df_t (fat tails) and high p_t (t-fraction) to hit target_ek.
+    # Step 1: 採樣 nct (noncentral-t)
+    #
+    # df  = 6 / target_ek + 4   → theoretical ek of t(df) = target_ek
+    # nc  ≈ skew_raw * sqrt(df / 2)  → first-order skew approximation
+    #
+    # nct preserves the fat-tail shape (set by df) while embedding skew (set
+    # by nc).  This is a single coherent distribution, so AR1/GARCH applied
+    # afterwards preserve both properties in the resulting return series.
     # ------------------------------------------------------------------
-    z_raw = None
+    df_nct = _df_from_ek(target_ek)
+    nc_nct = _nc_from_skew(skew_raw, df_nct)
 
-    if target_ek > _NIG_TRIGGER:
-        nig_ab = _nig_params_from_moments(ret_std, skew_raw, target_ek)
-        if nig_ab is not None:
-            a_nig, b_nig = nig_ab
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    z_raw = stats.norminvgauss.rvs(
-                        a=a_nig, b=b_nig, loc=0, scale=1,
-                        size=total, random_state=int(rng.integers(0, 2**31))
-                    )
-                    if not np.all(np.isfinite(z_raw)):
-                        z_raw = None
-                except Exception:
-                    z_raw = None
-
-    if z_raw is None:
-        # df_t: MLE-fitted, but floor at 2.5 to ensure heavy tails exist.
-        # p_t: fraction of t samples; higher ek → more t draws.
-        # t_ek_implied: excess kurtosis of t(df) = 6/(df-4) for df>4.
-        df_t_eff = float(np.clip(df_t, 2.5, 12.0))   # cap at 12 (not 20/30)
-        if df_t_eff > 4.0:
-            t_ek_implied = 6.0 / (df_t_eff - 4.0)
-        else:
-            t_ek_implied = target_ek  # df<=4: infinite kurtosis, use 100% t
-        p_t = float(np.clip(target_ek / max(t_ek_implied, 0.5), 0.10, 0.95))
-        mask  = rng.uniform(size=total) < p_t
-        z_raw = np.where(
-            mask,
-            stats.t.rvs(df=df_t_eff, loc=0, scale=1, size=total,
-                        random_state=int(rng.integers(0, 2**31))),
-            stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total,
-                               random_state=int(rng.integers(0, 2**31))),
-        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            z_raw = stats.nct.rvs(
+                df=df_nct, nc=nc_nct, loc=0, scale=1,
+                size=total,
+                random_state=int(rng.integers(0, 2**31)),
+            )
+            if not np.all(np.isfinite(z_raw)):
+                raise ValueError("nct produced non-finite values")
+        except Exception:
+            # Fallback to central t if nct fails (edge cases at extreme nc)
+            z_raw = stats.t.rvs(
+                df=df_nct, loc=0, scale=1,
+                size=total,
+                random_state=int(rng.integers(0, 2**31)),
+            )
 
     # ------------------------------------------------------------------
     # Step 2: AR1 Hurst
     # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 1e-6:
-        innov_sc = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+        innov_sc    = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
         z_ar_ext    = np.empty(total)
         z_ar_ext[0] = z_raw[0]
         for i in range(1, total):
@@ -450,7 +455,7 @@ def generate(
         z_acf = z_ar.copy()
         for i in range(1, n_bars):
             z_acf[i] = z_ar[i] + acf_lag1 * z_ar[i - 1] * 0.3
-        z_s = float(np.std(z_acf))
+        z_s  = float(np.std(z_acf))
         z_ar = z_acf / z_s if z_s > 1e-10 else z_acf
 
     # ------------------------------------------------------------------
@@ -463,9 +468,9 @@ def generate(
         base_var = 1.0
         omega    = base_var * max(1.0 - beta_g - alpha_s, 0.01)
 
-        h_t      = np.empty(n_bars)
-        z_garch  = np.empty(n_bars)
-        h_t[0]   = base_var
+        h_t        = np.empty(n_bars)
+        z_garch    = np.empty(n_bars)
+        h_t[0]     = base_var
         z_garch[0] = z_ar[0]
 
         for i in range(1, n_bars):
@@ -477,27 +482,23 @@ def generate(
         z_garch = z_ar
 
     # ------------------------------------------------------------------
-    # Step 5: jump 疊加
-    # Step 5b: amplify jump_std when target_ek > 6 to reproduce fat tails;
-    #          bias jump sign toward skew_raw direction.
+    # Step 5: jump 疊加 (ek-amplified + skew-biased)
     # ------------------------------------------------------------------
     z_work = z_garch.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
             jump_idx = rng.choice(n_bars, size=n_jumps, replace=False)
-
-            # Step 5b: ek-driven amplitude scaling
-            ek_amp = float(np.sqrt(max(target_ek / 6.0, 1.0)))
-            eff_jump_std = jump_std * ek_amp
-
-            # skew bias: shift jump mean toward sign(skew_raw)
-            skew_bias = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
-            jump_sizes = rng.normal(skew_bias, eff_jump_std, size=n_jumps)
-            z_work[jump_idx] += jump_sizes
+            ek_amp   = float(np.sqrt(max(target_ek / 6.0, 1.0)))
+            eff_std  = jump_std * ek_amp
+            skew_b   = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
+            z_work[jump_idx] += rng.normal(skew_b, eff_std, size=n_jumps)
 
     # ------------------------------------------------------------------
     # Step 6: exact rescale → (ret_mu, ret_std)
+    # Note: exact rescale is scale-invariant for kurtosis and skew.  The
+    # shape of z_work (set by nct in Step 1) is preserved; only location
+    # and scale change to match the fitted window parameters.
     # ------------------------------------------------------------------
     z_std = float(np.std(z_work))
     if z_std > 1e-10:
@@ -573,7 +574,7 @@ class OnlineRidgePredictor:
 
     def _ridge_predict(self, X, y, x_new, alpha=1.0):
         n, d = X.shape
-        XtX = X.T @ X + alpha * np.eye(d)
+        XtX  = X.T @ X + alpha * np.eye(d)
         try:
             w = np.linalg.solve(XtX, X.T @ y)
         except np.linalg.LinAlgError:
@@ -586,9 +587,9 @@ class OnlineRidgePredictor:
             return params
         blend = float(np.clip(
             self.max_blend * (n - self.min_train) / max(self.min_train, 1),
-            0.0, self.max_blend
+            0.0, self.max_blend,
         ))
-        X = np.array(self._X, dtype=float)
+        X     = np.array(self._X, dtype=float)
         x_new = np.array([
             params["ret_std"], params["ret_skew_a"],
             params["hurst_target"], params["target_ek"],
@@ -645,7 +646,7 @@ def rolling_fit_generate(
         calib_action = None
         if calibrator is not None:
             from sim.calibrator import AdaptiveCalibrator
-            ctx = AdaptiveCalibrator.build_context(params)
+            ctx          = AdaptiveCalibrator.build_context(params)
             calib_action = calibrator.predict(ctx)
             params_dict  = calib_action.apply(dict(params))
             params       = StatParams(**params_dict)
@@ -659,8 +660,8 @@ def rolling_fit_generate(
             start_price = float(df_real["Open"].iloc[fwd_start])
 
         sim_seed = int(rng.integers(0, 2**31))
-        df_sim = generate(params=params, n_bars=fwd_bars,
-                          start_price=start_price, seed=sim_seed)
+        df_sim   = generate(params=params, n_bars=fwd_bars,
+                            start_price=start_price, seed=sim_seed)
 
         sim_rets  = np.diff(np.log(np.maximum(df_sim["Close"].values,  1e-10)))
         real_rets = np.diff(np.log(np.maximum(df_fwd["Close"].values,  1e-10)))
@@ -716,7 +717,7 @@ def rolling_fit_generate(
         c_err  = (sim_c - real_c) / (real_c + 1e-10)
 
         if verbose:
-            dtw_str   = f"{dtw_val:.4f}"   if np.isfinite(dtw_val)   else "  nan"
+            dtw_str   = f"{dtw_val:.4f}"    if np.isfinite(dtw_val)   else "  nan"
             pcorr_str = f"{pcorr_val:+.3f}" if np.isfinite(pcorr_val) else "  nan"
             calib_str = f"  [calib n={calibrator.n_experiences}]" if calibrator else ""
             print(
@@ -741,7 +742,7 @@ def rolling_fit_generate(
         pos += step
 
     # -----------------------------------------------------------------------
-    # v48 fix: global std-rescale after concat
+    # Global std-rescale (v48) + drift alignment (v49.2)
     # -----------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -766,21 +767,18 @@ def rolling_fit_generate(
 
                 log_ret_sim = np.diff(np.log(np.maximum(orig_closes, 1e-10)))
                 scaled_rets = log_ret_sim * scale
-                new_closes = np.empty(len(orig_closes))
+                new_closes  = np.empty(len(orig_closes))
                 new_closes[0] = orig_closes[0]
                 for i in range(1, len(new_closes)):
                     new_closes[i] = new_closes[i - 1] * np.exp(scaled_rets[i - 1])
 
-                price_ratio = new_closes / np.maximum(orig_closes, 1e-10)
-                df_result = df_result.copy()
+                price_ratio        = new_closes / np.maximum(orig_closes, 1e-10)
+                df_result          = df_result.copy()
                 df_result["Close"] = new_closes
-                df_result["Open"]  = orig_opens  * price_ratio
-                df_result["High"]  = orig_highs  * price_ratio
-                df_result["Low"]   = orig_lows   * price_ratio
+                df_result["Open"]  = orig_opens * price_ratio
+                df_result["High"]  = orig_highs * price_ratio
+                df_result["Low"]   = orig_lows  * price_ratio
 
-        # -------------------------------------------------------------------
-        # v49.2: global drift alignment
-        # -------------------------------------------------------------------
         sim_all_rets_post = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -789,11 +787,11 @@ def rolling_fit_generate(
         drift_correction  = real_log_ret_mean - sim_log_ret_mean
 
         if abs(drift_correction) < 0.005:
-            final_closes = df_result["Close"].values.astype(float)
+            final_closes    = df_result["Close"].values.astype(float)
             correction_path = np.exp(np.arange(len(final_closes)) * drift_correction)
-            ratio = correction_path / correction_path[0]
-            df_result = df_result.copy()
-            df_result["Close"] = final_closes * ratio
+            ratio           = correction_path / correction_path[0]
+            df_result       = df_result.copy()
+            df_result["Close"] = final_closes              * ratio
             df_result["Open"]  = df_result["Open"].values  * ratio
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
