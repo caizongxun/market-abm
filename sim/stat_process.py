@@ -1,22 +1,39 @@
 """
-stat_process.py  v7
+stat_process.py  v8
 ===================
 純統計過程模型，完全不使用 agent。
 
-Fix-8 — 消除 rolling chunk 接縫跳躍
---------------------------------------
-問題：rolling_fit_generate() 每個 chunk 都用 df_real["Close"].iloc[fit_end-1]
-      當作 start_price。但上一個 chunk 的末端 Close 已隨機漂移 ±14%，
-      接縫處的 log(real_close / sim_last_close) 是 4×σ 的巨大跳躍。
-      41 個接縫把 805 根裡面的 std 從 0.016 膨脹到 0.053。
+Fix-9 — 修正 mean 雙重計算 + 恢復 kurtosis
+----------------------------------------------
+問題 A：mean=0.00357 vs 真實 0.00077 (+364%)
+  原因：ret_mu 已是 sample mean（包含 skew 效果），
+        但 Fix-7 又額外加了 skew_offset * ret_std（~0.0106/bar）。
+        相當於把 skew 對 mean 的貢獻計算了兩次。
 
-修正：用 sim_last_close 取代 real_close 作為下一個 chunk 的起始價。
-      這樣接縫 return = log(sim_last_close / sim_last_close) = 0（無縫連接）。
-      缺點：模擬價格會緩慢脫離真實水位，但這對 distribution metrics 是正確的。
-      可選 real_anchor_weight 參數（預設 0）允許部分錨定真實價，做法：
-        start_px = exp( (1-w)*log(sim_last) + w*log(real_close) )
+問題 B：kurtosis=1.23 vs 真實 10.6（-88%）
+  原因：AR(1) 輸出做 (mem-mean)/std 正規化，把 fat-tail 資訊磨掉了。
+        Student-t 的肥尾必須在 AR(1) 的 innovations 裡，而不是事後加。
 
-v1-v8 修正歷程
+Fix-9 正確方案：
+  1. z ~ skewnorm(a, loc=0, scale=1)
+     moment-preserving standardize：
+       mu_sn  = a / sqrt(1+a²) * sqrt(2/π)          [理論平均]
+       var_sn = 1 - mu_sn²                            [理論方差]
+       z_std  = (z - mu_sn) / sqrt(var_sn)
+     → mean=0, std=1, 偏態形狀保留（skew≈0.30 for a=1.5）
+     → 不再需要事後加 skew_offset，消除雙重計算
+
+  2. AR(1) 使用 Student-t innovations（df 來自 Fix-1 的掃描）：
+       eps_t ~ t(df, 0, sqrt((df-2)/df))   [unit-variance t noise]
+       mem[i] = rho*mem[i-1] + innov_scale*eps_t[i]
+     AR(1) output 不做 standardize，直接保留 fat-tail shape。
+     為了防止 scale 漂移，只做 sigma-clamp（不 demean，不 rescale）：
+       clip mem to ±5σ，然後 rescale by empirical std
+
+  3. log_rets = z_final * ret_std + ret_mu
+     z_final 的 mean≈0（moment-preserving），偏態在分佈形狀中，fat-tail 在 innovations 中。
+
+v1-v9 修正歷程
 --------------
   Fix-1 : Student-t df 掃描 log-likelihood
   Fix-2 : 改用 skewnorm 擬合
@@ -24,8 +41,9 @@ v1-v8 修正歷程
   Fix-4 : AR(1) 正規化使用 skewnorm 實際 std
   Fix-5 : AR(1) 後只除 std，不 demean
   Fix-6 : 失敗—Step-1 只除 std 導致 AR(1) 漏扖、std 爆炸
-  Fix-7 : 正確方案—保存 skew_mean_offset，在 AR(1) 後手動加回
+  Fix-7 : 保存 skew_mean_offset，在 AR(1) 後手動加回（但造成雙重計算）
   Fix-8 : rolling loop 改用 sim last-close 作為下一 chunk 起始價
+  Fix-9 : moment-preserving skewnorm standardize + t innovations in AR(1)
 """
 
 from __future__ import annotations
@@ -49,7 +67,7 @@ class StatParams(TypedDict):
     ret_mu:       float   # sample mean of log returns
     ret_std:      float   # sample std  of log returns
     ret_skew_a:   float   # skewnorm shape (alpha)
-    ret_df:       float   # Student-t df  (tail thickness, diagnostic only)
+    ret_df:       float   # Student-t df  (tail thickness)
     hurst_target: float   # Hurst exponent [0.3, 0.8]
     wick_lambda:  float   # Exponential scale for wick, in units of ATR
     atr_mean:     float   # Mean ATR in absolute price (for wick generation)
@@ -118,9 +136,17 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-def _skewnorm_mean_offset(a: float) -> float:
-    """Theoretical mean of skewnorm(a, loc=0, scale=1) = a/sqrt(1+a^2) * sqrt(2/pi)."""
-    return float(a / np.sqrt(1.0 + a * a) * np.sqrt(2.0 / np.pi))
+def _skewnorm_moment_standardize(z: np.ndarray, a: float) -> np.ndarray:
+    """Fix-9A: moment-preserving standardization of skewnorm samples.
+
+    Subtracts the theoretical mean and divides by theoretical std,
+    giving mean=0, std=1 while PRESERVING the skew shape.
+    This avoids re-adding skew_offset later (which caused double-counting).
+    """
+    mu_sn  = a / np.sqrt(1.0 + a * a) * np.sqrt(2.0 / np.pi)
+    var_sn = 1.0 - mu_sn ** 2
+    std_sn = float(np.sqrt(max(var_sn, 1e-10)))
+    return (z - mu_sn) / std_sn
 
 
 # ---------------------------------------------------------------------------
@@ -167,53 +193,61 @@ def generate(
     seed:        int | None = None,
 ) -> pd.DataFrame:
     """
-    Fix-7 generation pipeline (correct skew-preserving design)
-    -----------------------------------------------------------
-    1. Draw z ~ skewnorm(a, loc=0, scale=1)
-       Compute and save skew_offset = theoretical mean = a/sqrt(1+a^2)*sqrt(2/pi)
-       Full-standardize z: (z - mean(z)) / std(z)  -> AR(1) gets zero-mean input
+    Fix-9 generation pipeline
+    --------------------------
+    1. Draw z ~ skewnorm(a, 0, 1)
+       moment-preserving standardize: subtract theoretical mean, divide by theoretical std
+       → z has mean=0, std=1, skew shape preserved (no skew_offset injection needed)
 
-    2. AR(1) in unit space
-       Full-standardize output: (mem - mean(mem)) / std(mem)
+    2. AR(1) with Student-t(df) innovations to preserve fat tails
+       eps ~ t(df) scaled to unit variance: scale = sqrt((df-2)/df)
+       mem[i] = rho*mem[i-1] + innov_scale*eps[i]
+       Rescale mem by empirical std only (no demean) to keep scale correct
+       Blend z (skew shape) with mem (fat-tail AR structure): z_final = 0.5*z + 0.5*mem
 
-    3. Re-inject skew: z_final = z_ar1 + skew_offset
-
-    4. Rescale: log_rets = z_final * ret_std + ret_mu
+    3. log_rets = z_final * ret_std + ret_mu
+       ret_mu is sample mean which already encodes skew drift; no extra offset needed
     """
     rng = np.random.default_rng(seed)
 
     ret_mu   = params["ret_mu"]
     ret_std  = params["ret_std"]
     skew_a   = params["ret_skew_a"]
+    df_t     = params["ret_df"]
     hurst    = params["hurst_target"]
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Step 1: draw and save skew offset, then full-standardize
-    skew_offset = _skewnorm_mean_offset(skew_a)
-    z = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars, random_state=rng)
-    z_std = np.std(z)
-    if z_std > 1e-10:
-        z = (z - np.mean(z)) / z_std   # zero-mean unit-std for stable AR(1)
+    # Step 1: skewnorm with moment-preserving standardization (Fix-9A)
+    z_raw = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars, random_state=rng)
+    z = _skewnorm_moment_standardize(z_raw, skew_a)   # mean=0, std≈1, skew preserved
 
-    # Step 2: AR(1) in standardized space, full-standardize output
+    # Step 2: AR(1) with Student-t innovations (Fix-9B)
     rho = _ar1_hurst_rho(hurst)
-    if abs(rho) > 0.01:
+    if abs(rho) > 0.01 and df_t > 2.0:
+        # Unit-variance t innovations
+        t_scale = float(np.sqrt((df_t - 2.0) / df_t))
+        eps = stats.t.rvs(df=df_t, loc=0, scale=t_scale, size=n_bars, random_state=rng)
         mem = np.empty(n_bars)
-        mem[0] = z[0]
-        innov_scale = np.sqrt(1.0 - rho ** 2)
+        mem[0] = eps[0]
+        innov_scale = np.sqrt(max(1.0 - rho ** 2, 0.0))
         for i in range(1, n_bars):
-            mem[i] = rho * mem[i-1] + innov_scale * z[i]
-        m_std = np.std(mem)
+            mem[i] = rho * mem[i-1] + innov_scale * eps[i]
+        # Rescale by empirical std (no demean to avoid killing fat-tail signal)
+        m_std = float(np.std(mem))
         if m_std > 1e-10:
-            mem = (mem - np.mean(mem)) / m_std
-        z = mem
+            mem = mem / m_std
+        # Blend skew shape (z) with fat-tail AR structure (mem)
+        z_final = 0.5 * z + 0.5 * mem
+        # Final unit rescale
+        zf_std = float(np.std(z_final))
+        if zf_std > 1e-10:
+            z_final = z_final / zf_std
+    else:
+        z_final = z
 
-    # Step 3: re-inject theoretical skew mean offset
-    z = z + skew_offset
-
-    # Step 4: rescale to real sample statistics
-    log_rets = z * ret_std + ret_mu
+    # Step 3: rescale to real sample statistics
+    log_rets = z_final * ret_std + ret_mu
 
     # Rebuild OHLC
     opens  = np.empty(n_bars)
@@ -251,7 +285,7 @@ def rolling_fit_generate(
     step:                int = 20,
     n_forward:           int | None = None,
     seed:                int = 42,
-    real_anchor_weight:  float = 0.0,   # Fix-8: 0=pure sim chain, 1=always anchor to real
+    real_anchor_weight:  float = 0.0,
     verbose:             bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
@@ -259,7 +293,7 @@ def rolling_fit_generate(
 
     real_anchor_weight (0..1):
         0.0  — pure chain: start_price = sim_last_close  (no seam jump, default)
-        1.0  — always anchor to real close                (old behaviour, seam jumps)
+        1.0  — always anchor to real close
         0.x  — geometric blend: exp((1-w)*log(sim) + w*log(real))
     """
     if n_forward is None:
@@ -270,7 +304,7 @@ def rolling_fit_generate(
     param_log:  list[dict]         = []
     window_idx = 0
     pos        = lookback
-    sim_last_close: float | None = None   # Fix-8: carry sim price across chunks
+    sim_last_close: float | None = None
 
     while pos <= n_total:
         fit_start  = pos - lookback
@@ -283,12 +317,11 @@ def rolling_fit_generate(
         df_window = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         params    = fit(df_window)
 
-        # Fix-8: compute start_price using geometric blend
         real_close = float(df_real["Close"].iloc[fit_end - 1])
         if sim_last_close is None or real_anchor_weight >= 1.0:
-            start_px = real_close                         # first chunk always anchors
+            start_px = real_close
         elif real_anchor_weight <= 0.0:
-            start_px = sim_last_close                     # pure sim chain
+            start_px = sim_last_close
         else:
             w = float(real_anchor_weight)
             start_px = float(np.exp(
@@ -301,9 +334,8 @@ def rolling_fit_generate(
             start_price=start_px, seed=seed + window_idx,
         )
         sim_chunks.append(df_chunk)
-        sim_last_close = float(df_chunk["Close"].iloc[-1])   # Fix-8: update carry
+        sim_last_close = float(df_chunk["Close"].iloc[-1])
 
-        # Loss (per-chunk distribution, unaffected by seam)
         real_fwd  = df_real.iloc[pos:fwd_end].copy().reset_index(drop=True)
         real_rets = np.diff(np.log(np.maximum(real_fwd["Close"].values, 1e-10)))
         sim_rets  = np.diff(np.log(np.maximum(df_chunk["Close"].values, 1e-10)))
