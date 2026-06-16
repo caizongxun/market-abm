@@ -6,7 +6,7 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 
 設計原則
 --------
-- grid：3x3x3x4 = 108 組（intra_noise_scale 加入 0.4 下界）
+- grid：3x3x3x4 = 108 組
 - EMA 平滑（alpha=0.4）：新估值影響 40%，歷史殘留 60%
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
@@ -27,10 +27,12 @@ B. loss 加入 mean_err 懲罰（w_mean 預設 2.0）：
 
 Grid 更新說明（intra_noise_scale）
 -----------------------------------
-去掉 _t_draw() 的 clip 後，t(4) 尾巴變重，calibrator 需要能把
-intra_noise_scale 調到 0.4 以下才能把 std 壓回 real_std 水位。
-原本下界 0.7 在無截斷環境下已不夠低，擴展為 [0.4, 0.7, 1.0, 1.5]。
-grid 從 81 組增加到 108 組（+33%），每次執行時間等比增加。
+實測 sim_std 持續偏高（global ratio ~1.74x），搜尋空間上界 1.5 在 t(4)
+分佈下尾巴過重，導致 calibrator 選不到夠低的 noise。
+將 grid 從 [0.4, 0.7, 1.0, 1.5] 下移至 [0.3, 0.5, 0.7, 1.0]：
+- 上界從 1.5 降到 1.0，整體搜尋空間 std 水位下移
+- 下界從 0.4 降到 0.3，給 calibrator 更多壓縮空間
+- 組數維持 4 個，grid 總組數仍為 108
 
 Window 接縫對齊（價格平移）
 --------------------------
@@ -84,12 +86,16 @@ from .metrics import compare, hurst_exponent, log_returns
 # A: momentum_scale 下移至 [0.2, 0.5, 1.0]，原 [0.5, 1.0, 2.0]。
 #    原上限 2.0 在 AAPL 長期上漲的 lookback 中持續注入正 drift，
 #    導致 sim mean >> real mean。
+#
+# C: intra_noise_scale 從 [0.4, 0.7, 1.0, 1.5] 下移至 [0.3, 0.5, 0.7, 1.0]。
+#    實測 global sim_std/real_std ~1.74x，上界 1.5 在 t(4) 下尾巴過重，
+#    calibrator 選不到夠低的 noise。新上界 1.0 讓搜尋空間整體下移。
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
     "impact_coeff":      [0.0005, 0.0010, 0.0015],
     "momentum_scale":    [0.2,    0.5,    1.0   ],   # A: was [0.5, 1.0, 2.0]
     "decay":             [0.90,   0.93,   0.97  ],
-    "intra_noise_scale": [0.4,    0.7,    1.0,   1.5],
+    "intra_noise_scale": [0.3,    0.5,    0.7,   1.0],  # C: was [0.4, 0.7, 1.0, 1.5]
 }
 
 
