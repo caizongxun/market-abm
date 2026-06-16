@@ -1,32 +1,36 @@
 """
-stat_process.py  v19
+stat_process.py  v20
 ====================
 純統計過程模型，完全不使用 agent。
 
-Fix-19 — 兩項核心修改
-----------------------
-修改一：GARCH(1,1) 取代 rank-remap（修復 kurtosis 倒退）
-  v17/v18 的 rank-remap 把 z_mix 的尾部映射到 AR(1) 的 rank 分佈上，
-  AR(1) rank 接近 Normal，導致 kurtosis 被壓平（1.94）。
-  v19 完全移除 rank-remap，改用 GARCH(1,1) 提供 volatility clustering：
-    h_t[i] = omega + alpha * e[i-1]^2 + beta * h_t[i-1]
-    log_ret[i] = z_norm[i] * sqrt(h_t[i]) + ret_mu
-  這樣 z_mix 的尾部完整保留，kurtosis 不再被壓低。
-  GARCH 初始路徑用純 skewnorm 生成，再用 vol_scale 縮放，無 forward reference。
-  alpha=0.08, beta=0.88 為典型股票 GARCH 參數（alpha+beta=0.96，近 I-GARCH）。
+Fix-20 — 三項修改（針對 v19 剩餘問題）
+--------------------------------------
+修改一：chi2 variance-mixture tail amplifier（修復 kurtosis 持續偏低）
+  v19 的 GARCH 遞迴在 n_bars=20 時 warm-up 不足，無法有效放大尾部。
+  v20 改回對 z_mix 直接做 variance-mixture：
+    nu = max(df_t, 3.0)
+    chi2_scale = clip(sqrt(nu / chi2(nu)), 0.5, 4.0)
+    tail_mask = |z_norm| > 1.5
+    z_amplified = where(tail_mask, z_norm * chi2_scale, z_norm)
+  只放大 |z| > 1.5σ 的尾部，中心段不動，kurtosis 自然升高。
+  chi2_scale 的期望值 = 1（當 nu 很大時），不改變整體 std 的期望。
 
-修改二：directed t-mixture（修復 skew 稀釋）
-  v18 的 t 成分是對稱的，混入後稀釋 skewnorm 的偏態方向。
-  v19 讓 t 成分繼承 skewnorm 的偏方向：
-    if |skew_a| > 0.3: t_directed = |t| * sign(skew_a)
-  這樣 t 成分貢獻肥尾且與 skewnorm 同方向，不再稀釋 skew。
+修改二：skew_a amplifier x1.5（修復 skew 符號偏負）
+  v19 的 directed t-mixture 讓 skew 從 -0.377 收到 -0.104，
+  但目標是 +0.449。t 成分稀釋了 skewnorm 的偏態，
+  用 skew_a_amp = skew_a * 1.5 補償這個稀釋效果。
 
-Fix-18 的以下修改保持不變：
-  soft anchor (real_anchor_weight=0.3)
-  drift_correction
-  trend_bias
+修改三：AR(1) 直接遞迴（修復 hurst 偏低）
+  v19 移除 rank-remap 後 hurst 從 0.688 降到 0.638。
+  rank-remap 破壞 kurtosis，直接遞迴不破壞：
+    z_ar[i] = rho * z_ar[i-1] + innov_scale * z_amplified[i]
+  z_amplified 的尾部形狀保留，時序相關由 rho 決定。
+  最後做一次 rescale 確保 std == ret_std。
 
-v1-v19 修正歷程
+Fix-18 保留：soft anchor, drift_correction, trend_bias
+Fix-19 保留：directed t-mixture (|t| * sign(skew_a))
+
+v1-v20 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -38,12 +42,12 @@ v1-v19 修正歷程
              => kurtosis 9.74 ✅ 但 std 偏高 35%、skew -0.30、hurst 仍偏
   Fix-16  : symmetric clip + std rescale + nu_boost 0.8x + hurst clip 0.65
              => std ✅  hurst ✅  skew 仍 -0.307 ❌  kurtosis 4.54 ❌
-  Fix-16-debug: 定位到 amp 乘法在 PPF 階段就已翻轉 skew
-  Fix-17  : 雙層 rank-remap（skewnorm rank onto t samples）+ AR(1) copula
-             => 結構正確，但 kurtosis 仍偏低、price path 向上漂移
+  Fix-17  : 雙層 rank-remap + AR(1) copula => kurtosis 偏低、price 漂移
   Fix-18  : soft anchor + mixture model + trend bias
              => hurst ✅  方向命中率 ✅  kurtosis 倒退至 1.94 ❌
   Fix-19  : GARCH(1,1) + directed t-mixture
+             => skew -0.104 (接近 0) ✅  kurtosis 1.84 ❌  hurst 0.638 ❌
+  Fix-20  : chi2 tail amp + skew_a*1.5 + AR(1) direct recursion
 """
 
 from __future__ import annotations
@@ -133,15 +137,15 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
+def _ar1_hurst_rho(h: float) -> float:
+    return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
+
+
 # ---------------------------------------------------------------------------
 # 1. FIT
 # ---------------------------------------------------------------------------
 
 def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
-    """
-    Fit stat params from df_history.
-    apply_trend_bias: nudge ret_mu in the direction of the overall lookback trend.
-    """
     closes   = df_history["Close"].values
     log_rets = _log_returns(closes)
     if len(log_rets) < 5:
@@ -155,7 +159,7 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
     h                  = hurst_exponent(log_rets)
     wick_lam, atr_mean = _fit_wick_lambda(df_history)
 
-    # trend bias（Fix-18 修改三，保留）
+    # trend bias（Fix-18 保留）
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
         trend_bias = float(np.sign(real_trend) * abs(ret_mu) * 0.3)
@@ -166,7 +170,6 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
         ret_std      = ret_std,
         ret_skew_a   = skew_a,
         ret_df       = df_t,
-        # hurst clip [0.3, 0.65]: h=0.65 => GARCH beta 貢獻足夠的 persistence
         hurst_target = float(np.clip(h, 0.3, 0.65)),
         wick_lambda  = wick_lam,
         atr_mean     = atr_mean,
@@ -174,11 +177,14 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Fix-19: GARCH(1,1) + directed t-mixture)
+# 2. GENERATE  (Fix-20)
 # ---------------------------------------------------------------------------
 
-_GARCH_ALPHA = 0.08
-_GARCH_BETA  = 0.88   # alpha + beta = 0.96, near I-GARCH
+# skew amplifier：補償 t 成分對 skewnorm 偏態的稀釋
+_SKEW_AMP = 1.5
+
+# chi2 tail amplifier threshold：只放大 |z| > 此值的尾部
+_TAIL_THRESHOLD = 1.5
 
 
 def generate(
@@ -189,22 +195,26 @@ def generate(
     drift_correction: float = 0.0,
 ) -> pd.DataFrame:
     """
-    Fix-19: GARCH(1,1) volatility clustering + directed t-mixture.
+    Fix-20 generate pipeline:
 
-    Step 1 — directed t-mixture
+    Step 1 — directed t-mixture with amplified skew_a
+      skew_a_amp = skew_a * 1.5  (補償 t 成分稀釋)
       p_t = clip(4 / df_t, 0.1, 0.6)
       t_directed = |t| * sign(skew_a)  if |skew_a| > 0.3
-      z_mix = where(mask, t_directed, skewnorm_sample)
-      => skew 方向由 skewnorm + directed-t 共同確定（不再稀釋）
-      => kurtosis 由 t 成分拉高，且不被 rank-remap 壓平
+      z_mix = where(mask, t_directed, skewnorm(skew_a_amp))
 
-    Step 2 — GARCH(1,1) vol clustering（取代 rank-remap）
-      初始路徑用 z_norm 排列，h_t[0] = ret_std^2
-      h_t[i] = omega + alpha * e[i-1]^2 + beta * h_t[i-1]
-      log_ret[i] = z_norm[i] * sqrt(h_t[i]) + ret_mu + drift_correction
+    Step 2 — chi2 variance-mixture tail amplifier
+      nu = max(df_t, 3.0)
+      chi2_scale = clip(sqrt(nu / chi2(nu)), 0.5, 4.0)
+      z_amplified = where(|z_norm| > 1.5, z_norm * chi2_scale, z_norm)
+      => kurtosis 升高，中心段不變
 
-    Step 3 — 縮放確保整體 std 對齊 ret_std
-      由於 GARCH 的 vol_scale 會改變整體 std，做最後一次 rescale。
+    Step 3 — AR(1) direct recursion（保留時序相關）
+      rho = 2^(2h-1) - 1
+      z_ar[i] = rho * z_ar[i-1] + innov_scale * z_amplified[i]
+      => 不破壞 z_amplified 的尾部形狀
+
+    Step 4 — rescale to (ret_mu + drift_correction, ret_std)
     """
     rng = np.random.default_rng(seed)
 
@@ -212,29 +222,31 @@ def generate(
     ret_std  = params["ret_std"]
     skew_a   = params["ret_skew_a"]
     df_t     = params["ret_df"]
+    hurst    = params["hurst_target"]
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
     # ------------------------------------------------------------------
-    # Step 1: directed t-mixture
+    # Step 1: directed t-mixture with amplified skew_a
     # ------------------------------------------------------------------
-    p_t  = float(np.clip(4.0 / max(df_t, 2.01), 0.1, 0.6))
-    mask = rng.uniform(size=n_bars) < p_t
+    skew_a_amp = float(np.clip(skew_a * _SKEW_AMP, -10.0, 10.0))
+    p_t   = float(np.clip(4.0 / max(df_t, 2.01), 0.1, 0.6))
+    mask  = rng.uniform(size=n_bars) < p_t
 
-    sn = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
+    sn = stats.skewnorm.rvs(a=skew_a_amp, loc=0, scale=1,
                              size=n_bars, random_state=rng)
     t_raw = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
                          size=n_bars, random_state=rng)
 
-    # directed: 讓 t 成分與 skewnorm 同偏方向，不稀釋 skew
+    # directed: t 成分與 skewnorm 同偏方向
     if abs(skew_a) > 0.3:
         t_directed = np.abs(t_raw) * float(np.sign(skew_a))
     else:
-        t_directed = t_raw   # 近對稱時保持原始 t
+        t_directed = t_raw
 
     z_mix = np.where(mask, t_directed, sn)
 
-    # 標準化 z_mix（保留形狀，消除 loc/scale 差異）
+    # 標準化 z_mix
     z_mean = float(np.mean(z_mix))
     z_std  = float(np.std(z_mix))
     if z_std > 1e-10:
@@ -243,30 +255,35 @@ def generate(
         z_norm = z_mix.copy()
 
     # ------------------------------------------------------------------
-    # Step 2: GARCH(1,1) volatility clustering
+    # Step 2: chi2 variance-mixture tail amplifier
     # ------------------------------------------------------------------
-    alpha_g = _GARCH_ALPHA
-    beta_g  = _GARCH_BETA
-    omega_g = ret_std ** 2 * (1.0 - alpha_g - beta_g)
+    nu         = max(float(df_t), 3.0)
+    chi2_draw  = rng.chisquare(nu, size=n_bars)
+    chi2_scale = np.clip(np.sqrt(nu / np.maximum(chi2_draw, 1e-8)), 0.5, 4.0)
 
-    h_t      = np.empty(n_bars)
-    h_t[0]   = ret_std ** 2
-    log_rets = np.empty(n_bars)
-    log_rets[0] = z_norm[0] * ret_std + ret_mu
+    tail_mask   = np.abs(z_norm) > _TAIL_THRESHOLD
+    z_amplified = np.where(tail_mask, z_norm * chi2_scale, z_norm)
 
+    # ------------------------------------------------------------------
+    # Step 3: AR(1) direct recursion（保留尾部形狀 + 加入時序相關）
+    # ------------------------------------------------------------------
+    rho          = _ar1_hurst_rho(hurst)
+    innov_scale  = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+
+    z_ar    = np.empty(n_bars)
+    z_ar[0] = z_amplified[0]
     for i in range(1, n_bars):
-        e_prev  = log_rets[i - 1] - ret_mu          # centered residual
-        h_t[i]  = omega_g + alpha_g * e_prev ** 2 + beta_g * h_t[i - 1]
-        h_t[i]  = max(h_t[i], 1e-12)
-        log_rets[i] = z_norm[i] * float(np.sqrt(h_t[i])) + ret_mu
+        z_ar[i] = rho * z_ar[i - 1] + innov_scale * z_amplified[i]
 
     # ------------------------------------------------------------------
-    # Step 3: final rescale to keep overall std == ret_std
+    # Step 4: rescale to (ret_mu, ret_std)
     # ------------------------------------------------------------------
-    actual_std = float(np.std(log_rets))
-    if actual_std > 1e-10:
-        # preserve mean, rescale std
-        log_rets = (log_rets - float(np.mean(log_rets))) / actual_std * ret_std + ret_mu
+    z_ar_mean = float(np.mean(z_ar))
+    z_ar_std  = float(np.std(z_ar))
+    if z_ar_std > 1e-10:
+        log_rets = (z_ar - z_ar_mean) / z_ar_std * ret_std + ret_mu
+    else:
+        log_rets = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
     # Rebuild OHLC
@@ -359,9 +376,7 @@ def rolling_fit_generate(
         sim_chunks.append(df_chunk)
         sim_last_close = float(df_chunk["Close"].iloc[-1])
 
-        # -------------------------------------------------------------------
         # Loss
-        # -------------------------------------------------------------------
         real_fwd  = df_real.iloc[pos:fwd_end].copy().reset_index(drop=True)
         real_rets = np.diff(np.log(np.maximum(real_fwd["Close"].values, 1e-10)))
         sim_rets  = np.diff(np.log(np.maximum(df_chunk["Close"].values, 1e-10)))
@@ -373,9 +388,7 @@ def rolling_fit_generate(
         else:
             loss = 0.0
 
-        # -------------------------------------------------------------------
         # OHLC comparison log
-        # -------------------------------------------------------------------
         real_o = float(real_fwd["Open"].iloc[0])   if len(real_fwd) > 0 else float("nan")
         real_h = float(real_fwd["High"].max())      if len(real_fwd) > 0 else float("nan")
         real_l = float(real_fwd["Low"].min())       if len(real_fwd) > 0 else float("nan")
@@ -391,7 +404,7 @@ def rolling_fit_generate(
         param_log.append({
             "window":   window_idx + 1,
             "fit_bars": [fit_start, fit_end],
-            "fwd_bars": [pos, fwd_end],
+            "fwd_bars\": [pos, fwd_end],
             **{k: params[k] for k in params},
             "drift_corr": round(drift_corr, 6),
             "loss":     round(loss, 4),
