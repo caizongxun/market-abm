@@ -1,65 +1,50 @@
 """
-stat_process.py  v14
+stat_process.py  v15
 ====================
 純統計過程模型，完全不使用 agent。
 
-Fix-14 — 修正 skew 符號翻轉問題
+Fix-15 — 三項修正
 ---------------------------------------
-Fix-13 症狀：
-  kurtosis = 4.78 ✅(進步)
-  skew     = -0.82 ❌ (真實 +0.45，翻轉且幅度大)
-  mean     = +0.00090 ✅
+Fix-14 遺留問題：
+  skew     = -0.525 ❌ (真實 +0.449，仍然翻轉)
+  kurtosis =  3.841 ❌ (真實 10.599，差距 64%)
+  hurst    =  0.811 ❌ (真實 0.693，偏高)
 
-Fix-13 的失敗原因：
-  q_mix(p) = (1-mix_t)*skewnorm.ppf(p,a) + mix_t*t.ppf(p,df)
-  當 skew_a < 0 的 window（共 18 個）：
-    - skewnorm.ppf(p, a=-2) 是左偏的
-    - t.ppf(p, df) 是對稱的， mix 後對稱成分導致
-      對稱的尾部放大，結合左偏 skewnorm => 左尾更大
-    - 18 個負 window 的導致對象決定了整體 skew 為負
+Fix-15 修正方案：
 
-  根本問題：
-    t.ppf 的對稱放大與 skewnorm 的方向交互 =>
-    負偏 window 的對稱尾部放大效果大於正偏 window
-    => 整體 skew 擅向負
+  [1] 中心遮罩 amp（修復 skew 翻轉）
+      舊問題：|t.ppf(p)|/|norm.ppf(p)| 在 p→0.5 時
+               norm.ppf(0.5)=0，分母趨近 0，
+               造成中心段數值爆炸後被 clip 打到非 1 的值，
+               使 amp 對 p=0.5 不精確對稱 => skew 被扭曲。
+      新方案：center_mask = |p-0.5| < 0.35（中心 70% 精確設 amp=1）
+               tail_mask = ~center_mask（外側 30% 才做 t/norm 放大）
+               => 中心不受數值問題影響，skew 符號完全保留
 
-Fix-14 正確方案：尾部放大器（Tail Amplifier）
-  目標：增加 fat-tail 但不改變 skew 方向。
-  方法：對 skewnorm.ppf 的尾部分位點把尾部拉長，
-         中間分位點保持不變。
+  [2] Variance-Mixture tail booster（修復 kurtosis）
+      舊問題：t(df~10) 的 excess kurtosis 上限 = 6/(df-4) ≈ 1.5，
+               但 AAPL 真實 excess kurtosis ≈ 10.6，差距太大。
+      新方案：在 rescale 後對 log_rets 乘以 chi2 縮放因子：
+               nu_boost = max(df * 0.5, 3.0)  ← 比擬合的 df 更肥
+               chi2_scale = sqrt(nu_boost / chi2(nu_boost))
+               => 這是 Student-t 的 variance-mixture 構造，
+                  有效提升 kurtosis 而不改變 skew 符號
+               clip(0.5, 3.0) 防止極端值爆炸
 
-  Tail Amplifier 定義：
-    t_q(p)  = |t.ppf(p, df)|         ← t 的尾部大小
-    n_q(p)  = |norm.ppf(p)|          ← Normal 的尾部大小
-    amp(p)  = t_q(p) / (n_q(p) + ε)  ← 尾部放大倍數（>1 在尾部）
+  [3] hurst_target clip 上限 0.8 → 0.72（修復 autocorrelation）
+      舊問題：h=0.8 => AR(1) rho = 2^(2*0.8-1)-1 = 0.56，
+               自相關過強 => 模擬 hurst=0.811 vs 真實 0.693。
+      新方案：clip(0.3, 0.72) => 最大 rho = 2^(2*0.72-1)-1 = 0.33
 
-    q_mix(p) = skewnorm.ppf(p, a) * amp(p)
-
-    特性：
-      - amp(p) > 1 在 p < 0.1 和 p > 0.9  => 尾部被拉長
-      - amp(p) ≈ 1 在 p ≈ 0.5           => 中間不變
-      - amp(p) 是關於 p=0.5 對稱的     => 不改變左右尾部的相對大小
-      - 因此 skewnorm 的算術 skew 符號被完全保留
-
-    kurtosis 來源：
-      amp(p) 在 p→0 和 p→1 時的增長幾乎跟 t(df) 的尾部行為一致
-      => 整體 kurtosis 接近 t(df) 的水準
-
-  Rescale：
-    z_mean = E[q_mix] = E[skewnorm(a)*amp]
-    z_std  = std[q_mix]
-    以 p_grid 上的 q_grid 計算 (uniform 積分)
-    z_norm = (z - z_mean) / z_std
-    log_rets = z_norm * ret_std + ret_mu
-
-v1-v14 修正歷程
+v1-v15 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
   Fix-9~11: 失敗—線性 t-blend 消除 skew
   Fix-12  : Gaussian Copula + skewnorm 邊際 => skew 修復但 kurtosis≈2.5
   Fix-13  : quantile-blend (skewnorm+t) => kurtosis 4.78 但 skew 翻轉 -0.82
-  Fix-14  : Tail Amplifier = t/normal 尾部比值 => kurtosis↑ + skew 符號保留
+  Fix-14  : Tail Amplifier = t/normal 尾部比值 => kurtosis↑ 但 skew 仍翻轉 -0.525
+  Fix-15  : center-masked amp + variance-mixture booster + hurst clip 0.72
 """
 
 from __future__ import annotations
@@ -155,14 +140,15 @@ def _build_tail_amplified_ppf(
     n_grid: int = 5000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build a tail-amplified PPF:
-      q_mix(p) = skewnorm.ppf(p, a) * amp(p)
-    where:
-      amp(p) = |t.ppf(p, df)| / (|norm.ppf(p)| + eps)
+    Fix-15: Center-masked tail amplifier.
 
-    amp(p) > 1 at tails (p near 0 or 1), amp(p) ≈ 1 at center.
-    Symmetric around p=0.5, so skew sign is fully preserved.
-    Fat-tail magnitude ≈ t(df) tails.
+    amp(p) = 1                                     if |p-0.5| < 0.35  (center 70%)
+           = |t.ppf(p,df)| / (|norm.ppf(p)| + eps)  if |p-0.5| >= 0.35 (outer tails)
+
+    Center 70% is exactly 1 to avoid numerical issues at p=0.5 where
+    norm.ppf(0.5)=0 would blow up the ratio in Fix-14.
+    The outer 30% (p < 0.15 or p > 0.85) gets t-like fat tails.
+    amp is symmetric around p=0.5, so skew sign of skewnorm is fully preserved.
     """
     eps = 1e-4
     p = np.linspace(eps, 1.0 - eps, n_grid)
@@ -171,9 +157,10 @@ def _build_tail_amplified_ppf(
     q_t    = stats.t.ppf(p, df=max(df_t, 2.01), loc=0, scale=1)
     q_norm = stats.norm.ppf(p, loc=0, scale=1)
 
-    # Tail amplifier: how much fatter t is vs normal at each quantile
-    amp = np.abs(q_t) / (np.abs(q_norm) + 1e-8)
-    # Clip amp to avoid extreme blowup at very deep tails
+    # Fix-15: center-masked amp — center 70% is exactly 1
+    amp = np.ones_like(p)
+    tail_mask = np.abs(p - 0.5) >= 0.35
+    amp[tail_mask] = np.abs(q_t[tail_mask]) / (np.abs(q_norm[tail_mask]) + 1e-8)
     amp = np.clip(amp, 0.5, 8.0)
 
     q_mix = q_sn * amp
@@ -203,14 +190,16 @@ def fit(df_history: pd.DataFrame) -> StatParams:
         ret_std      = ret_std,
         ret_skew_a   = skew_a,
         ret_df       = df_t,
-        hurst_target = float(np.clip(h, 0.3, 0.8)),
+        # Fix-15: hurst clip upper bound lowered 0.8 -> 0.72
+        # h=0.72 => rho = 2^(2*0.72-1)-1 = 0.33  (was 0.56 at h=0.8)
+        hurst_target = float(np.clip(h, 0.3, 0.72)),
         wick_lambda  = wick_lam,
         atr_mean     = atr_mean,
     )
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Fix-14: Tail Amplifier + Gaussian Copula)
+# 2. GENERATE  (Fix-15: center-masked amp + variance-mixture kurtosis booster)
 # ---------------------------------------------------------------------------
 
 def _ar1_hurst_rho(h: float) -> float:
@@ -224,22 +213,24 @@ def generate(
     seed:        int | None = None,
 ) -> pd.DataFrame:
     """
-    Fix-14: Tail Amplifier marginal + Gaussian Copula AR(1)
-    --------------------------------------------------------
+    Fix-15: center-masked amp + variance-mixture booster + hurst clip 0.72
+
     Marginal distribution:
       q_mix(p) = skewnorm.ppf(p, a) * amp(p)
-      amp(p) = |t.ppf(p,df)| / |norm.ppf(p)|   (symmetric around p=0.5)
+      amp(p) = 1 for |p-0.5| < 0.35  (center 70%, exact)
+             = |t.ppf(p,df)| / |norm.ppf(p)|  for tails
 
-    Properties:
-      - amp(p=0.5) = 1  => center unchanged
-      - amp(p->0 or 1) > 1  => tails amplified like Student-t
-      - amp symmetric => skew sign of skewnorm is preserved exactly
-      - kurtosis elevated toward t(df) level
+    Variance-mixture kurtosis booster:
+      nu_boost = max(df * 0.5, 3.0)
+      chi2_scale = sqrt(nu_boost / chi2(nu_boost))
+      log_rets *= chi2_scale
+      => Equivalent to drawing from a heavier-tailed variance-mixture distribution.
+         Kurtosis scales inversely with nu_boost (smaller => fatter tails).
+         chi2_scale is positive => skew sign is fully preserved.
+         Clipped to [0.5, 3.0] to prevent extreme outliers.
 
-    Autocorrelation: Gaussian Copula rank-remap (same as Fix-12).
-
-    Rescale: subtract E[q_mix], divide by std[q_mix] from p_grid
-    (theoretical moments, not empirical -> no tail compression).
+    Autocorrelation:
+      hurst_target clipped to [0.3, 0.72] => max AR(1) rho = 0.33
     """
     rng = np.random.default_rng(seed)
 
@@ -251,7 +242,7 @@ def generate(
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Build tail-amplified PPF grid
+    # Build tail-amplified PPF grid (Fix-15: center-masked)
     p_grid, q_grid = _build_tail_amplified_ppf(skew_a, df_t)
 
     # Theoretical mean and std from q_grid (uniform measure over p)
@@ -279,12 +270,20 @@ def generate(
     rank_of_ar1 = np.argsort(np.argsort(u_ar1))
     z_final = samples_sorted[rank_of_ar1]
 
-    # Rescale using theoretical moments (no empirical std compression)
+    # Rescale using theoretical moments
     if z_std > 1e-10:
         z_norm = (z_final - z_mean) / z_std
     else:
         z_norm = z_final - z_mean
     log_rets = z_norm * ret_std + ret_mu
+
+    # Fix-15: Variance-mixture tail booster for kurtosis
+    # nu_boost << df => chi2_scale has fatter tails than raw t(df)
+    nu_boost = float(max(df_t * 0.5, 3.0))
+    chi2_samples = rng.chisquare(nu_boost, size=n_bars)
+    chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_samples, 1e-8))
+    chi2_scale = np.clip(chi2_scale, 0.5, 3.0)
+    log_rets = log_rets * chi2_scale
 
     # Rebuild OHLC
     opens  = np.empty(n_bars)
