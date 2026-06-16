@@ -6,7 +6,7 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 
 設計原則
 --------
-- grid 比 ParamCalibrator 小（3x3x3x3 = 81 組）
+- grid：3x3x3x4 = 108 組（intra_noise_scale 加入 0.4 下界）
 - EMA 平滑（alpha=0.4）：新估值影響 40%，歷史殘留 60%
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
@@ -14,11 +14,18 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 - std_ratio 對稱 penalty：sim_std/real_std 超出 (cap, 1/cap) 區間時 loss *= 2.0
 - impact_coeff grid 收縮到 [0.0005, 0.0010, 0.0015]，抑制 sim_std 偏高
 
+Grid 更新說明（intra_noise_scale）
+-----------------------------------
+去掉 _t_draw() 的 clip 後，t(4) 尾巴變重，calibrator 需要能把
+intra_noise_scale 調到 0.4 以下才能把 std 壓回 real_std 水位。
+原本下界 0.7 在無截斷環境下已不夠低，擴展為 [0.4, 0.7, 1.0, 1.5]。
+grid 從 81 組增加到 108 組（+33%），每次執行時間等比增加。
+
 Window 接縫對齊（價格平移）
 --------------------------
 用對數報酬還原法把整個 window 的模擬路徑平移到 anchor_close：
 
-  scale = anchor_close / df_window_sim["Close"].iloc[0]
+  scale = anchor_close / df_window_sim["Open"].iloc[0]
   df_window_sim[["Open","High","Low","Close"]] *= scale
 
 這保留內部對數報酬的分佈（std / hurst / kurtosis 不變），
@@ -60,13 +67,15 @@ from .metrics import compare, hurst_exponent, log_returns
 
 # ---------------------------------------------------------------------------
 # Small grid for per-window search
-# 3x3x3x3 = 81 combos, ~10 sims each = 810 paths per window
+# 3x3x3x4 = 108 combos, ~10 sims each = 1080 paths per window
+# intra_noise_scale lower bound extended from 0.7 → 0.4 to accommodate
+# the heavier t(4) tails after removing the hard clip in _t_draw().
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
     "impact_coeff":      [0.0005, 0.0010, 0.0015],
     "momentum_scale":    [0.5,    1.0,    2.0   ],
     "decay":             [0.90,   0.93,   0.97  ],
-    "intra_noise_scale": [0.7,    1.0,    1.5   ],
+    "intra_noise_scale": [0.4,    0.7,    1.0,   1.5],
 }
 
 
@@ -85,7 +94,7 @@ class RegimeCalibrator:
     ema_alpha : float
         EMA 平滑係數。建議範圍 0.3–0.6。
     grid : dict
-        參數搜尋網格，預設 ROLLING_GRID（3x3x3x3 = 81）。
+        參數搜尋網格，預設 ROLLING_GRID（3x3x3x4 = 108）。
     w_hurst, w_dir, w_kurt, w_vol, w_pup : float
         loss 各項權重。
     p_up_lo, p_up_hi : float
@@ -267,7 +276,7 @@ class RegimeCalibrator:
         Rolling calibration 主迴圈。
 
         每個 window 的最終模擬路徑會經過 _rescale_window() 平移，
-        確保第一根 bar 的 Open 等於前一個 window 的真實收盤價，
+        確保第一根 bar 的 Open 等於前一個 window 的模擬收盤價，
         消除跨 window 跳層對 global std 的新增展。
 
         Parameters
@@ -347,8 +356,8 @@ class RegimeCalibrator:
             })
 
             # -------------------------------------------------------
-            # 接縫對齊：取前一個 window 最後一根真實收盤價
-            # window_idx == 0 時用 df_train 最後一根 Close
+            # 接縫對齊：取前一個 window 最後一根模擬收盤價
+            # window_idx == 0 時用 df_train 最後一根真實 Close
             # -------------------------------------------------------
             if window_idx == 0:
                 anchor_close = float(df_train["Close"].iloc[-1])

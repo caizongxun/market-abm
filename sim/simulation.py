@@ -20,6 +20,17 @@ auto_drift 模式（預設開啟）
 
   effective_drift[bar_i] = momentum_bias * decay^i
 
+drift_schedule 上限保護
+-----------------------
+為防止持續同向 momentum 造成累積 drift 過大，drift_schedule 建立後
+立即以 |momentum_bias| * 2 做雙向截斷：
+
+  drift_cap = |momentum_bias| * 2.0
+  drift_schedule = clip(drift_schedule, -drift_cap, drift_cap)
+
+由於 decay^i 單調遞減，正常情況下第一根 bar 就是最大值，後續都比它小，
+所以這個 clip 只在極端 momentum_bias 時才會觸發，不影響正常路徑。
+
 Rolling calibration
 -------------------
 見 sim/regime.py 的 RegimeCalibrator。
@@ -132,6 +143,9 @@ def run_simulation(
     drift_schedule: np.ndarray | None = None
     if use_momentum_init and auto_drift and drift_per_bar == 0.0 and momentum_bias != 0.0:
         drift_schedule = momentum_bias * (bias_decay ** np.arange(sim_bars))
+        # 防止持續同向 momentum 累積過大：以起始值的 2 倍做雙向截斷
+        drift_cap      = abs(momentum_bias) * 2.0
+        drift_schedule = np.clip(drift_schedule, -drift_cap, drift_cap)
 
     if agents is None:
         agents = build_default_agents(
