@@ -1,21 +1,29 @@
 """
-stat_process.py  v49.3
+stat_process.py  v50
 ====================
 純統計過程模型，完全不使用 agent。
 
+v50: Revert Fleishman Power Transform (v49 family) — it destroyed skew/kurtosis
+     and time-series structure (path_corr dropped to +0.11).
+
+     Root cause: Fleishman is designed for i.i.d. samples; applying it after
+     AR1/GARCH/jump reordered the innovations, wiping out autocorrelation.
+     The exact-rescale after Fleishman also collapsed skew back toward zero.
+
+     Replacement strategy for fat tails + skew:
+       Step 1  Heavy-tail base: always use t(df) + skewnorm mixture.
+               df is MLE-fitted per window; p_t driven by target_ek directly.
+               NIG path kept for target_ek > 15 as a secondary option.
+       Step 5b Jump amplification: when target_ek > 6, scale jump_std by
+               sqrt(target_ek / 6) so sparse jumps carry fatter tails.
+               Jump size drawn from skewed-t to also push skew.
+     Everything else (AR1 Hurst, ACF, GARCH, exact rescale, drift alignment)
+     is unchanged from v49.2.
+
 v49.3: fix bracket mismatch in OnlineRidgePredictor.predict_correction
-       np.array(self._y_ek] → np.array(self._y_ek)
-v49.2: fix rolling level drift (downward bias)
-       1. start_price chaining: each window starts from prev sim Close
-          instead of real Open, eliminating boundary gaps across 40+ windows.
-       2. Global drift alignment after std-rescale: linear correction path
-          aligns sim mean log-return to real tail mean log-return.
-          Guard: |correction| < 0.005/bar to avoid over-fitting.
-v49.1: fix Fleishman mean-drift & skew sign
-       - Reduce to 3-unknown system (a = -c analytic)
-       - Loosen feasibility guard from 0.95 → 0.80
-       - Second exact rescale after Fleishman guarantees (mu, std)
-v49: Step 6b — Fleishman Power Transform
+v49.2: fix rolling level drift — start_price chaining + global drift alignment
+v49.1: fix Fleishman mean-drift & skew sign (3-unknown system)
+v49: Step 6b Fleishman Power Transform (now removed)
 v48.1: fix bracket mismatch
 v48: std inflation, skew sign flip, kurtosis overshoot fixes
 v47: Volume fit / generate
@@ -31,7 +39,7 @@ from typing import TYPE_CHECKING, Optional, TypedDict
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.optimize import fsolve, minimize_scalar
+from scipy.optimize import minimize_scalar
 
 from sim.metrics import hurst_exponent
 
@@ -199,89 +207,6 @@ def _path_corr(real_closes, sim_closes):
 
 
 # ---------------------------------------------------------------------------
-# v49.1: Fleishman Power Transform helpers
-#
-# v49.1 change: reduce from 4 unknowns to 3 by substituting a = -c
-# (the mean=0 condition E[Y] = a + c = 0 gives a = -c analytically).
-# This removes one degree of freedom and makes fsolve significantly
-# more stable, eliminating the mean-drift observed in v49.
-# ---------------------------------------------------------------------------
-
-def _fleishman_equations_3(bcd, target_skew: float, target_ek: float):
-    """
-    3-unknown Fleishman system with a = -c substituted in.
-
-    Y = -c + b*Z + c*Z^2 + d*Z^3,  Z ~ N(0,1)
-
-    Remaining three equations:
-        Var[Y] = b^2 + 6bd + 2c^2 + 15d^2 = 1
-        gamma1 = 2c(b^2 + 24bd + 105d^2 + 2) = target_skew
-        gamma2 = 24*(bd + c^2*(1+b^2+28bd) + d^2*(12+48bd+141c^2+225d^2))
-               = target_ek
-    """
-    b, c, d = bcd
-    eq1 = b**2 + 6*b*d + 2*c**2 + 15*d**2 - 1.0
-    eq2 = 2*c*(b**2 + 24*b*d + 105*d**2 + 2) - target_skew
-    eq3 = (24*(b*d + c**2*(1 + b**2 + 28*b*d) +
-               d**2*(12 + 48*b*d + 141*c**2 + 225*d**2))
-           - target_ek)
-    return [eq1, eq2, eq3]
-
-
-def _solve_fleishman(target_skew: float, target_ek: float):
-    """
-    Solve Fleishman coefficients using the reduced 3-unknown system.
-
-    Returns (a, b, c, d) with a = -c, or None if no valid solution.
-
-    Feasibility guard (v49.1): target_ek >= skew^2 * 1.7 + 1 relaxed
-    to 0.80x so that marginal cases become no-ops rather than bad solves.
-    """
-    min_ek = target_skew ** 2 * 1.7 + 1.0
-    if target_ek < min_ek * 0.80:          # v49.1: was 0.95
-        return None
-
-    best     = None
-    best_res = np.inf
-
-    # Grid of starting points for (b, c, d)
-    for b0 in [1.0, 0.9, 1.1]:
-        for c0 in [0.0, target_skew * 0.05, -target_skew * 0.05]:
-            for d0 in [0.01, target_ek * 0.002, 0.05]:
-                x0 = [b0, c0, d0]
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        sol, info, ier, _ = fsolve(
-                            _fleishman_equations_3, x0,
-                            args=(target_skew, target_ek),
-                            full_output=True,
-                        )
-                    if ier != 1:
-                        continue
-                    residual = float(np.linalg.norm(info["fvec"]))
-                    b_sol = sol[0]
-                    if residual < best_res and b_sol > 0:   # b > 0 for monotone
-                        best_res = residual
-                        best     = sol
-                except Exception:
-                    continue
-
-    if best is None or best_res > 1e-3:
-        return None
-
-    b, c, d = float(best[0]), float(best[1]), float(best[2])
-    a = -c          # analytic: mean=0 constraint
-    return (a, b, c, d)
-
-
-def _apply_fleishman(z: np.ndarray, coefs) -> np.ndarray:
-    """Apply Y = a + b*z + c*z^2 + d*z^3."""
-    a, b, c, d = coefs
-    return a + b * z + c * z**2 + d * z**3
-
-
-# ---------------------------------------------------------------------------
 # v47: Volume helpers
 # ---------------------------------------------------------------------------
 
@@ -413,17 +338,18 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v49.1: Fleishman with 3-unknown system + second rescale)
+# 2. GENERATE  (v50: Fleishman removed; fat tails via t-mix + jump amplify)
 #
 # 管線：
-#   Step 1  採樣基礎分佈（skewnorm+t 混合 or NIG）
+#   Step 1  採樣基礎分佈（NIG if ek>15, else t+skewnorm mixture）
+#           p_t = clip(target_ek / t_ek_implied, 0.10, 0.95) — drives fat tails
 #   Step 2  AR1 Hurst 過濾
 #   Step 3  ACF lag1 微調
 #   Step 4  對稱 GARCH(1,1)
 #   Step 5  jump 疊加
+#   Step 5b Jump amplification: scale jump_std by sqrt(ek/6) when ek>6
+#           Jump direction biased by skew_raw sign to push skew
 #   Step 6  exact rescale → (ret_mu, ret_std)
-#   Step 6b Fleishman Power Transform (v49.1: 3-unknown system)
-#           標準化 → fsolve(b,c,d) → a=-c → 變換 → exact rescale → (ret_mu, ret_std)
 #   Step 7  OHLC wick
 #   Step 8  Volume
 # ---------------------------------------------------------------------------
@@ -464,7 +390,10 @@ def generate(
 
     # ------------------------------------------------------------------
     # Step 1: 採樣基礎分佈
+    # Use low df_t (fat tails) and high p_t (t-fraction) to hit target_ek.
     # ------------------------------------------------------------------
+    z_raw = None
+
     if target_ek > _NIG_TRIGGER:
         nig_ab = _nig_params_from_moments(ret_std, skew_raw, target_ek)
         if nig_ab is not None:
@@ -476,29 +405,28 @@ def generate(
                         a=a_nig, b=b_nig, loc=0, scale=1,
                         size=total, random_state=int(rng.integers(0, 2**31))
                     )
+                    if not np.all(np.isfinite(z_raw)):
+                        z_raw = None
                 except Exception:
                     z_raw = None
-        else:
-            z_raw = None
 
-        if z_raw is None:
-            df_t_eff = float(np.clip(df_t, 2.5, 6.0))
-            p_t      = float(np.clip(target_ek / 20.0, 0.30, 0.90))
-            mask     = rng.uniform(size=total) < p_t
-            z_raw    = np.where(
-                mask,
-                stats.t.rvs(df=df_t_eff, loc=0, scale=1, size=total, random_state=rng),
-                stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total, random_state=rng),
-            )
-    else:
-        df_t_eff = float(np.clip(df_t, 2.5, 20.0))
-        t_ek     = 6.0 / max(df_t_eff - 4.0, 0.1) if df_t_eff > 4.0 else 3.0
-        p_t      = float(np.clip(target_ek / max(t_ek, 0.5), 0.05, 0.85))
-        mask     = rng.uniform(size=total) < p_t
-        z_raw    = np.where(
+    if z_raw is None:
+        # df_t: MLE-fitted, but floor at 2.5 to ensure heavy tails exist.
+        # p_t: fraction of t samples; higher ek → more t draws.
+        # t_ek_implied: excess kurtosis of t(df) = 6/(df-4) for df>4.
+        df_t_eff = float(np.clip(df_t, 2.5, 12.0))   # cap at 12 (not 20/30)
+        if df_t_eff > 4.0:
+            t_ek_implied = 6.0 / (df_t_eff - 4.0)
+        else:
+            t_ek_implied = target_ek  # df<=4: infinite kurtosis, use 100% t
+        p_t = float(np.clip(target_ek / max(t_ek_implied, 0.5), 0.10, 0.95))
+        mask  = rng.uniform(size=total) < p_t
+        z_raw = np.where(
             mask,
-            stats.t.rvs(df=df_t_eff, loc=0, scale=1, size=total, random_state=rng),
-            stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total, random_state=rng),
+            stats.t.rvs(df=df_t_eff, loc=0, scale=1, size=total,
+                        random_state=int(rng.integers(0, 2**31))),
+            stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total,
+                               random_state=int(rng.integers(0, 2**31))),
         )
 
     # ------------------------------------------------------------------
@@ -530,10 +458,10 @@ def generate(
     # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.02 and n_bars > 1:
-        beta     = float(np.clip(alpha * 0.8, 0.0, 0.89))
+        beta_g   = float(np.clip(alpha * 0.8, 0.0, 0.89))
         alpha_s  = float(np.clip(alpha * 0.15, 0.01, 0.20))
         base_var = 1.0
-        omega    = base_var * max(1.0 - beta - alpha_s, 0.01)
+        omega    = base_var * max(1.0 - beta_g - alpha_s, 0.01)
 
         h_t      = np.empty(n_bars)
         z_garch  = np.empty(n_bars)
@@ -541,22 +469,31 @@ def generate(
         z_garch[0] = z_ar[0]
 
         for i in range(1, n_bars):
-            h_t[i]   = omega + beta * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
-            h_t[i]   = max(h_t[i], base_var * 0.01)
+            h_t[i]     = omega + beta_g * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
+            h_t[i]     = max(h_t[i], base_var * 0.01)
             vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.7, 1.3))
             z_garch[i] = z_ar[i] * vol_scale
     else:
         z_garch = z_ar
 
     # ------------------------------------------------------------------
-    # Step 5: jump
+    # Step 5: jump 疊加
+    # Step 5b: amplify jump_std when target_ek > 6 to reproduce fat tails;
+    #          bias jump sign toward skew_raw direction.
     # ------------------------------------------------------------------
     z_work = z_garch.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
-            jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
-            jump_sizes = rng.normal(0.0, 1.0, size=n_jumps)
+            jump_idx = rng.choice(n_bars, size=n_jumps, replace=False)
+
+            # Step 5b: ek-driven amplitude scaling
+            ek_amp = float(np.sqrt(max(target_ek / 6.0, 1.0)))
+            eff_jump_std = jump_std * ek_amp
+
+            # skew bias: shift jump mean toward sign(skew_raw)
+            skew_bias = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
+            jump_sizes = rng.normal(skew_bias, eff_jump_std, size=n_jumps)
             z_work[jump_idx] += jump_sizes
 
     # ------------------------------------------------------------------
@@ -567,41 +504,6 @@ def generate(
         z_final = (z_work - float(np.mean(z_work))) / z_std * ret_std + ret_mu
     else:
         z_final = np.full(n_bars, ret_mu)
-
-    # ------------------------------------------------------------------
-    # Step 6b: Fleishman Power Transform  (v49.1)
-    #
-    # Uses reduced 3-unknown system (a = -c by construction) to
-    # eliminate mean drift.  A second exact rescale after the polynomial
-    # transform is the final guarantee of (ret_mu, ret_std).
-    #
-    # Skip when:
-    #   - n_bars < 20
-    #   - |skew_raw| < 0.05 AND target_ek < 1.0  (near-normal)
-    #   - Solver returns None (infeasible or diverged)
-    # ------------------------------------------------------------------
-    if n_bars >= 20 and (abs(skew_raw) >= 0.05 or target_ek >= 1.0):
-        z_mean = float(np.mean(z_final))
-        z_s2   = float(np.std(z_final))
-        if z_s2 > 1e-10:
-            z_std01 = (z_final - z_mean) / z_s2   # standardise to (0, 1)
-
-            fleishman_coefs = _solve_fleishman(
-                target_skew = float(np.clip(skew_raw,   -3.0, 3.0)),
-                target_ek   = float(np.clip(target_ek,   0.5, 20.0)),
-            )
-
-            if fleishman_coefs is not None:
-                y_transformed = _apply_fleishman(z_std01, fleishman_coefs)
-
-                if np.all(np.isfinite(y_transformed)):
-                    y_s = float(np.std(y_transformed))
-                    if y_s > 1e-10:
-                        # Second exact rescale: guarantee (ret_mu, ret_std)
-                        z_final = (
-                            (y_transformed - float(np.mean(y_transformed))) / y_s
-                            * ret_std + ret_mu
-                        )
 
     # ------------------------------------------------------------------
     # Step 7: OHLC
@@ -751,13 +653,12 @@ def rolling_fit_generate(
             params = predictor.predict_correction(params, window_idx)
 
         # v49.2: chain start_price from previous sim chunk's last Close
-        # instead of real Open, to avoid accumulating boundary gaps.
         if result_chunks:
             start_price = float(result_chunks[-1]["Close"].iloc[-1])
         else:
             start_price = float(df_real["Open"].iloc[fwd_start])
 
-        sim_seed    = int(rng.integers(0, 2**31))
+        sim_seed = int(rng.integers(0, 2**31))
         df_sim = generate(params=params, n_bars=fwd_bars,
                           start_price=start_price, seed=sim_seed)
 
@@ -879,9 +780,6 @@ def rolling_fit_generate(
 
         # -------------------------------------------------------------------
         # v49.2: global drift alignment
-        # Align sim mean log-return to real tail mean log-return.
-        # Guard: only correct when |drift_correction| < 0.005/bar to
-        # avoid over-fitting on short or highly volatile windows.
         # -------------------------------------------------------------------
         sim_all_rets_post = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
