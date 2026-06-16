@@ -253,18 +253,18 @@ def plot_stat(symbol, df_real, df_result, param_log):
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 8))
-    fig.suptitle(f"{symbol} \u2014 StatProcess Rolling vs Real", fontsize=13)
+    fig.suptitle(f"{symbol} - StatProcess Rolling vs Real", fontsize=13)
 
     n = len(df_result)
     real_tail = df_real.iloc[-n:].copy().reset_index(drop=True)
 
-    # (0,0) Close 價格對比
+    # (0,0) Close price
     axes[0, 0].plot(real_tail["Close"].values, label="Real", alpha=0.7)
     axes[0, 0].plot(df_result["Close"].values,  label="Sim",  alpha=0.7)
     axes[0, 0].set_title("Close Price")
     axes[0, 0].legend()
 
-    # (0,1) 報酬分佈
+    # (0,1) Return distribution
     r_real = np.diff(np.log(real_tail["Close"].values + 1e-10))
     r_sim  = np.diff(np.log(df_result["Close"].values + 1e-10))
     axes[0, 1].hist(r_real, bins=60, alpha=0.5, label="Real")
@@ -280,15 +280,16 @@ def plot_stat(symbol, df_real, df_result, param_log):
     axes[0, 2].set_title("Rolling Volatility")
     axes[0, 2].legend()
 
-    # (1,0) Student-t df 隨時間演變
-    windows  = [p["window"]       for p in param_log]
-    df_vals  = [p["ret_df"]       for p in param_log]
-    hurst_v  = [p["hurst_target"] for p in param_log]
-    sigma_v  = [p["ret_sigma"]    for p in param_log]
-    wick_v   = [p["wick_lambda"]  for p in param_log]
+    # (1,0) Student-t df
+    windows = [p["window"]       for p in param_log]
+    df_vals = [p["ret_df"]       for p in param_log]
+    hurst_v = [p["hurst_target"] for p in param_log]
+    # v3: ret_std (was ret_sigma in v1/v2)
+    std_v   = [p.get("ret_std", p.get("ret_sigma", 0.0)) for p in param_log]
+    wick_v  = [p["wick_lambda"]  for p in param_log]
 
     axes[1, 0].plot(windows, df_vals, marker="o", ms=3, color="tab:red")
-    axes[1, 0].set_title("Student-t df  (\u5c0f=肥尾大)")
+    axes[1, 0].set_title("Student-t df  (low = fat tail)")
     axes[1, 0].axhline(y=10, linestyle="--", alpha=0.4)
 
     # (1,1) Hurst
@@ -297,14 +298,14 @@ def plot_stat(symbol, df_real, df_result, param_log):
     axes[1, 1].set_title("Hurst Target")
     axes[1, 1].set_ylim(0.3, 0.8)
 
-    # (1,2) sigma + wick
+    # (1,2) std + wick
     ax = axes[1, 2]
-    ax.plot(windows, sigma_v, marker="o", ms=3, label="ret_sigma", color="tab:orange")
-    ax.set_ylabel("ret_sigma", color="tab:orange")
+    ax.plot(windows, std_v,  marker="o", ms=3, label="ret_std", color="tab:orange")
+    ax.set_ylabel("ret_std", color="tab:orange")
     axr = ax.twinx()
     axr.plot(windows, wick_v, marker="s", ms=3, label="wick_lambda", color="tab:green", alpha=0.7)
     axr.set_ylabel("wick_lambda", color="tab:green")
-    ax.set_title("sigma / wick_lambda")
+    ax.set_title("ret_std / wick_lambda")
 
     plt.tight_layout()
     out_png = f"results/{symbol}_stat.png"
@@ -324,7 +325,6 @@ def main():
 
     # -----------------------------------------------------------------------
     if args.stat:
-        # 統計過程模型 rolling 模式
         df_result, param_log = run_stat(args, df_real)
         save_results_stat(args.symbol, df_result, param_log)
 
@@ -337,7 +337,6 @@ def main():
             plot_stat(args.symbol, df_real, df_result, param_log)
 
     elif args.rolling:
-        # ABM rolling calibration 模式
         df_result, param_log = run_rolling(args, df_real)
         save_results_rolling(args.symbol, df_result, param_log)
 
@@ -350,7 +349,6 @@ def main():
             plot_rolling(args.symbol, df_real, df_result, param_log)
 
     else:
-        # ABM 單次模擬模式
         df_sim = run_static(args, df_real)
         save_results_static(args.symbol, df_sim)
 
