@@ -1,27 +1,18 @@
 """
-stat_process.py  v40
+stat_process.py  v41
 ====================
 純統計過程模型，完全不使用 agent。
 
-v40 新增（v39 骨架不動）：
-------------------------------------------------------
-Fix-40  AdaptiveCalibrator 整合
-  rolling_fit_generate() 接受可選的 calibrator 參數。
-  每個視窗執行流程：
-    1. fit(df_fit) → 取得基礎 StatParams
-    2. calibrator.predict(context) → 取得 CalibAction
-    3. action.apply(params) → 套用校正量
-    4. generate(corrected_params) → 產生模擬序列
-    5. 計算誤差 → calibrator.record(context, action, reward_components)
-  OnlineRidgePredictor 保留作為 baseline fallback。
+v41 patch（三項）：
+  Patch-1  target_ek 上限 30 → 15（fit() 與 fit() 的 np.clip 同步收緊）
+  Patch-2  HIGH_EK_THRESH  20 → 12（高 ek 路徑提早切換到 t-mixture，
+           同時把 chi2 amp 上限 4.0 → 2.5，防止尾部爆炸）
+  Patch-3  context 正規化：build_context 改在 calibrator.py，
+           stat_process 端在送入 calibrator 前不再需要改動；
+           但 fit() 的 target_ek clip 上限已反映 Patch-1。
 
-v1-v40 修正歷程（節錄）
------------------------
-  Fix-1~36 : 見 v36 docstring
-  Fix-37   : GJR-GARCH + NIG 尾部採樣
-  Fix-38   : NIG a_nig >= 0.15 + 截斷 t-mixture + GJR vol_scale 收緊
-  Fix-39   : 高 ek 路徑跳過 chi2 放大；final_scale 下限 0.5→0.4
-  Fix-40   : AdaptiveCalibrator 整合（跨 trial 持久化校正知識）
+v40 (不變)：AdaptiveCalibrator 整合
+v1-v39 : 見舊 docstring
 """
 
 from __future__ import annotations
@@ -67,7 +58,7 @@ def _log_returns(closes: np.ndarray) -> np.ndarray:
     return np.diff(np.log(np.maximum(closes.astype(float), 1e-10)))
 
 
-def _wilder_atr(hi: np.ndarray, lo: np.ndarray, cl: np.ndarray, period: int = 14) -> np.ndarray:
+def _wilder_atr(hi, lo, cl, period=14):
     n = len(hi)
     tr = np.empty(n)
     tr[0] = hi[0] - lo[0]
@@ -80,7 +71,7 @@ def _wilder_atr(hi: np.ndarray, lo: np.ndarray, cl: np.ndarray, period: int = 14
     return atr
 
 
-def _fit_df_scan(log_rets: np.ndarray) -> float:
+def _fit_df_scan(log_rets):
     mu    = float(np.mean(log_rets))
     sigma = float(np.std(log_rets, ddof=1))
     def neg_ll(df):
@@ -88,7 +79,7 @@ def _fit_df_scan(log_rets: np.ndarray) -> float:
     return float(minimize_scalar(neg_ll, bounds=(2.1, 30.0), method="bounded").x)
 
 
-def _fit_skewnorm(log_rets: np.ndarray) -> tuple[float, float, float]:
+def _fit_skewnorm(log_rets):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -101,7 +92,7 @@ def _fit_skewnorm(log_rets: np.ndarray) -> tuple[float, float, float]:
     return a, loc, scale
 
 
-def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
+def _fit_wick_lambda(df_ohlc):
     hi = df_ohlc["High"].values.astype(float)
     lo = df_ohlc["Low"].values.astype(float)
     op = df_ohlc["Open"].values.astype(float)
@@ -119,7 +110,7 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-def _fit_jump_params(log_rets: np.ndarray, ret_std: float) -> tuple[float, float]:
+def _fit_jump_params(log_rets, ret_std):
     threshold  = 3.0 * ret_std
     jump_mask  = np.abs(log_rets) > threshold
     jump_count = int(np.sum(jump_mask))
@@ -132,7 +123,7 @@ def _fit_jump_params(log_rets: np.ndarray, ret_std: float) -> tuple[float, float
     return jump_freq, jump_std
 
 
-def _fit_vol_persistence(log_rets: np.ndarray, ret_mu: float) -> float:
+def _fit_vol_persistence(log_rets, ret_mu):
     resid    = log_rets - ret_mu
     resid_sq = resid ** 2
     if len(resid_sq) < 4:
@@ -143,7 +134,7 @@ def _fit_vol_persistence(log_rets: np.ndarray, ret_mu: float) -> float:
     return float(np.clip(corr if np.isfinite(corr) else 0.0, 0.0, 0.85))
 
 
-def _fit_acf_lag1(log_rets: np.ndarray) -> float:
+def _fit_acf_lag1(log_rets):
     if len(log_rets) < 4:
         return 0.0
     with warnings.catch_warnings():
@@ -152,13 +143,11 @@ def _fit_acf_lag1(log_rets: np.ndarray) -> float:
     return float(np.clip(corr if np.isfinite(corr) else 0.0, -0.5, 0.5))
 
 
-def _ar1_hurst_rho(h: float) -> float:
+def _ar1_hurst_rho(h):
     return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
 
 
-def _nig_params_from_moments(
-    std: float, skew: float, kurt_excess: float
-) -> tuple[float, float] | None:
+def _nig_params_from_moments(std, skew, kurt_excess):
     if kurt_excess < 0.5:
         return None
     try:
@@ -171,7 +160,7 @@ def _nig_params_from_moments(
         return None
 
 
-def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
+def _dtw_distance(s, t):
     n, m = len(s), len(t)
     if n == 0 or m == 0:
         return float("nan")
@@ -184,7 +173,7 @@ def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
     return float(dtw[n, m] / max(n, m))
 
 
-def _path_corr(real_closes: np.ndarray, sim_closes: np.ndarray) -> float:
+def _path_corr(real_closes, sim_closes):
     n = min(len(real_closes), len(sim_closes))
     if n < 3:
         return float("nan")
@@ -197,8 +186,13 @@ def _path_corr(real_closes: np.ndarray, sim_closes: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 1. FIT
+# 1. FIT  (Patch-1: target_ek clip 上限 30 → 15)
 # ---------------------------------------------------------------------------
+
+# Patch-1: 收緊 target_ek 上限，防止 NVDA/GOOGL 等高波動股把
+# kurtosis 目標放大到無法合理模擬的程度。
+_TARGET_EK_MAX = 15.0   # v40: 30.0 → v41: 15.0
+
 
 def fit(
     df_history:      pd.DataFrame,
@@ -225,7 +219,8 @@ def fit(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ek = float(stats.kurtosis(log_rets))
-    target_ek = float(max(np.clip(ek, 0.5, 30.0), ek_global_floor))
+    # Patch-1: 上限收緊為 _TARGET_EK_MAX
+    target_ek = float(max(np.clip(ek, 0.5, _TARGET_EK_MAX), ek_global_floor))
 
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
@@ -249,10 +244,14 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v40：與 v39 邏輯相同，介面不變)
+# 2. GENERATE  (Patch-2: HIGH_EK_THRESH 20→12, chi2 amp 上限 4.0→2.5)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
+
+# Patch-2: 高 ek 路徑提早切換閾值，且 chi2 放大係數上限收緊
+_HIGH_EK_THRESH = 12.0   # v40: 20.0 → v41: 12.0
+_CHI2_AMP_MAX   = 2.5    # v40: 4.0  → v41: 2.5
 
 
 def generate(
@@ -279,7 +278,8 @@ def generate(
 
     total = n_bars + _AR1_WARMUP
 
-    HIGH_EK_THRESH = 20.0
+    # Patch-2: 使用模組常數而非 hardcode 20.0
+    HIGH_EK_THRESH = _HIGH_EK_THRESH
 
     if target_ek > HIGH_EK_THRESH:
         use_nig    = False
@@ -406,7 +406,8 @@ def generate(
                 np.clip(chi2_norm, 0.5, 5.0),
                 np.clip(chi2_norm, 0.5, 3.5),
             )
-            amp = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, 4.0)
+            # Patch-2: amp 上限 4.0 → _CHI2_AMP_MAX (2.5)
+            amp = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, _CHI2_AMP_MAX)
             sign_mask = np.sign(z_scaled[tail_mask] - ret_mu)
             z_scaled[tail_mask] = (
                 ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
@@ -426,7 +427,7 @@ def generate(
         final_scale = float(np.clip(ret_std / final_std, 0.4, scale_max))
         z_scaled    = (z_scaled - final_mean) * final_scale + ret_mu
 
-    prices  = np.empty(n_bars + 1)
+    prices    = np.empty(n_bars + 1)
     prices[0] = start_price
     for i in range(n_bars):
         prices[i + 1] = prices[i] * np.exp(z_scaled[i])
@@ -443,22 +444,20 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. OnlineRidgePredictor  (baseline，v25+，保留相容)
+# 3. OnlineRidgePredictor  (保留相容)
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
-    def __init__(self, min_train: int = 10, max_blend: float = 0.50):
+    def __init__(self, min_train=10, max_blend=0.50):
         self.min_train = min_train
         self.max_blend = max_blend
-        self._X: list[list[float]] = []
-        self._y_std:   list[float] = []
-        self._y_skew:  list[float] = []
-        self._y_hurst: list[float] = []
-        self._y_ek:    list[float] = []
+        self._X: list = []
+        self._y_std:   list = []
+        self._y_skew:  list = []
+        self._y_hurst: list = []
+        self._y_ek:    list = []
 
-    def record(self, params: StatParams, realised_std: float,
-               realised_skew: float, realised_hurst: float,
-               realised_ek: float) -> None:
+    def record(self, params, realised_std, realised_skew, realised_hurst, realised_ek):
         feat = [
             params["ret_std"], params["ret_skew_a"],
             params["hurst_target"], params["target_ek"],
@@ -479,7 +478,7 @@ class OnlineRidgePredictor:
             w = np.linalg.lstsq(XtX, X.T @ y, rcond=None)[0]
         return float(x_new @ w)
 
-    def predict_correction(self, params: StatParams, window_idx: int) -> StatParams:
+    def predict_correction(self, params, window_idx):
         n = len(self._X)
         if n < self.min_train:
             return params
@@ -496,7 +495,7 @@ class OnlineRidgePredictor:
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
         new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, 30.0))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
@@ -504,7 +503,7 @@ class OnlineRidgePredictor:
 
 
 # ---------------------------------------------------------------------------
-# 4. Rolling fit-generate  (v40: 整合 AdaptiveCalibrator)
+# 4. Rolling fit-generate  (v40 邏輯不變)
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
@@ -516,10 +515,6 @@ def rolling_fit_generate(
     use_adapt:  bool = True,
     calibrator: "Optional[AdaptiveCalibrator]" = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """
-    calibrator: 外部傳入的 AdaptiveCalibrator 實例（跨 trial 共享）。
-                None 時退化到 OnlineRidgePredictor（原行為）。
-    """
     n      = len(df_real)
     pos    = 0
     result_chunks: list[pd.DataFrame] = []
@@ -543,10 +538,8 @@ def rolling_fit_generate(
         df_fit = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         df_fwd = df_real.iloc[fwd_start:fwd_end].copy().reset_index(drop=True)
 
-        # ---- Step 1: fit ----
         params = fit(df_fit)
 
-        # ---- Step 2: AdaptiveCalibrator 校正（優先） ----
         calib_action = None
         if calibrator is not None:
             from sim.calibrator import AdaptiveCalibrator
@@ -554,22 +547,18 @@ def rolling_fit_generate(
             calib_action = calibrator.predict(ctx)
             params_dict  = calib_action.apply(dict(params))
             params       = StatParams(**params_dict)
-
-        # ---- Step 3: OnlineRidgePredictor fallback（calibrator 未訓練時輔助） ----
         elif predictor is not None:
             params = predictor.predict_correction(params, window_idx)
 
-        # ---- Step 4: generate ----
         start_price = float(df_real["Open"].iloc[fwd_start])
         sim_seed    = int(rng.integers(0, 2**31))
         df_sim = generate(params=params, n_bars=fwd_bars,
                           start_price=start_price, seed=sim_seed)
 
-        # ---- Step 5: 計算誤差指標 ----
         sim_rets  = np.diff(np.log(np.maximum(df_sim["Close"].values,  1e-10)))
         real_rets = np.diff(np.log(np.maximum(df_fwd["Close"].values,  1e-10)))
 
-        real_std_w = float(np.std(real_rets)) + 1e-10
+        real_std_w  = float(np.std(real_rets)) + 1e-10
         std_err_pct = abs(float(np.std(sim_rets)) / real_std_w - 1.0) if len(sim_rets) > 1 else float("nan")
         kurt_err    = abs(float(stats.kurtosis(sim_rets)) - float(stats.kurtosis(real_rets))) if len(sim_rets) > 3 else float("nan")
         hurst_err   = abs(float(hurst_exponent(sim_rets)) - float(hurst_exponent(real_rets))) if len(sim_rets) > 10 else float("nan")
@@ -593,7 +582,6 @@ def rolling_fit_generate(
         if np.isfinite(dtw_val):   all_dtw.append(dtw_val)
         if np.isfinite(pcorr_val): all_pcorr.append(pcorr_val)
 
-        # ---- Step 6: 回饋給 calibrator ----
         if calibrator is not None and calib_action is not None:
             if all(np.isfinite(v) for v in [std_err_pct, kurt_err, hurst_err, dir_hit]):
                 calibrator.record(
@@ -605,7 +593,6 @@ def rolling_fit_generate(
                     dir_hit     = dir_hit,
                 )
 
-        # ---- Step 7: OnlineRidgePredictor 也記錄（calibrator 模式下仍更新） ----
         if predictor is not None and len(real_rets) > 3:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -637,9 +624,9 @@ def rolling_fit_generate(
             "fit_range": [fit_start, fit_end],
             "fwd_bars":  [fwd_start, fwd_end],
             **{k: float(v) for k, v in params.items()},
-            "loss":      loss       if np.isfinite(loss)      else None,
-            "dtw":       dtw_val    if np.isfinite(dtw_val)   else None,
-            "path_corr": pcorr_val  if np.isfinite(pcorr_val) else None,
+            "loss":      loss      if np.isfinite(loss)      else None,
+            "dtw":       dtw_val   if np.isfinite(dtw_val)   else None,
+            "path_corr": pcorr_val if np.isfinite(pcorr_val) else None,
             "c_err":     float(c_err),
         })
 
@@ -649,9 +636,9 @@ def rolling_fit_generate(
     df_result = pd.concat(result_chunks, ignore_index=True)
 
     if all_dtw or all_pcorr:
-        dtw_mean   = float(np.mean(all_dtw))   if all_dtw   else float("nan")
-        dtw_median = float(np.median(all_dtw)) if all_dtw   else float("nan")
-        pc_mean    = float(np.mean(all_pcorr)) if all_pcorr else float("nan")
+        dtw_mean   = float(np.mean(all_dtw))     if all_dtw   else float("nan")
+        dtw_median = float(np.median(all_dtw))   if all_dtw   else float("nan")
+        pc_mean    = float(np.mean(all_pcorr))   if all_pcorr else float("nan")
         pc_median  = float(np.median(all_pcorr)) if all_pcorr else float("nan")
         print(f"\n[similarity] DTW  mean={dtw_mean:.4f}  median={dtw_median:.4f}  (越小越好)")
         print(f"[similarity] path_corr  mean={pc_mean:+.3f}  median={pc_median:+.3f}  (越接近 +1 越好)")

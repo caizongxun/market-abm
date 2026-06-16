@@ -1,37 +1,17 @@
 """
-calibrator.py  v3
+calibrator.py  v4
 =================
 AdaptiveCalibrator：replay buffer + XGBoost 校正模型。
 
-v3 fix：
-  - load() 加 try/except，捕捉 EOFError / UnpicklingError（崩潰時產生的損壞 pkl），
-    自動刪檔並以全新 calibrator 繼續執行。
-v2 fix：
-  - Ridge fallback 改用 RidgeModel 類別，取代 lambda 閉包，
-    解決 pickle.dump 時 "Can't pickle local function" 的問題。
+v4 patch（兩項）：
+  Patch-2  _compute_reward：kurt_err 改用 log1p 壓縮 + 更高權重
+           舊: -(0.5*std_err_pct + 0.3*kurt_err/10 + 0.1*hurst_err/0.1 - 0.1*dir_hit)
+           新: -(0.3*std_err_pct + 0.4*log1p(kurt_err)/3 + 0.2*hurst_err/0.1 - 0.1*dir_hit)
+  Patch-3  build_context：target_ek 改為 log1p 正規化，
+           解決 ret_std(~0.01) vs target_ek(~300) 量級差 4 個 order 的問題。
 
-架構
-----
-  - ReplayBuffer        : 環形 buffer，儲存 (context, action, reward) 三元組
-  - CalibAction         : 對 StatParams 各欄位的乘法修正量
-  - RidgeModel          : 可 pickle 的 Ridge 預測器（XGBoost 不可用時的 fallback）
-  - AdaptiveCalibrator  : 主類，predict() + record() + fit() + save/load
-
-Context 特徵（9 維）
-  ret_std, ret_skew_a, ret_df, hurst_target, wick_lambda,
-  jump_freq, vol_persistence, acf_lag1, target_ek
-
-Action 輸出（4 維，對應最敏感的 4 個參數）
-  d_ret_std, d_hurst, d_target_ek, d_vol_persistence
-  -- 解釋為相對 delta（+0.05 = 乘以 1.05）
-
-Reward（純量，越高越好）
-  reward = - (0.5*std_err_pct + 0.3*kurt_err/10 + 0.1*hurst_err/0.1 - 0.1*dir_hit)
-  bounded to [-5, +1]
-
-持久化
-  calibrator.save(path)   # pickle
-  calibrator.load(path)   # 就地恢復（損壞檔自動刪除從頭來過）
+v3 fix：load() 加 corrupt pkl 守衛
+v2 fix：RidgeModel 取代 lambda 閉包
 """
 from __future__ import annotations
 
@@ -81,7 +61,7 @@ ACTION_TARGET: Dict[str, str] = {
 PARAM_SAFE: Dict[str, tuple] = {
     "ret_std":          (1e-5,  0.20),
     "hurst_target":     (0.30,  0.69),
-    "target_ek":        (1.0,   30.0),
+    "target_ek":        (1.0,   15.0),   # Patch-1 同步上限
     "vol_persistence":  (0.0,   0.85),
 }
 
@@ -170,7 +150,7 @@ class ReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
-# RidgeModel — 可 pickle 的 Ridge fallback
+# RidgeModel
 # ---------------------------------------------------------------------------
 
 class RidgeModel:
@@ -199,8 +179,9 @@ class RidgeModel:
 
 class AdaptiveCalibrator:
     """
-    跨 trial 持久化的校正器。
-    崩潰時產生的損壞 pkl 會被 load() 自動刪除，不影響下次執行。
+    跨 trial 持久化校正器。
+    Patch-2: reward 強化 kurtosis 懲罰。
+    Patch-3: context 用 log1p 正規化 target_ek。
     """
 
     def __init__(
@@ -231,7 +212,22 @@ class AdaptiveCalibrator:
 
     @staticmethod
     def build_context(params: Dict[str, Any]) -> np.ndarray:
-        return np.array([float(params[k]) for k in CONTEXT_KEYS], dtype=float)
+        """
+        Patch-3: target_ek 改為 log1p 正規化，壓縮量級差異。
+        其餘 8 個特徵維持原值。
+        context 維度仍為 9（介面不變）。
+        """
+        return np.array([
+            float(params["ret_std"]),
+            float(params["ret_skew_a"]),
+            float(params["ret_df"]),
+            float(params["hurst_target"]),
+            float(params["wick_lambda"]),
+            float(params["jump_freq"]),
+            float(params["vol_persistence"]),
+            float(params["acf_lag1"]),
+            float(np.log1p(abs(params["target_ek"]))),  # Patch-3: log1p
+        ], dtype=float)
 
     @staticmethod
     def _compute_reward(
@@ -240,9 +236,14 @@ class AdaptiveCalibrator:
         hurst_err:   float,
         dir_hit:     float,
     ) -> float:
-        r = -(0.5 * std_err_pct
-              + 0.3 * kurt_err / 10.0
-              + 0.1 * hurst_err / 0.10
+        """
+        Patch-2: kurt_err 改用 log1p 壓縮 + 提高權重。
+        舊: -(0.5*std + 0.03*kurt + 0.1*hurst - 0.1*dir)
+        新: -(0.3*std + 0.4*log1p(kurt)/3 + 0.2*hurst - 0.1*dir)
+        """
+        r = -(0.3 * std_err_pct
+              + 0.4 * float(np.log1p(kurt_err)) / 3.0
+              + 0.2 * hurst_err / 0.10
               - 0.1 * dir_hit)
         return float(np.clip(r, -5.0, 1.0))
 
@@ -308,10 +309,6 @@ class AdaptiveCalibrator:
                 and len(self._buffer) >= self.min_train):
             self._fit_models()
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "wb") as f:
@@ -326,10 +323,6 @@ class AdaptiveCalibrator:
             }, f)
 
     def load(self, path: str) -> None:
-        """
-        載入 pkl。若檔案損壞（EOFError 或 UnpicklingError），
-        自動刪除并以空 calibrator 繼續，不會中斷執行。
-        """
         try:
             with open(path, "rb") as f:
                 state = pickle.load(f)
@@ -339,8 +332,7 @@ class AdaptiveCalibrator:
                 os.remove(path)
             except OSError:
                 pass
-            return   # 保持目前空狀態
-
+            return
         self._buffer          = state["buffer"]
         self._models          = state.get("models")
         self.n_experiences    = state.get("n_experiences", len(self._buffer))
@@ -349,6 +341,5 @@ class AdaptiveCalibrator:
         self.update_interval  = state.get("update_interval", self.update_interval)
         self.xgb_kwargs       = state.get("xgb_kwargs",      self.xgb_kwargs)
         self._n_since_fit     = 0
-        # 若 models 為 None（舊版 pkl 只存 buffer），重新訓練
         if self._models is None and len(self._buffer) >= self.min_train:
             self._fit_models()
