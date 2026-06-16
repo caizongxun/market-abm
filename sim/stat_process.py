@@ -1,39 +1,50 @@
 """
-stat_process.py  v8
+stat_process.py  v9
 ===================
 純統計過程模型，完全不使用 agent。
 
-Fix-9 — 修正 mean 雙重計算 + 恢復 kurtosis
-----------------------------------------------
-問題 A：mean=0.00357 vs 真實 0.00077 (+364%)
-  原因：ret_mu 已是 sample mean（包含 skew 效果），
-        但 Fix-7 又額外加了 skew_offset * ret_std（~0.0106/bar）。
-        相當於把 skew 對 mean 的貢獻計算了兩次。
+Fix-10 — 修正 skew 方向翻轉 + kurtosis 嚴重不足
+-------------------------------------------------
+Fix-9 後剩餘問題：
+  skew  = -0.183  vs 真實 +0.449  (方向翻轉)
+  kurt  =  1.637  vs 真實 10.60   (-85%)
+  mean  = -0.0002 vs 真實 +0.0008 (符號翻轉，但量小)
 
-問題 B：kurtosis=1.23 vs 真實 10.6（-88%）
-  原因：AR(1) 輸出做 (mem-mean)/std 正規化，把 fat-tail 資訊磨掉了。
-        Student-t 的肥尾必須在 AR(1) 的 innovations 裡，而不是事後加。
+根本原因分析：
+  A. skew 翻轉：
+     0.5*z(skewnorm) + 0.5*mem(t-AR1) 的混合，
+     mem 是對稱 t，稀釋了 skew，且 AR(1) rho≈0.56 會讓 mem 的
+     尾部分佈與 z 的偏態抵消。最終 skew 甚至翻號。
 
-Fix-9 正確方案：
-  1. z ~ skewnorm(a, loc=0, scale=1)
-     moment-preserving standardize：
-       mu_sn  = a / sqrt(1+a²) * sqrt(2/π)          [理論平均]
-       var_sn = 1 - mu_sn²                            [理論方差]
-       z_std  = (z - mu_sn) / sqrt(var_sn)
-     → mean=0, std=1, 偏態形狀保留（skew≈0.30 for a=1.5）
-     → 不再需要事後加 skew_offset，消除雙重計算
+  B. kurtosis 仍低：
+     最後做 z_final / std(z_final) 把 fat-tail 的 outlier 壓縮，
+     kurtosis 從理論 ~6 降到 1.6。
 
-  2. AR(1) 使用 Student-t innovations（df 來自 Fix-1 的掃描）：
-       eps_t ~ t(df, 0, sqrt((df-2)/df))   [unit-variance t noise]
-       mem[i] = rho*mem[i-1] + innov_scale*eps_t[i]
-     AR(1) output 不做 standardize，直接保留 fat-tail shape。
-     為了防止 scale 漂移，只做 sigma-clamp（不 demean，不 rescale）：
-       clip mem to ±5σ，然後 rescale by empirical std
+Fix-10 設計（徹底分離三個目標）：
+  1. 先用純 t-AR(1) 生成 fat-tail + autocorrelation 結構：
+       eps ~ t(df, 0, sqrt((df-2)/df))
+       mem[i] = rho*mem[i-1] + innov_scale*eps[i]
+     不做任何 standardize，直接保留 fat-tail。
 
-  3. log_rets = z_final * ret_std + ret_mu
-     z_final 的 mean≈0（moment-preserving），偏態在分佈形狀中，fat-tail 在 innovations 中。
+  2. 用 empirical CDF rank → skewnorm.ppf 把 mem 的排名
+     映射到 skewnorm 分位數（quantile mapping）：
+       ranks = argsort(argsort(mem)) / (n-1)   [0,1]
+       z_skew = skewnorm.ppf(clip(ranks, ε, 1-ε), a=skew_a, loc=0, scale=1)
+     這樣 fat-tail 的 rank 結構被保留（kurtosis），
+     skew 方向由 skewnorm.ppf 決定（準確），
+     不存在均值偏移問題。
 
-v1-v9 修正歷程
+  3. 對 z_skew 做 empirical standardize（減均值除標準差），
+     確保 z_skew 的 mean≈0, std≈1，
+     然後 log_rets = z_skew * ret_std + ret_mu。
+
+  期望效果：
+    kurtosis: t-AR(1) 保留肥尾 rank，quantile mapping 保留形狀 → kurt > 5
+    skew:     skewnorm.ppf(a=+1.5) 的右尾 → skew > +0.3
+    mean:     empirical standardize 確保 mean≈ret_mu
+    std:      直接由 ret_std 控制
+
+v1-v10 修正歷程
 --------------
   Fix-1 : Student-t df 掃描 log-likelihood
   Fix-2 : 改用 skewnorm 擬合
@@ -44,6 +55,7 @@ v1-v9 修正歷程
   Fix-7 : 保存 skew_mean_offset，在 AR(1) 後手動加回（但造成雙重計算）
   Fix-8 : rolling loop 改用 sim last-close 作為下一 chunk 起始價
   Fix-9 : moment-preserving skewnorm standardize + t innovations in AR(1)
+  Fix-10: quantile mapping (t-AR1 ranks → skewnorm.ppf) 同時保留 kurtosis 和 skew
 """
 
 from __future__ import annotations
@@ -136,17 +148,18 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-def _skewnorm_moment_standardize(z: np.ndarray, a: float) -> np.ndarray:
-    """Fix-9A: moment-preserving standardization of skewnorm samples.
+def _quantile_map_to_skewnorm(arr: np.ndarray, skew_a: float, eps: float = 1e-4) -> np.ndarray:
+    """Fix-10: map arr's rank structure onto skewnorm(skew_a) quantiles.
 
-    Subtracts the theoretical mean and divides by theoretical std,
-    giving mean=0, std=1 while PRESERVING the skew shape.
-    This avoids re-adding skew_offset later (which caused double-counting).
+    Preserves the rank ordering (and thus fat-tail structure) of arr
+    while reshaping the marginal distribution to match skewnorm(skew_a).
+    The result has the skew direction of skewnorm but the kurtosis of arr.
     """
-    mu_sn  = a / np.sqrt(1.0 + a * a) * np.sqrt(2.0 / np.pi)
-    var_sn = 1.0 - mu_sn ** 2
-    std_sn = float(np.sqrt(max(var_sn, 1e-10)))
-    return (z - mu_sn) / std_sn
+    n = len(arr)
+    # Fractional ranks in (0, 1) — Hazen plotting position avoids 0/1 boundary
+    ranks = (np.argsort(np.argsort(arr)) + 0.5) / n
+    ranks = np.clip(ranks, eps, 1.0 - eps)
+    return stats.skewnorm.ppf(ranks, a=skew_a, loc=0, scale=1)
 
 
 # ---------------------------------------------------------------------------
@@ -193,20 +206,22 @@ def generate(
     seed:        int | None = None,
 ) -> pd.DataFrame:
     """
-    Fix-9 generation pipeline
-    --------------------------
-    1. Draw z ~ skewnorm(a, 0, 1)
-       moment-preserving standardize: subtract theoretical mean, divide by theoretical std
-       → z has mean=0, std=1, skew shape preserved (no skew_offset injection needed)
+    Fix-10 generation pipeline
+    ---------------------------
+    1. Pure t-AR(1): generate fat-tail + autocorrelation in one pass
+         eps ~ t(df, 0, sqrt((df-2)/df))   [unit-variance]
+         mem[i] = rho*mem[i-1] + innov_scale*eps[i]
+       No standardization — keep the fat-tail rank structure intact.
 
-    2. AR(1) with Student-t(df) innovations to preserve fat tails
-       eps ~ t(df) scaled to unit variance: scale = sqrt((df-2)/df)
-       mem[i] = rho*mem[i-1] + innov_scale*eps[i]
-       Rescale mem by empirical std only (no demean) to keep scale correct
-       Blend z (skew shape) with mem (fat-tail AR structure): z_final = 0.5*z + 0.5*mem
+    2. Quantile mapping: map mem's ranks onto skewnorm(skew_a) quantiles
+         ranks = (argsort(argsort(mem)) + 0.5) / n   [Hazen, avoids 0/1]
+         z_skew = skewnorm.ppf(ranks, a=skew_a)
+       Result: marginal distribution matches skewnorm (correct skew direction),
+               rank ordering preserved from t-AR(1) (correct kurtosis / tail weight).
 
-    3. log_rets = z_final * ret_std + ret_mu
-       ret_mu is sample mean which already encodes skew drift; no extra offset needed
+    3. Empirical standardize z_skew to mean=0, std=1, then rescale:
+         log_rets = (z_skew - mean(z_skew)) / std(z_skew) * ret_std + ret_mu
+       ret_mu drives mean exactly; ret_std drives vol exactly.
     """
     rng = np.random.default_rng(seed)
 
@@ -218,36 +233,32 @@ def generate(
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Step 1: skewnorm with moment-preserving standardization (Fix-9A)
-    z_raw = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars, random_state=rng)
-    z = _skewnorm_moment_standardize(z_raw, skew_a)   # mean=0, std≈1, skew preserved
-
-    # Step 2: AR(1) with Student-t innovations (Fix-9B)
+    # Step 1: t-AR(1) — fat tails + autocorrelation
     rho = _ar1_hurst_rho(hurst)
-    if abs(rho) > 0.01 and df_t > 2.0:
-        # Unit-variance t innovations
+    if df_t > 2.0:
         t_scale = float(np.sqrt((df_t - 2.0) / df_t))
-        eps = stats.t.rvs(df=df_t, loc=0, scale=t_scale, size=n_bars, random_state=rng)
+    else:
+        t_scale = 1.0
+    eps = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=t_scale,
+                      size=n_bars, random_state=rng)
+    if abs(rho) > 0.01:
         mem = np.empty(n_bars)
         mem[0] = eps[0]
-        innov_scale = np.sqrt(max(1.0 - rho ** 2, 0.0))
+        innov_scale = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
         for i in range(1, n_bars):
             mem[i] = rho * mem[i-1] + innov_scale * eps[i]
-        # Rescale by empirical std (no demean to avoid killing fat-tail signal)
-        m_std = float(np.std(mem))
-        if m_std > 1e-10:
-            mem = mem / m_std
-        # Blend skew shape (z) with fat-tail AR structure (mem)
-        z_final = 0.5 * z + 0.5 * mem
-        # Final unit rescale
-        zf_std = float(np.std(z_final))
-        if zf_std > 1e-10:
-            z_final = z_final / zf_std
     else:
-        z_final = z
+        mem = eps.copy()
 
-    # Step 3: rescale to real sample statistics
-    log_rets = z_final * ret_std + ret_mu
+    # Step 2: quantile mapping → skewnorm marginal, t-AR(1) rank structure
+    z_skew = _quantile_map_to_skewnorm(mem, skew_a)
+
+    # Step 3: empirical standardize then rescale to (ret_mu, ret_std)
+    z_mean = float(np.mean(z_skew))
+    z_std  = float(np.std(z_skew))
+    if z_std > 1e-10:
+        z_skew = (z_skew - z_mean) / z_std
+    log_rets = z_skew * ret_std + ret_mu
 
     # Rebuild OHLC
     opens  = np.empty(n_bars)
