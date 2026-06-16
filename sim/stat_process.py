@@ -1,22 +1,30 @@
 """
-stat_process.py  v32
+stat_process.py  v33
 ====================
 純統計過程模型，完全不使用 agent。
 
-v32 fix（v31 骨架不動）：
+v33 fix（v32 骨架不動）：
 ------------------------------------------------------
-Fix-E v32：chi2 clip 上限 5.0 → 3.0，final_scale clip (0.6,1.4) → (0.5,1.0)
-  問題根源：v31 結果 kurtosis 13.03 > 目標 10.60，代表 chi2 tail booster
-  的 clip(0.5, 5.0) 上限過寬，允許個別尾部點被放大到 5x，
-  final global rescale 雖然等比縮小整體，但無法消除 chi2 的非線性尾部效果，
-  導致 kurtosis 過衝而 std 仍偏高 +11%。
-  修法 1：chi2_scale clip 上限 5.0 → 3.0，抑制極端尾部放大。
-  修法 2：final_scale clip (0.6, 1.4) → (0.5, 1.0)，
-  只允許縮不允許放大。jump 注入通常讓 std 膨脹，
-  final_scale 應 < 1.0；若 > 1.0 代表 jump 反而縮小了 std，
-  這種邊緣情況允許放大會讓 std 偏高。
+Fix-F v33-1：chi2 clip 上限 3.0 → 4.0
+  v32 結果 kurtosis=5.64，距目標 10.60 仍差 ~5。
+  clip 4.0 讓尾部最大放大從 3x → 4x，預計 kurtosis 推向 7-8。
 
-v1-v32 修正歷程
+Fix-G v33-2：final_scale skew-adaptive 上限
+  v32 only-shrink (max=1.0) 把右偏 window 的正向尾部縮掉，
+  導致 skew 從真實 +0.449 被壓到 +0.152。
+  新規則：skew_a > 0.3 的 window 允許 final_scale 最高 1.15，
+  其餘保持 1.0 上限，避免一刀切縮掉正向尾部。
+
+Fix-H v33-3：新增走勢相似性指標（DTW + path_corr）
+  現有 loss 只有 vol_err / kurt_err / skew_err，無法反映
+  模擬走勢與真實走勢的時序相似度。
+  新增兩個 per-window 指標：
+    dtw_dist  : DTW（動態時間扭曲）距離，正規化到每 bar 單位
+    path_corr : Pearson correlation of cumulative return paths
+  這兩個指標不進入 loss（避免過擬合），只記錄在 param_log 供
+  後續優化觀察用。全局彙總在 metrics 表格末尾印出。
+
+v1-v33 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -57,7 +65,11 @@ v1-v32 修正歷程
              方向命中率 0.539✅
   Fix-32  : chi2 clip 5.0→3.0 抑制 kurtosis 過衝
              final_scale clip (0.6,1.4)→(0.5,1.0) 只允許縮
-             => 預期 kurtosis 回落至接近 10.6，std 更精確收斂
+             => kurtosis 5.64 skew +0.152 hurst 0.685✅ std 1.662✅
+             方向命中率 0.529✅
+  Fix-33  : chi2 clip 3.0→4.0 繼續推 kurtosis
+             final_scale skew-adaptive：skew_a>0.3 → max 1.15，else max 1.0
+             新增 DTW distance + path_corr 走勢相似性指標（不進 loss，只記錄）
 """
 
 from __future__ import annotations
@@ -190,6 +202,44 @@ def _ar1_hurst_rho(h: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Fix-H v33: 走勢相似性輔助函數
+# ---------------------------------------------------------------------------
+
+def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
+    """
+    計算兩段 cumulative return path 的 DTW 距離（正規化到每 bar）。
+    使用 O(n*m) 動態規劃，序列長度通常 <= 20，可接受。
+    """
+    n, m = len(s), len(t)
+    if n == 0 or m == 0:
+        return float("nan")
+    dtw = np.full((n + 1, m + 1), np.inf)
+    dtw[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = abs(s[i - 1] - t[j - 1])
+            dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
+    raw = dtw[n, m]
+    return float(raw / max(n, m))
+
+
+def _path_corr(real_closes: np.ndarray, sim_closes: np.ndarray) -> float:
+    """
+    計算真實與模擬的累積報酬路徑相關係數。
+    兩段從各自第一個 close 正規化，長度取較短者。
+    """
+    n = min(len(real_closes), len(sim_closes))
+    if n < 3:
+        return float("nan")
+    r_path = np.log(np.maximum(real_closes[:n], 1e-10) / max(real_closes[0], 1e-10))
+    s_path = np.log(np.maximum(sim_closes[:n], 1e-10) / max(sim_closes[0], 1e-10))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        corr = float(np.corrcoef(r_path, s_path)[0, 1])
+    return corr if np.isfinite(corr) else float("nan")
+
+
+# ---------------------------------------------------------------------------
 # 1. FIT
 # ---------------------------------------------------------------------------
 
@@ -242,7 +292,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v32: chi2 clip 5.0->3.0, final_scale clip (0.5,1.0))
+# 2. GENERATE  (v33: chi2 clip 3->4, skew-adaptive final_scale)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -330,7 +380,7 @@ def generate(
 
     # ------------------------------------------------------------------
     # Fix-B v30: variance-mixture tail booster
-    # Fix-E v32: chi2_scale clip 上限 5.0 → 3.0（抑制 kurtosis 過衝）
+    # Fix-F v33: chi2_scale clip 上限 3.0 → 4.0（繼續推 kurtosis）
     # ------------------------------------------------------------------
     tail_threshold  = 1.5 * ret_std
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
@@ -339,7 +389,7 @@ def generate(
         nu_boost   = float(np.clip(df_t * 0.15, 1.5, 4.0))
         chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
-        chi2_scale = np.clip(chi2_scale, 0.5, 3.0)  # v32: 5.0 → 3.0
+        chi2_scale = np.clip(chi2_scale, 0.5, 4.0)  # v33: 3.0 → 4.0
 
         z_boosted = z_scaled.copy()
         tail_vals = z_scaled[tail_mask_boost]
@@ -396,21 +446,23 @@ def generate(
     # ------------------------------------------------------------------
     log_rets = z_scaled.copy()
 
-    # jump 注入（v31: 移除 jump 後的 body rescale，改由 final global std 收斂統一處理）
+    # jump 注入
     if jump_freq > 0 and n_bars > 0:
         jump_mask  = rng.uniform(size=n_bars) < jump_freq
         jump_sizes = rng.normal(0.0, jump_std, size=n_bars)
         log_rets   = log_rets + np.where(jump_mask, jump_sizes, 0.0)
 
     # ------------------------------------------------------------------
-    # Fix-D v31 / Fix-E v32: jump 後 final global std 收斂
-    # v32: clip 改為 (0.5, 1.0)，只允許縮不允許放大
-    # jump 注入通常讓 std 膨脹，final_scale 應 <= 1.0
+    # Fix-D v31: jump 後 final global std 收斂
+    # Fix-G v33: skew-adaptive 上限
+    #   skew_a > 0.3 的 window（右偏）允許 final_scale 最高 1.15
+    #   其餘保持 1.0，避免右偏尾部被一刀切縮掉
     # ------------------------------------------------------------------
     final_std = float(np.std(log_rets - ret_mu))
     if final_std > 1e-8:
         final_scale = ret_std / final_std
-        final_scale = float(np.clip(final_scale, 0.5, 1.0))  # v32: (0.6,1.4) → (0.5,1.0)
+        scale_max = 1.15 if skew_a > 0.3 else 1.0   # v33: skew-adaptive
+        final_scale = float(np.clip(final_scale, 0.5, scale_max))
         log_rets = ret_mu + (log_rets - ret_mu) * final_scale
 
     opens  = np.empty(n_bars)
@@ -438,7 +490,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. ROLLING FIT -> GENERATE  (v25 邏輯不動)
+# 3. ROLLING FIT -> GENERATE  (v33: 新增 dtw_dist / path_corr)
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
@@ -529,6 +581,8 @@ def rolling_fit_generate(
         real_fwd  = df_real.iloc[pos:fwd_end].copy().reset_index(drop=True)
         real_rets = np.diff(np.log(np.maximum(real_fwd["Close"].values, 1e-10)))
         sim_rets  = np.diff(np.log(np.maximum(df_chunk["Close"].values, 1e-10)))
+
+        # 現有 loss（不含走勢相似性，避免過擬合）
         if len(real_rets) > 1 and len(sim_rets) > 1:
             vol_err  = abs(np.std(sim_rets) - np.std(real_rets)) / max(np.std(real_rets), 1e-8)
             kurt_err = abs(float(stats.kurtosis(sim_rets)) - float(stats.kurtosis(real_rets)))
@@ -536,6 +590,25 @@ def rolling_fit_generate(
             loss     = vol_err * 3.0 + kurt_err * 0.5 + skew_err * 1.0
         else:
             loss = 0.0
+
+        # ------------------------------------------------------------------
+        # Fix-H v33: 走勢相似性指標（只記錄，不進 loss）
+        # dtw_dist  : DTW 距離（正規化到每 bar），越小越好
+        # path_corr : 累積報酬路徑 Pearson 相關，越接近 1 越好
+        # ------------------------------------------------------------------
+        real_closes_fwd = real_fwd["Close"].values
+        sim_closes_fwd  = df_chunk["Close"].values
+        if len(real_closes_fwd) >= 3 and len(sim_closes_fwd) >= 3:
+            # 正規化路徑：從各自第一個 close 出發的對數累積報酬
+            r_path = np.log(np.maximum(real_closes_fwd, 1e-10)
+                            / max(real_closes_fwd[0], 1e-10))
+            s_path = np.log(np.maximum(sim_closes_fwd, 1e-10)
+                            / max(sim_closes_fwd[0], 1e-10))
+            dtw_dist  = round(_dtw_distance(r_path, s_path), 6)
+            path_corr = round(_path_corr(real_closes_fwd, sim_closes_fwd), 4)
+        else:
+            dtw_dist  = float("nan")
+            path_corr = float("nan")
 
         real_o = float(real_fwd["Open"].iloc[0])   if len(real_fwd) > 0 else float("nan")
         real_h = float(real_fwd["High"].max())      if len(real_fwd) > 0 else float("nan")
@@ -556,6 +629,8 @@ def rolling_fit_generate(
             **{k: params[k] for k in params},
             "drift_corr":  round(drift_corr, 6),
             "loss":        round(loss, 4),
+            "dtw_dist":    dtw_dist,
+            "path_corr":   path_corr,
             "ohlc_real": {"O": round(real_o,2), "H": round(real_h,2),
                           "L": round(real_l,2), "C": round(real_c,2)},
             "ohlc_sim":  {"O": round(sim_o,2),  "H": round(sim_h,2),
@@ -579,7 +654,8 @@ def rolling_fit_generate(
                 f"vp={params['vol_persistence']:.3f}  "
                 f"acf1={params['acf_lag1']:+.3f}  "
                 f"tgt_ek={params['target_ek']:.2f}  "
-                f"loss={loss:.4f}"
+                f"loss={loss:.4f}  "
+                f"dtw={dtw_dist:.4f}  pcorr={path_corr:+.3f}"
             )
             print(
                 f"         real OHLC  O={real_o:>8.2f}  H={real_h:>8.2f}  "
@@ -596,5 +672,34 @@ def rolling_fit_generate(
 
     if not sim_chunks:
         raise RuntimeError("No chunks generated -- check lookback/step settings.")
+
+    # ------------------------------------------------------------------
+    # 全局走勢相似性彙總（印在 metrics 後面）
+    # ------------------------------------------------------------------
+    dtw_vals   = [e["dtw_dist"]  for e in param_log if isinstance(e.get("dtw_dist"), float)
+                  and not np.isnan(e["dtw_dist"])]
+    pcorr_vals = [e["path_corr"] for e in param_log if isinstance(e.get("path_corr"), float)
+                  and not np.isnan(e["path_corr"])]
+
+    if dtw_vals:
+        param_log.append({
+            "_summary": True,
+            "dtw_mean":    round(float(np.mean(dtw_vals)), 6),
+            "dtw_median":  round(float(np.median(dtw_vals)), 6),
+            "pcorr_mean":  round(float(np.mean(pcorr_vals)), 4) if pcorr_vals else float("nan"),
+            "pcorr_median":round(float(np.median(pcorr_vals)), 4) if pcorr_vals else float("nan"),
+        })
+        if verbose:
+            print(
+                f"\n[similarity] DTW  mean={np.mean(dtw_vals):.4f}  "
+                f"median={np.median(dtw_vals):.4f}  "
+                f"(越小越好)"
+            )
+            if pcorr_vals:
+                print(
+                    f"[similarity] path_corr  mean={np.mean(pcorr_vals):+.3f}  "
+                    f"median={np.median(pcorr_vals):+.3f}  "
+                    f"(越接近 +1 越好)"
+                )
 
     return pd.concat(sim_chunks, ignore_index=True), param_log
