@@ -1,29 +1,24 @@
 """
-stat_process.py  v38
+stat_process.py  v39
 ====================
 純統計過程模型，完全不使用 agent。
 
-v38 新增（v37 骨架不動）：
+v39 新增（v38 骨架不動）：
 ------------------------------------------------------
-Fix-38-P1  NIG 穩定性保護 + 超高 ek 截斷 t-mixture
-  問題：target_ek > 20 時 a_nig = sqrt(3/ek) < 0.15，NIG 退化成柯西，
-        final_scale 壓不住 → kurt_err 爆炸（GOOGL=437）。
-  修法：
-    (a) a_nig 強制 >= 0.15（最胖尾下限保護）。
-    (b) target_ek > 20 時改走「高 ek 截斷 t-mixture」路徑：
-        df_t_eff = max(df_t, 2.5) → 確保真實重尾
-        nu_boost 上限從 3.0 → 5.0（允許更激進尾部放大）
-        p_t 上限從 0.92 → 0.98（幾乎全走 t-dist）
-  預期：kurt_err 中位數 21 → 8
+Fix-39-P1  高 ek 路徑跳過 chi2 尾部放大
+  問題：target_ek > 20 時截斷 t-mixture 已有足夠重尾，
+        chi2 疊加後 kurt 被 final_scale 壓縮，兩段抵消（GOOGL=267）。
+  修法：target_ek > HIGH_EK_THRESH(20) 時完全跳過 chi2 尾部放大區塊，
+        讓截斷 t-mixture 自己控尾部。
+  預期：GOOGL/XLE kurt_err 大幅下降。
 
-Fix-38-P2  GJR vol_scale 收緊 + scale_max 壓制
-  問題：vol_scale clip(0.3, 3.5) 在 GLD/TLT/GOOGL 把 std 放大超標。
-  修法：
-    (a) vol_scale clip 收緊至 (0.3, 2.5)。
-    (b) scale_max = min(1.0 + (ek-3)*0.015, 1.2)（原 0.02 係數改 0.015，上限 1.4→1.2）。
-  預期：std_err% 中位數 15 → 10
+Fix-39-P2  final_scale 下限 0.5 → 0.4
+  問題：final_scale clip(0.5, scale_max) 在高 std 品種（TLT/GLD/SPY）
+        壓縮空間不足，std_err% 中位數 14.7%。
+  修法：下限從 0.5 改 0.4，讓高 std 品種能夠被壓更多。
+  預期：std_err% 中位數 14.7% → 10% 以下。
 
-v1-v38 修正歷程
+v1-v39 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -86,6 +81,8 @@ v1-v38 修正歷程
              Fix-Q NIG 尾部採樣（target_ek>6 時替換 t-mixture）
   Fix-38  : Fix-38-P1 NIG a_nig >= 0.15 下限 + target_ek > 20 截斷 t-mixture
              Fix-38-P2 GJR vol_scale clip(0.3,2.5) + scale_max 係數 0.02→0.015 上限 1.4→1.2
+  Fix-39  : Fix-39-P1 target_ek > 20 跳過 chi2 尾部放大（截斷 t-mixture 自控尾部）
+             Fix-39-P2 final_scale 下限 0.5 → 0.4（讓高 std 品種壓縮空間更大）
 """
 
 from __future__ import annotations
@@ -325,7 +322,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v38: Fix-38-P1 NIG穩定 + Fix-38-P2 GJR收緊)
+# 2. GENERATE  (v39: Fix-39-P1 高ek跳過chi2 + Fix-39-P2 final_scale下限0.4)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -491,32 +488,34 @@ def generate(
 
     # ------------------------------------------------------------------
     # Chi2 尾部放大（Fix-I/L/M 繼承）
-    # Fix-38-P1: target_ek > 20 時 nu_boost 上限從 3.0 → 5.0
+    # Fix-39-P1: target_ek > HIGH_EK_THRESH 時完全跳過此區塊
+    #            截斷 t-mixture 已有足夠重尾，不再疊加 chi2 放大
     # ------------------------------------------------------------------
     tail_threshold = 1.2 * ret_std
     tail_mask      = np.abs(z_scaled - ret_mu) > tail_threshold
 
-    nu_raw   = 3.0 / max(df_t - 4.0, 0.1)
-    # Fix-38-P1: 超高 ek 品種允許更激進的尾部放大
-    nu_boost_max = 5.0 if target_ek > HIGH_EK_THRESH else 3.0
-    nu_boost = float(np.clip(nu_raw, 0.5, nu_boost_max))
+    if target_ek <= HIGH_EK_THRESH:
+        # 正常路徑：chi2 尾部放大
+        nu_raw    = 3.0 / max(df_t - 4.0, 0.1)
+        nu_boost  = float(np.clip(nu_raw, 0.5, 3.0))
 
-    if np.any(tail_mask):
-        chi2_raw = rng.chisquare(df=max(df_t, 3.0), size=int(np.sum(tail_mask)))
-        chi2_norm = chi2_raw / max(df_t, 3.0)
+        if np.any(tail_mask):
+            chi2_raw = rng.chisquare(df=max(df_t, 3.0), size=int(np.sum(tail_mask)))
+            chi2_norm = chi2_raw / max(df_t, 3.0)
 
-        extreme_mask_local = chi2_norm > 2.5
-        chi2_norm = np.where(
-            extreme_mask_local,
-            np.clip(chi2_norm, 0.5, 5.0),
-            np.clip(chi2_norm, 0.5, 3.5),
-        )
-        amp = 1.0 + nu_boost * (chi2_norm - 1.0)
-        amp = np.clip(amp, 0.5, 4.0)
-        sign_mask = np.sign(z_scaled[tail_mask] - ret_mu)
-        z_scaled[tail_mask] = (
-            ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
-        )
+            extreme_mask_local = chi2_norm > 2.5
+            chi2_norm = np.where(
+                extreme_mask_local,
+                np.clip(chi2_norm, 0.5, 5.0),
+                np.clip(chi2_norm, 0.5, 3.5),
+            )
+            amp = 1.0 + nu_boost * (chi2_norm - 1.0)
+            amp = np.clip(amp, 0.5, 4.0)
+            sign_mask = np.sign(z_scaled[tail_mask] - ret_mu)
+            z_scaled[tail_mask] = (
+                ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
+            )
+    # Fix-39-P1: target_ek > HIGH_EK_THRESH → 直接跳過，截斷 t-mixture 自控尾部
 
     # ------------------------------------------------------------------
     # Jump diffusion（Merton 跳躍項）
@@ -530,12 +529,14 @@ def generate(
 
     # ------------------------------------------------------------------
     # Fix-38-P2: scale_max 係數 0.02→0.015，上限 1.4→1.2
+    # Fix-39-P2: final_scale 下限 0.5 → 0.4（讓高 std 品種壓縮空間更大）
     # ------------------------------------------------------------------
     scale_max   = float(np.clip(1.0 + (target_ek - 3.0) * 0.015, 1.0, 1.2))
     final_mean  = float(np.mean(z_scaled))
     final_std   = float(np.std(z_scaled))
     if final_std > 1e-10:
-        final_scale = float(np.clip(ret_std / final_std, 0.5, scale_max))
+        # Fix-39-P2: 下限 0.5 → 0.4
+        final_scale = float(np.clip(ret_std / final_std, 0.4, scale_max))
         z_scaled    = (z_scaled - final_mean) * final_scale + ret_mu
 
     # ------------------------------------------------------------------
