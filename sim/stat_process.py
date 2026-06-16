@@ -1,29 +1,22 @@
 """
-stat_process.py  v6
+stat_process.py  v7
 ===================
 純統計過程模型，完全不使用 agent。
 
-Fix-7 — 正確的偏態保留方案
+Fix-8 — 消除 rolling chunk 接縫跳躍
 --------------------------------------
-問題分析：
-  skewnorm(a>0) 的 mean offset = a / sqrt(1+a²) * sqrt(2/π)
-  這個 offset 是「右尾多」的數值表現，必須在最後 rescale 前存在。
+問題：rolling_fit_generate() 每個 chunk 都用 df_real["Close"].iloc[fit_end-1]
+      當作 start_price。但上一個 chunk 的末端 Close 已隨機漂移 ±14%，
+      接縫處的 log(real_close / sim_last_close) 是 4×σ 的巨大跳躍。
+      41 個接縫把 805 根裡面的 std 從 0.016 膨脹到 0.053。
 
-  失敗的嘗試：
-  - v3/Fix-4：兩次 demean → skew=−0.68（小步改善）
-  - v4/Fix-5：AR(1) 後只除 std → skew=−0.68 （AR(1) 前的第一次 demean 仍在）
-  - v5/Fix-6：Step-1 也只除 std → std 爆炸 0.138，skew=−3
-             原因：z[0] 將隨機 offset 帶進 AR(1)，AR(1) 漏抖，mem 尺度就崩
+修正：用 sim_last_close 取代 real_close 作為下一個 chunk 的起始價。
+      這樣接縫 return = log(sim_last_close / sim_last_close) = 0（無縫連接）。
+      缺點：模擬價格會緩慢脫離真實水位，但這對 distribution metrics 是正確的。
+      可選 real_anchor_weight 參數（預設 0）允許部分錨定真實價，做法：
+        start_px = exp( (1-w)*log(sim_last) + w*log(real_close) )
 
-  正確方案（本版）：
-  1. 从 skewnorm 取樣後，記錄 skew_mean_offset = a/sqrt(1+a²)*sqrt(2/pi)
-  2. full standardize：(z - mean) / std → AR(1) 在正規分佈上適攮標準化
-  3. AR(1) 完成後，(mem - mean) / std （AR(1) 本身不改變偏態）
-  4. 將 skew_mean_offset 加回去：z_final = z_ar1 + skew_mean_offset
-  5. rescale：log_rets = z_final * ret_std + ret_mu
-     此時 z_final 的 mean = skew_mean_offset，右尾偏移正確匙入
-
-v1-v6 修正歷程
+v1-v8 修正歷程
 --------------
   Fix-1 : Student-t df 掃描 log-likelihood
   Fix-2 : 改用 skewnorm 擬合
@@ -32,6 +25,7 @@ v1-v6 修正歷程
   Fix-5 : AR(1) 後只除 std，不 demean
   Fix-6 : 失敗—Step-1 只除 std 導致 AR(1) 漏扖、std 爆炸
   Fix-7 : 正確方案—保存 skew_mean_offset，在 AR(1) 後手動加回
+  Fix-8 : rolling loop 改用 sim last-close 作為下一 chunk 起始價
 """
 
 from __future__ import annotations
@@ -181,14 +175,10 @@ def generate(
 
     2. AR(1) in unit space
        Full-standardize output: (mem - mean(mem)) / std(mem)
-       AR(1) preserves autocorrelation structure, not skewness -- that's fine.
 
     3. Re-inject skew: z_final = z_ar1 + skew_offset
-       Now z_final has mean = skew_offset (positive for right-skew, negative for left)
-       and std ~ 1 (skew_offset is small, O(0.1-0.5) for typical a values).
 
     4. Rescale: log_rets = z_final * ret_std + ret_mu
-       The skew direction is carried by skew_offset in z_final.
     """
     rng = np.random.default_rng(seed)
 
@@ -256,13 +246,22 @@ def generate(
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
-    df_real:   pd.DataFrame,
-    lookback:  int = 60,
-    step:      int = 20,
-    n_forward: int | None = None,
-    seed:      int = 42,
-    verbose:   bool = True,
+    df_real:             pd.DataFrame,
+    lookback:            int = 60,
+    step:                int = 20,
+    n_forward:           int | None = None,
+    seed:                int = 42,
+    real_anchor_weight:  float = 0.0,   # Fix-8: 0=pure sim chain, 1=always anchor to real
+    verbose:             bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Fix-8: track sim_last_close and use it as the next chunk's start_price.
+
+    real_anchor_weight (0..1):
+        0.0  — pure chain: start_price = sim_last_close  (no seam jump, default)
+        1.0  — always anchor to real close                (old behaviour, seam jumps)
+        0.x  — geometric blend: exp((1-w)*log(sim) + w*log(real))
+    """
     if n_forward is None:
         n_forward = step
 
@@ -271,6 +270,7 @@ def rolling_fit_generate(
     param_log:  list[dict]         = []
     window_idx = 0
     pos        = lookback
+    sim_last_close: float | None = None   # Fix-8: carry sim price across chunks
 
     while pos <= n_total:
         fit_start  = pos - lookback
@@ -282,15 +282,28 @@ def rolling_fit_generate(
 
         df_window = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         params    = fit(df_window)
-        start_px  = float(df_real["Close"].iloc[fit_end - 1])
+
+        # Fix-8: compute start_price using geometric blend
+        real_close = float(df_real["Close"].iloc[fit_end - 1])
+        if sim_last_close is None or real_anchor_weight >= 1.0:
+            start_px = real_close                         # first chunk always anchors
+        elif real_anchor_weight <= 0.0:
+            start_px = sim_last_close                     # pure sim chain
+        else:
+            w = float(real_anchor_weight)
+            start_px = float(np.exp(
+                (1 - w) * np.log(max(sim_last_close, 1e-10))
+                + w * np.log(max(real_close, 1e-10))
+            ))
 
         df_chunk = generate(
             params=params, n_bars=actual_fwd,
             start_price=start_px, seed=seed + window_idx,
         )
         sim_chunks.append(df_chunk)
+        sim_last_close = float(df_chunk["Close"].iloc[-1])   # Fix-8: update carry
 
-        # Loss
+        # Loss (per-chunk distribution, unaffected by seam)
         real_fwd  = df_real.iloc[pos:fwd_end].copy().reset_index(drop=True)
         real_rets = np.diff(np.log(np.maximum(real_fwd["Close"].values, 1e-10)))
         sim_rets  = np.diff(np.log(np.maximum(df_chunk["Close"].values, 1e-10)))
