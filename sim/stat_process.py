@@ -1,28 +1,28 @@
 """
-stat_process.py  v3
+stat_process.py  v4
 ===================
 純統計過程模型，完全不使用 agent。
 
-v3 修正
--------
-  Fix-1 : Student-t df 掃描 log-likelihood，不再鎖死
-  Fix-2 : 改用 skewnorm 擬合，保留 skew 方向
-  Fix-3 : wick_lambda 使用真實 rolling ATR（Wilder 14）
-  Fix-4 : AR(1) 正規化經正確的 skewnorm 實際 std。
-          原問題：用 skewnorm.scale 做 rescale 目標，
-          但 skewnorm.std() ≠ scale（当 |skew_a| 大時相差超過 30%）
-          修正：先在標準化工作分佈（mean=0, std=1）上做 AR(1)，
-          再 rescale 回真實對數報酬的 mean/std，不經由 skewnorm 參數。
+v4 修正 (Fix-5)
+------------------
+  問題 : AR(1) 後第二次標準化成 (mem - mean) / std 把偏態结構碳平
+           skewnorm(a>0) 取樣後 mean > median，減去 mean 之後對稱的左尾
+           相對跟長，造成模擬 skew 翻負。
+  修正 : AR(1) 後只隠就 std，保留偏差（mean 影響小於 0.001），
+           最後 rescale 到 ret_mu 時統一對齊。
+
+v1-v3 修正
+------------
+  Fix-1 : Student-t df 掃描 log-likelihood
+  Fix-2 : 改用 skewnorm 擬合
+  Fix-3 : wick_lambda 使用 rolling ATR（Wilder 14）
+  Fix-4 : AR(1) 正規化經正確的 skewnorm 實際 std
 
 Pipeline
 --------
-1. fit(df_history)         → StatParams (7 個參數)
-2. generate(params, n_bars, seed)  → OHLC DataFrame
-3. rolling_fit_generate(df_real, lookback, step, ...)  → (df_sim, param_log)
-
-用法
-----
-  from sim.stat_process import fit, generate, rolling_fit_generate
+1. fit(df_history)        -> StatParams (7 個參數)
+2. generate(params, n_bars, seed) -> OHLC DataFrame
+3. rolling_fit_generate(df_real, lookback, step, ...) -> (df_sim, param_log)
 """
 
 from __future__ import annotations
@@ -38,30 +38,29 @@ from scipy.optimize import minimize_scalar
 from sim.metrics import hurst_exponent
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 型別
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Type
+# ---------------------------------------------------------------------------
 
 class StatParams(TypedDict):
-    ret_mu:       float   # 對數報酬均值（真實 sample mean）
-    ret_std:      float   # 對數報酬標準差（真實 sample std）
+    ret_mu:       float   # sample mean of log returns
+    ret_std:      float   # sample std  of log returns
     ret_skew_a:   float   # skewnorm shape (alpha)
-    ret_df:       float   # Student-t df，尾巴厚度估計（僅診斷）
-    hurst_target: float   # Hurst 指數（0.3 ~ 0.8）
-    wick_lambda:  float   # 影線 Exp scale，單位 = ATR 倍數
-    atr_mean:     float   # 歷史平均 ATR（絕對價格，用於 wick 生成）
+    ret_df:       float   # Student-t df  (tail thickness, diagnostic only)
+    hurst_target: float   # Hurst exponent [0.3, 0.8]
+    wick_lambda:  float   # Exponential scale for wick, in units of ATR
+    atr_mean:     float   # Mean ATR in absolute price (for wick generation)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 工具
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _log_returns(closes: np.ndarray) -> np.ndarray:
     return np.diff(np.log(np.maximum(closes.astype(float), 1e-10)))
 
 
 def _wilder_atr(hi: np.ndarray, lo: np.ndarray, cl: np.ndarray, period: int = 14) -> np.ndarray:
-    """Wilder 平滑 ATR，回傳與輸入等長的 array。"""
     n = len(hi)
     tr = np.empty(n)
     tr[0] = hi[0] - lo[0]
@@ -75,22 +74,22 @@ def _wilder_atr(hi: np.ndarray, lo: np.ndarray, cl: np.ndarray, period: int = 14
 
 
 def _fit_df_scan(log_rets: np.ndarray) -> float:
-    """Fix-1: 對 df ∈ [2.1, 30] 做 log-likelihood 1D 掃描。"""
-    mu_hat    = float(np.mean(log_rets))
-    sigma_hat = float(np.std(log_rets, ddof=1))
+    """Fix-1: bounded 1-D scan for best Student-t df in [2.1, 30]."""
+    mu    = float(np.mean(log_rets))
+    sigma = float(np.std(log_rets, ddof=1))
     def neg_ll(df):
-        return -np.sum(stats.t.logpdf(log_rets, df=df, loc=mu_hat, scale=sigma_hat))
+        return -np.sum(stats.t.logpdf(log_rets, df=df, loc=mu, scale=sigma))
     return float(minimize_scalar(neg_ll, bounds=(2.1, 30.0), method="bounded").x)
 
 
 def _fit_skewnorm(log_rets: np.ndarray) -> tuple[float, float, float]:
-    """Fix-2: MLE 擬合 skewnorm，回傳 (skew_a, snorm_loc, snorm_scale)。"""
+    """Fix-2: MLE fit skewnorm, return (skew_a, loc, scale)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             a, loc, scale = stats.skewnorm.fit(log_rets)
             a     = float(np.clip(a, -10.0, 10.0))
-            scale = float(np.maximum(scale, 1e-6))
+            scale = float(max(scale, 1e-6))
             loc   = float(loc)
         except Exception:
             a, loc, scale = 0.0, float(np.mean(log_rets)), float(np.std(log_rets))
@@ -98,7 +97,7 @@ def _fit_skewnorm(log_rets: np.ndarray) -> tuple[float, float, float]:
 
 
 def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
-    """Fix-3: 用 Wilder ATR 作為正規化基準，回傳 (wick_lambda, atr_mean)。"""
+    """Fix-3: normalize wick by Wilder ATR, return (wick_lambda, atr_mean)."""
     hi = df_ohlc["High"].values.astype(float)
     lo = df_ohlc["Low"].values.astype(float)
     op = df_ohlc["Open"].values.astype(float)
@@ -107,9 +106,8 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     body_lo    = np.minimum(op, cl)
     upper_wick = np.maximum(hi - body_hi, 0.0)
     lower_wick = np.maximum(body_lo - lo, 0.0)
-    atr      = _wilder_atr(hi, lo, cl, period=14)
-    atr      = np.maximum(atr, 1e-10)
-    atr_mean = float(np.mean(atr))
+    atr        = np.maximum(_wilder_atr(hi, lo, cl, period=14), 1e-10)
+    atr_mean   = float(np.mean(atr))
     wick_ratio = np.concatenate([upper_wick / atr, lower_wick / atr])
     wick_ratio = wick_ratio[wick_ratio > 0]
     if len(wick_ratio) < 10:
@@ -117,28 +115,23 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # 1. FIT
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def fit(df_history: pd.DataFrame) -> StatParams:
-    """
-    從歷史 K 棒 DataFrame（需含 Open/High/Low/Close）擬合 7 個參數。
-    """
     closes   = df_history["Close"].values
     log_rets = _log_returns(closes)
-
     if len(log_rets) < 5:
-        raise ValueError(f"lookback 太短（{len(log_rets)} bars），需要至少 5 根。")
+        raise ValueError(f"lookback too short ({len(log_rets)} bars), need >= 5.")
 
-    # 真實對數報酬的 mean / std（作為 rescale 目標）
     ret_mu  = float(np.mean(log_rets))
     ret_std = float(np.std(log_rets, ddof=1))
 
-    df_t                   = _fit_df_scan(log_rets)
-    skew_a, sn_loc, sn_sc  = _fit_skewnorm(log_rets)
-    h                      = hurst_exponent(log_rets)
-    wick_lam, atr_mean     = _fit_wick_lambda(df_history)
+    df_t               = _fit_df_scan(log_rets)
+    skew_a, _, _       = _fit_skewnorm(log_rets)
+    h                  = hurst_exponent(log_rets)
+    wick_lam, atr_mean = _fit_wick_lambda(df_history)
 
     return StatParams(
         ret_mu       = ret_mu,
@@ -151,30 +144,29 @@ def fit(df_history: pd.DataFrame) -> StatParams:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # 2. GENERATE
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def _ar1_hurst_rho(h: float) -> float:
-    rho = 2 ** (2 * h - 1) - 1
-    return float(np.clip(rho, -0.95, 0.95))
+    return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
 
 
 def generate(
-    params:       StatParams,
-    n_bars:       int,
-    start_price:  float = 100.0,
-    seed:         int | None = None,
+    params:      StatParams,
+    n_bars:      int,
+    start_price: float = 100.0,
+    seed:        int | None = None,
 ) -> pd.DataFrame:
     """
-    用 StatParams 取樣 n_bars 根合成 K 棒。
-
-    Fix-4 的核心邏輯
-    --------------------
-    1. 從 skewnorm(a, loc=0, scale=1) 取樣（標準化工作分佈）
-    2. AR(1) 記憑注入（在 unit scale 操作，不會引入错誤 scale）
-    3. 最後統一 rescale 到真實樣本的 mean=ret_mu, std=ret_std
-    → skew 符號保留， std 精確對齊
+    Fix-4 + Fix-5 generation pipeline
+    ----------------------------------
+    Step 1: sample skewnorm(a, loc=0, scale=1)
+            -> force mean=0, std=1  (preserve shape / skew sign)
+    Step 2: AR(1) memory injection in unit space
+            -> scale-only normalization: divide by std, DO NOT subtract mean
+            -> keeps the asymmetric tail intact (Fix-5)
+    Step 3: rescale to target mean=ret_mu, std=ret_std
     """
     rng = np.random.default_rng(seed)
 
@@ -185,14 +177,13 @@ def generate(
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Step 1: 從標準化 skewnorm 取樣（mean=0, std=1）
+    # Step 1: standardized skewnorm sample
     z = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars, random_state=rng)
-    # 強制標準化，確保取樣結果 mean=0 std=1
     z_std = np.std(z)
     if z_std > 1e-10:
-        z = (z - np.mean(z)) / z_std
+        z = (z - np.mean(z)) / z_std   # full standardize at draw time is fine
 
-    # Step 2: AR(1) 方向記憶注入（在標準化空間操作）
+    # Step 2: AR(1) in unit space
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 0.01:
         mem = np.empty(n_bars)
@@ -200,16 +191,17 @@ def generate(
         innov_scale = np.sqrt(1.0 - rho ** 2)
         for i in range(1, n_bars):
             mem[i] = rho * mem[i-1] + innov_scale * z[i]
-        # AR(1) 後再次標準化（保持 mean=0, std=1）
+        # Fix-5: scale-only normalization -- preserve mean offset from skew
         m_std = np.std(mem)
         if m_std > 1e-10:
-            mem = (mem - np.mean(mem)) / m_std
+            mem = mem / m_std   # <-- DO NOT demean here
         z = mem
 
-    # Step 3: rescale 到真實樣本的 mean/std
+    # Step 3: rescale to real sample statistics
+    # z is now ~unit-std with skew shape intact; shift mean to ret_mu
     log_rets = z * ret_std + ret_mu
 
-    # --- 重建 OHLC ---
+    # Rebuild OHLC
     opens  = np.empty(n_bars)
     closes = np.empty(n_bars)
     opens[0] = start_price
@@ -218,29 +210,26 @@ def generate(
             opens[i] = closes[i - 1]
         closes[i] = opens[i] * np.exp(log_rets[i])
 
-    # --- wick 用 atr_mean 作為基準（Fix-3）---
     atr_proxy   = np.full(n_bars, atr_mean)
     upper_wicks = rng.exponential(scale=wick_lam * atr_proxy)
     lower_wicks = rng.exponential(scale=wick_lam * atr_proxy)
     body_hi     = np.maximum(opens, closes)
     body_lo     = np.minimum(opens, closes)
-    highs       = body_hi + upper_wicks
-    lows        = body_lo - lower_wicks
 
     volumes = rng.lognormal(mean=15.0, sigma=0.5, size=n_bars).astype(int)
 
     return pd.DataFrame({
         "Open":   opens,
-        "High":   highs,
-        "Low":    lows,
+        "High":   body_hi + upper_wicks,
+        "Low":    body_lo - lower_wicks,
         "Close":  closes,
         "Volume": volumes,
     })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. ROLLING FIT → GENERATE
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 3. ROLLING FIT -> GENERATE
+# ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
     df_real:   pd.DataFrame,
@@ -250,9 +239,6 @@ def rolling_fit_generate(
     seed:      int = 42,
     verbose:   bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """
-    Rolling 模式：每隔 step 根重新擬合，往前生成模擬 K 棒。
-    """
     if n_forward is None:
         n_forward = step
 
@@ -292,14 +278,13 @@ def rolling_fit_generate(
         else:
             loss = 0.0
 
-        log_entry = {
+        param_log.append({
             "window":   window_idx + 1,
             "fit_bars": [fit_start, fit_end],
             "fwd_bars": [pos, fwd_end],
             **{k: params[k] for k in params},
             "loss":     round(loss, 4),
-        }
-        param_log.append(log_entry)
+        })
 
         if verbose:
             print(
@@ -317,6 +302,6 @@ def rolling_fit_generate(
         window_idx += 1
 
     if not sim_chunks:
-        raise RuntimeError("沒有產生任何模擬 chunk，請檢查 lookback/step 設定。")
+        raise RuntimeError("No chunks generated -- check lookback/step settings.")
 
     return pd.concat(sim_chunks, ignore_index=True), param_log
