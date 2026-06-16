@@ -329,7 +329,7 @@ class RegimeCalibrator:
         current_params = {
             "impact_coeff":      float(np.median(self.grid["impact_coeff"])),
             "momentum_scale":    float(np.median(self.grid["momentum_scale"])),
-            "decay":             float(np.median(self.grid["decay\"])),
+            "decay":             float(np.median(self.grid["decay"])),
             "intra_noise_scale": float(np.median(self.grid["intra_noise_scale"])),
         }
 
@@ -383,10 +383,6 @@ class RegimeCalibrator:
                 "real_mean":         best.get("real_mean",  float("nan")),
             })
 
-            # -------------------------------------------------------
-            # 接縫對齊：取前一個 window 最後一根模擬收盤價
-            # window_idx == 0 時用 df_train 最後一根真實 Close
-            # -------------------------------------------------------
             if window_idx == 0:
                 anchor_close = float(df_train["Close"].iloc[-1])
             else:
@@ -405,7 +401,6 @@ class RegimeCalibrator:
                 seed=seed + window_idx,
             )
 
-            # 對數報酬平移：內部 log-return 不變，只消除跨 window 價格跳層
             df_window_sim = self._rescale_window(df_window_sim, anchor_close)
 
             all_bars.append(df_window_sim)
