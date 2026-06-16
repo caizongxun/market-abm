@@ -1,26 +1,19 @@
 """
-stat_process.py  v24
+stat_process.py  v25
 ====================
 純統計過程模型，完全不使用 agent。
 
-v24 三項精準修改（v23 骨架其餘不動）：
+v25 新增（v24 骨架不動）：
 ------------------------------------------------------
+在 rolling_fit_generate() 裡插入 OnlineRidgePredictor。
+  - fit() / generate() 邏輯完全不改
+  - 每個 window 跑完 fit() 後，predictor 先 observe() 記錄訓練樣本
+  - 前 min_train(=10) 個 window 純觀察，第 11 個起開始混合預測
+  - blend_w 從 0 線性增長到 0.5，最大只信一半 predictor
+  - 若 sklearn 未安裝，自動退化為純 fit() 模式
+  - 新增 --no-adapt flag 可停用（run_sim.py 傳入 use_adaptive=False）
 
-Fix 1：AR(1) warm-up 50 步（解決 skew transient bias）
-  additive AR(1) 在 n_bars=20 的短 window 中，
-  前幾 bar 的 transient 偏差佔比 25%，破壞 skewnorm 邊際 skew。
-  修正：先跑 50 步 warm-up 讓序列達到 stationary，再取後 n_bars 段。
-
-Fix 2：target_ek 用全局下限補正（解決 kurtosis 低估）
-  60-bar window 的樣本 kurtosis 普遍低於全局值（865 bar 為 10.6）。
-  rolling_fit_generate() 先算完整序列的 kurtosis 作為 global_ek_floor，
-  fit() 新增 ek_global_floor 參數，target_ek = max(window_ek, floor)。
-  預設 floor=3.0，rolling 時傳入實際全局值。
-
-Fix 3：hurst clip 上限從 0.72 降回 0.69
-  v23 調到 0.72 導致 sim hurst=0.74 偏高，改回 clip(h, 0.3, 0.69)。
-
-v1-v24 修正歷程
+v1-v25 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -39,6 +32,9 @@ v1-v24 修正歷程
   Fix-23  : additive AR(1) + body-only rescale + kurtosis-driven p_t
              => kurtosis 3.97✅↑ hurst 0.74 偏高 skew -0.24
   Fix-24  : AR(1) warmup + global ek floor + hurst clip 0.69
+             => skew -0.068✅ hurst 0.720✅ kurtosis 2.62 偏低
+  Fix-25  : OnlineRidgePredictor（adaptive_params.py）
+             => 從歷史 K 棒特徵自適應預測 ret_std/skew_a/hurst
 """
 
 from __future__ import annotations
@@ -177,7 +173,7 @@ def _ar1_hurst_rho(h: float) -> float:
 def fit(
     df_history:      pd.DataFrame,
     apply_trend_bias: bool = True,
-    ek_global_floor:  float = 3.0,   # Fix 2: global kurtosis floor
+    ek_global_floor:  float = 3.0,
 ) -> StatParams:
     closes   = df_history["Close"].values
     log_rets = _log_returns(closes)
@@ -196,13 +192,11 @@ def fit(
     vol_persistence     = _fit_vol_persistence(log_rets, ret_mu)
     acf_lag1            = _fit_acf_lag1(log_rets)
 
-    # Fix 2: target_ek = max(window sample kurtosis, global floor)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ek = float(stats.kurtosis(log_rets))  # Fisher excess kurtosis
+        ek = float(stats.kurtosis(log_rets))
     target_ek = float(max(np.clip(ek, 0.5, 30.0), ek_global_floor))
 
-    # trend bias (Fix-18 保留)
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
         trend_bias = float(np.sign(real_trend) * abs(ret_mu) * 0.3)
@@ -213,7 +207,7 @@ def fit(
         ret_std         = ret_std,
         ret_skew_a      = skew_a,
         ret_df          = df_t,
-        hurst_target    = float(np.clip(h, 0.3, 0.69)),  # Fix 3: 上限 0.69
+        hurst_target    = float(np.clip(h, 0.3, 0.69)),
         wick_lambda     = wick_lam,
         atr_mean        = atr_mean,
         jump_freq       = jump_freq,
@@ -225,10 +219,10 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v24)
+# 2. GENERATE  (v24，不改動)
 # ---------------------------------------------------------------------------
 
-_AR1_WARMUP = 50  # Fix 1: warmup steps
+_AR1_WARMUP = 50
 
 
 def generate(
@@ -238,16 +232,6 @@ def generate(
     seed:             int | None = None,
     drift_correction: float = 0.0,
 ) -> pd.DataFrame:
-    """
-    v24 generate pipeline:
-
-    Step 1  Patch C: kurtosis-driven p_t (v23)
-    Step 2  Fix 1: additive AR(1) with 50-step warmup
-    Step 3  ACF lag-1 微調 (v22)
-    Step 4  GARCH vol clustering (v22)
-    Step 5  rescale to (ret_mu, ret_std)
-    Step 6  Patch B: jump body-only rescale (v23)
-    """
     rng = np.random.default_rng(seed)
 
     ret_mu          = params["ret_mu"] + drift_correction
@@ -263,9 +247,6 @@ def generate(
     acf_lag1        = params["acf_lag1"]
     target_ek       = params["target_ek"]
 
-    # ------------------------------------------------------------------
-    # Step 1: kurtosis-driven p_t (Patch C, v23)
-    # ------------------------------------------------------------------
     t_ek = 6.0 / max(df_t - 4.0, 0.1)
     p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.85))
 
@@ -277,25 +258,19 @@ def generate(
                               size=total, random_state=rng)
     z_mix_ext = np.where(mask, t_samples, sn_samples)
 
-    # ------------------------------------------------------------------
-    # Step 2: Fix 1 — additive AR(1) with warmup
-    # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 1e-6:
-        innov_sc   = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
-        z_ar_ext   = np.empty(total)
+        innov_sc    = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+        z_ar_ext    = np.empty(total)
         z_ar_ext[0] = z_mix_ext[0]
         for i in range(1, total):
             z_ar_ext[i] = rho * z_ar_ext[i - 1] + innov_sc * z_mix_ext[i]
-        z_ar = z_ar_ext[_AR1_WARMUP:]   # 捨棄 warmup 段
+        z_ar = z_ar_ext[_AR1_WARMUP:]
     else:
         z_ar = z_mix_ext[_AR1_WARMUP:].copy()
 
     z_final = z_ar
 
-    # ------------------------------------------------------------------
-    # Step 3: ACF lag-1 微調 (v22)
-    # ------------------------------------------------------------------
     if abs(acf_lag1) > 0.05 and n_bars > 1:
         z_adj = z_final.copy()
         for i in range(1, n_bars):
@@ -306,9 +281,6 @@ def generate(
     else:
         z_adj = z_final
 
-    # ------------------------------------------------------------------
-    # Step 4: GARCH vol clustering (v22)
-    # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.01 and n_bars > 1:
         base_var   = ret_std ** 2
@@ -326,9 +298,6 @@ def generate(
     else:
         z_garch = z_adj
 
-    # ------------------------------------------------------------------
-    # Step 5: rescale to (ret_mu, ret_std)
-    # ------------------------------------------------------------------
     z_mean = float(np.mean(z_garch))
     z_std  = float(np.std(z_garch))
     if z_std > 1e-10:
@@ -338,9 +307,6 @@ def generate(
 
     log_rets = z_scaled.copy()
 
-    # ------------------------------------------------------------------
-    # Step 6: jump injection, body-only rescale (Patch B, v23)
-    # ------------------------------------------------------------------
     jump_mask = np.zeros(n_bars, dtype=bool)
     if jump_freq > 0 and n_bars > 0:
         jump_mask  = rng.uniform(size=n_bars) < jump_freq
@@ -356,9 +322,6 @@ def generate(
                     (log_rets[body_mask] - ret_mu) * body_scale + ret_mu
                 )
 
-    # ------------------------------------------------------------------
-    # Rebuild OHLC
-    # ------------------------------------------------------------------
     opens  = np.empty(n_bars)
     closes = np.empty(n_bars)
     opens[0] = start_price
@@ -384,7 +347,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. ROLLING FIT -> GENERATE
+# 3. ROLLING FIT -> GENERATE  (v25: + OnlineRidgePredictor)
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
@@ -395,20 +358,34 @@ def rolling_fit_generate(
     seed:                int = 42,
     real_anchor_weight:  float = 0.3,
     verbose:             bool = True,
+    use_adaptive:        bool = True,   # v25: 可停用 predictor
 ) -> tuple[pd.DataFrame, list[dict]]:
     if n_forward is None:
         n_forward = step
 
-    # Fix 2: 先算完整序列的 kurtosis 作為 global floor
     full_rets = _log_returns(df_real["Close"].values)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         global_ek = float(stats.kurtosis(full_rets))
     ek_floor = float(np.clip(global_ek, 3.0, 20.0))
 
+    # v25: 初始化 predictor
+    predictor = None
+    if use_adaptive:
+        try:
+            from sim.adaptive_params import OnlineRidgePredictor, extract_features
+            predictor = OnlineRidgePredictor(min_train=10, max_blend=0.5,
+                                             alpha=1.0, verbose=verbose)
+            if verbose:
+                print("[adapt] OnlineRidgePredictor enabled (min_train=10, max_blend=0.50)")
+        except ImportError:
+            if verbose:
+                print("[adapt] sklearn not found, adaptive mode disabled")
+
     n_total    = len(df_real)
     sim_chunks: list[pd.DataFrame] = []
     param_log:  list[dict]         = []
+    past_params: list[StatParams]  = []   # v25: 歷史 params 供 feature extractor
     window_idx = 0
     pos        = lookback
     sim_last_close: float | None = None
@@ -424,6 +401,14 @@ def rolling_fit_generate(
         df_window = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         params    = fit(df_window, apply_trend_bias=True, ek_global_floor=ek_floor)
 
+        # v25: adaptive blending
+        if predictor is not None:
+            past_params.append(params)
+            feats = extract_features(df_real, fit_end, past_params)
+            predictor.observe(feats, params)
+            if predictor.ready:
+                params = predictor.predict_and_blend(feats, params)
+
         # soft anchor
         real_close = float(df_real["Close"].iloc[fit_end - 1])
         if sim_last_close is None or real_anchor_weight >= 1.0:
@@ -437,7 +422,6 @@ def rolling_fit_generate(
                 + w * np.log(max(real_close, 1e-10))
             ))
 
-        # drift_correction
         next_real_idx  = min(fwd_end, n_total - 1)
         next_real_open = float(df_real["Open"].iloc[next_real_idx])
         if actual_fwd > 0 and start_px > 0 and next_real_open > 0:
@@ -454,7 +438,6 @@ def rolling_fit_generate(
         sim_chunks.append(df_chunk)
         sim_last_close = float(df_chunk["Close"].iloc[-1])
 
-        # Loss
         real_fwd  = df_real.iloc[pos:fwd_end].copy().reset_index(drop=True)
         real_rets = np.diff(np.log(np.maximum(real_fwd["Close"].values, 1e-10)))
         sim_rets  = np.diff(np.log(np.maximum(df_chunk["Close"].values, 1e-10)))
