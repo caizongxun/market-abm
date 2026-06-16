@@ -1,18 +1,43 @@
 """
-stat_process.py  v16-debug
-==========================
+stat_process.py  v17
+====================
 純統計過程模型，完全不使用 agent。
 
-Fix-16-debug — 在 generate() 三個關鍵節點加診斷輸出
+Fix-17 — 根本重構 generate() 的取樣機制
 ---------------------------------------
-診斷點：
-  [dbg] A: rank-remap 之後、chi2_scale 之前      -> 確認 amp+copula 是否已翻轉 skew
-  [dbg] B: chi2_scale 乘完之後                   -> 確認 chi2 本身是否翻轉 skew
-  [dbg] C: post-rescale (最終 log_rets)           -> 確認 rescale 是否改變 skew
+v16-debug 診斷結果：
+  param skew_a=+0.6066
+  skewnorm samples skew=-0.1852   <- 問題在此，amp 乘法翻轉了 skew
+  after rank-remap: skew=-0.1852  <- rank-remap 無關
+  after chi2*:      skew=-0.0731
+  after rescale:    skew=-0.0731
 
-只對第一個 window (debug=True) 輸出，其餘 window 靜默。
+根本原因：
+  q_mix = q_sn * amp
+  amp 在正偏 skewnorm 的兩尾放大倍率對稱（來自 t/norm 比值），
+  但正偏分佈左尾的 |q_sn| 比右尾小，乘以相同 amp 後左尾被過度放大，
+  導致 skew 翻轉為負。
 
-v1-v16 修正歷程
+Fix-17 方案：完全拋棄 amp-PPF，改用雙層 rank-remap
+  Layer 1: skew 層
+    從 skewnorm(a) 直接取 n_bars 個 i.i.d. 樣本
+    記錄每個樣本的 rank（= skewnorm 的排序資訊）
+
+  Layer 2: kurtosis 層
+    從 t(df) 取 n_bars 個 i.i.d. 樣本（排序後代表 fat-tail 分位點）
+    用 skewnorm 的 rank 重新排列 t 樣本
+    => 邊際分佈的分位點由 t 決定（kurtosis 正確）
+    => 每個位置的相對大小排名由 skewnorm 決定（skew 正確）
+
+  Layer 3: AR(1) copula（與 v16 相同）
+    用 AR(1) 序列的 rank 重新排列 layer-2 的結果
+    => 加入時間自相關
+
+  不再需要 chi2_scale booster（kurtosis 已由 t(df) 直接控制）
+  不再需要 center-masked amp
+  不再需要 post-boost rescale（只需一次線性 rescale）
+
+v1-v17 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -24,7 +49,8 @@ v1-v16 修正歷程
              => kurtosis 9.74 ✅ 但 std 偏高 35%、skew -0.30、hurst 仍偏
   Fix-16  : symmetric clip + std rescale + nu_boost 0.8x + hurst clip 0.65
              => std ✅  hurst ✅  skew 仍 -0.307 ❌  kurtosis 4.54 ❌
-  Fix-16-debug: 加診斷，定位 skew 翻轉的確切位置
+  Fix-16-debug: 定位到 amp 乘法在 PPF 階段就已翻轉 skew
+  Fix-17  : 雙層 rank-remap（skewnorm rank onto t samples）+ AR(1) copula
 """
 
 from __future__ import annotations
@@ -114,37 +140,6 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-def _build_tail_amplified_ppf(
-    skew_a: float,
-    df_t: float,
-    n_grid: int = 5000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Fix-15/16: Center-masked tail amplifier.
-
-    amp(p) = 1                                        if |p-0.5| < 0.35
-           = |t.ppf(p,df)| / (|norm.ppf(p)| + eps)   if |p-0.5| >= 0.35
-
-    Center 70% is exactly 1 to avoid the p=0.5 singularity from Fix-14.
-    Outer 30% gets t-like fat tails. amp is symmetric around p=0.5,
-    so skew sign of skewnorm is preserved.
-    """
-    eps = 1e-4
-    p = np.linspace(eps, 1.0 - eps, n_grid)
-
-    q_sn   = stats.skewnorm.ppf(p, a=skew_a, loc=0, scale=1)
-    q_t    = stats.t.ppf(p, df=max(df_t, 2.01), loc=0, scale=1)
-    q_norm = stats.norm.ppf(p, loc=0, scale=1)
-
-    amp = np.ones_like(p)
-    tail_mask = np.abs(p - 0.5) >= 0.35
-    amp[tail_mask] = np.abs(q_t[tail_mask]) / (np.abs(q_norm[tail_mask]) + 1e-8)
-    amp = np.clip(amp, 0.5, 8.0)
-
-    q_mix = q_sn * amp
-    return p, q_mix
-
-
 # ---------------------------------------------------------------------------
 # 1. FIT
 # ---------------------------------------------------------------------------
@@ -168,6 +163,7 @@ def fit(df_history: pd.DataFrame) -> StatParams:
         ret_std      = ret_std,
         ret_skew_a   = skew_a,
         ret_df       = df_t,
+        # hurst clip [0.3, 0.65]: h=0.65 => AR(1) rho=0.21
         hurst_target = float(np.clip(h, 0.3, 0.65)),
         wick_lambda  = wick_lam,
         atr_mean     = atr_mean,
@@ -175,7 +171,7 @@ def fit(df_history: pd.DataFrame) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Fix-16-debug)
+# 2. GENERATE  (Fix-17: dual rank-remap)
 # ---------------------------------------------------------------------------
 
 def _ar1_hurst_rho(h: float) -> float:
@@ -187,13 +183,27 @@ def generate(
     n_bars:      int,
     start_price: float = 100.0,
     seed:        int | None = None,
-    debug:       bool = False,
 ) -> pd.DataFrame:
     """
-    Fix-16-debug: add 3 diagnostic print points.
-    [A] after rank-remap, before chi2_scale  -> skew of z_norm
-    [B] after chi2_scale multiply            -> skew of log_rets (pre-rescale)
-    [C] after std rescale                    -> skew of final log_rets
+    Fix-17: dual rank-remap for clean skew/kurtosis separation.
+
+    Step 1 — skew layer
+      Draw n_bars i.i.d. samples from skewnorm(a).
+      Compute their ranks => rank_sn.
+
+    Step 2 — kurtosis layer
+      Draw n_bars i.i.d. samples from t(df).
+      Sort them => t_sorted (fat-tail quantiles).
+      Remap: z_skewed_t = t_sorted[rank_sn]
+      => marginal quantiles come from t(df)  (correct kurtosis)
+      => relative ordering comes from skewnorm  (correct skew sign)
+
+    Step 3 — AR(1) copula
+      Generate AR(1) series, compute ranks => rank_ar1.
+      Final: z_final = z_skewed_t_sorted[rank_ar1]
+      => time autocorrelation imposed while preserving marginal shape.
+
+    Step 4 — rescale to (ret_mu, ret_std): single linear transform.
     """
     rng = np.random.default_rng(seed)
 
@@ -205,19 +215,24 @@ def generate(
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Build tail-amplified PPF grid (center-masked, from Fix-15)
-    p_grid, q_grid = _build_tail_amplified_ppf(skew_a, df_t)
+    # ------------------------------------------------------------------
+    # Step 1: skewnorm samples => ranks
+    # ------------------------------------------------------------------
+    sn_samples = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
+                                    size=n_bars, random_state=rng)
+    rank_sn = np.argsort(np.argsort(sn_samples))   # ranks in [0, n_bars-1]
 
-    # Theoretical mean and std from q_grid
-    z_mean = float(np.mean(q_grid))
-    z_std  = float(np.std(q_grid))
+    # ------------------------------------------------------------------
+    # Step 2: t(df) samples => sorted quantiles => remap by skewnorm rank
+    # ------------------------------------------------------------------
+    t_samples = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
+                             size=n_bars, random_state=rng)
+    t_sorted  = np.sort(t_samples)
+    z_skewed_t = t_sorted[rank_sn]   # fat-tail quantiles + skewnorm ordering
 
-    # i.i.d. samples from tail-amplified marginal
-    u_iid = rng.uniform(0.0, 1.0, size=n_bars)
-    samples = np.interp(u_iid, p_grid, q_grid)
-    samples_sorted = np.sort(samples)
-
-    # Gaussian AR(1) copula for autocorrelation
+    # ------------------------------------------------------------------
+    # Step 3: AR(1) copula
+    # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
     eps = rng.standard_normal(n_bars)
     if abs(rho) > 0.01:
@@ -229,69 +244,23 @@ def generate(
     else:
         u_ar1 = eps.copy()
 
-    # Rank remap: impose autocorrelation structure while preserving marginal
-    rank_of_ar1 = np.argsort(np.argsort(u_ar1))
-    z_final = samples_sorted[rank_of_ar1]
+    rank_ar1       = np.argsort(np.argsort(u_ar1))
+    z_skewed_t_sorted = np.sort(z_skewed_t)
+    z_final        = z_skewed_t_sorted[rank_ar1]
 
-    # Rescale to target moments
+    # ------------------------------------------------------------------
+    # Step 4: single linear rescale to (ret_mu, ret_std)
+    # ------------------------------------------------------------------
+    z_mean = float(np.mean(z_final))
+    z_std  = float(np.std(z_final))
     if z_std > 1e-10:
-        z_norm = (z_final - z_mean) / z_std
+        log_rets = (z_final - z_mean) / z_std * ret_std + ret_mu
     else:
-        z_norm = z_final - z_mean
-    log_rets = z_norm * ret_std + ret_mu
+        log_rets = np.full(n_bars, ret_mu)
 
-    # -----------------------------------------------------------------------
-    # [dbg] Point A: after rank-remap + rescale, BEFORE chi2_scale
-    # -----------------------------------------------------------------------
-    if debug:
-        _skew_A  = float(stats.skew(log_rets))
-        _kurt_A  = float(stats.kurtosis(log_rets))
-        _skew_sn = float(stats.skew(samples))   # pure skewnorm samples (no AR)
-        print(
-            f"  [dbg-A] param skew_a={skew_a:+.4f} | "
-            f"skewnorm samples skew={_skew_sn:+.4f} | "
-            f"after rank-remap+rescale: skew={_skew_A:+.4f}  kurt={_kurt_A:.4f}"
-        )
-
-    # Fix-16A+B: Variance-mixture kurtosis booster with SYMMETRIC clip
-    nu_boost = float(max(df_t * 0.8, 4.0))
-    chi2_samples = rng.chisquare(nu_boost, size=n_bars)
-    chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_samples, 1e-8))
-    _c = 2.5
-    chi2_scale = np.clip(chi2_scale, 1.0 / _c, _c)
-    log_rets = log_rets * chi2_scale
-
-    # -----------------------------------------------------------------------
-    # [dbg] Point B: after chi2_scale multiply, BEFORE std rescale
-    # -----------------------------------------------------------------------
-    if debug:
-        _skew_B  = float(stats.skew(log_rets))
-        _kurt_B  = float(stats.kurtosis(log_rets))
-        _chi2_mean = float(np.mean(chi2_scale))
-        _chi2_std  = float(np.std(chi2_scale))
-        print(
-            f"  [dbg-B] chi2_scale: mean={_chi2_mean:.4f}  std={_chi2_std:.4f}  "
-            f"clipped_frac={float(np.mean((chi2_scale <= 1/_c) | (chi2_scale >= _c))):.3f} | "
-            f"after chi2*: skew={_skew_B:+.4f}  kurt={_kurt_B:.4f}"
-        )
-
-    # Fix-16C: rescale std back to ret_std (linear => preserves skew sign & kurtosis ratio)
-    lr_std = float(np.std(log_rets))
-    if lr_std > 1e-10:
-        log_rets = (log_rets - float(np.mean(log_rets))) / lr_std * ret_std + ret_mu
-
-    # -----------------------------------------------------------------------
-    # [dbg] Point C: final log_rets after rescale
-    # -----------------------------------------------------------------------
-    if debug:
-        _skew_C = float(stats.skew(log_rets))
-        _kurt_C = float(stats.kurtosis(log_rets))
-        print(
-            f"  [dbg-C] after rescale:  skew={_skew_C:+.4f}  kurt={_kurt_C:.4f}  "
-            f"std={float(np.std(log_rets)):.6f}  (target ret_std={ret_std:.6f})"
-        )
-
+    # ------------------------------------------------------------------
     # Rebuild OHLC
+    # ------------------------------------------------------------------
     opens  = np.empty(n_bars)
     closes = np.empty(n_bars)
     opens[0] = start_price
@@ -362,11 +331,9 @@ def rolling_fit_generate(
                 + w * np.log(max(real_close, 1e-10))
             ))
 
-        # debug=True only for the first window
         df_chunk = generate(
             params=params, n_bars=actual_fwd,
             start_price=start_px, seed=seed + window_idx,
-            debug=(window_idx == 0),
         )
         sim_chunks.append(df_chunk)
         sim_last_close = float(df_chunk["Close"].iloc[-1])
