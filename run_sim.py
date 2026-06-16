@@ -280,13 +280,16 @@ def plot_stat(symbol, df_real, df_result, param_log):
     axes[0, 2].set_title("Rolling Volatility")
     axes[0, 2].legend()
 
+    # 過濾掉 _summary 記錄，只保留有 window key 的 window 記錄
+    window_params = [p for p in param_log if "window" in p]
+
     # (1,0) Student-t df
-    windows = [p["window"]       for p in param_log]
-    df_vals = [p["ret_df"]       for p in param_log]
-    hurst_v = [p["hurst_target"] for p in param_log]
+    windows = [p["window"]       for p in window_params]
+    df_vals = [p["ret_df"]       for p in window_params]
+    hurst_v = [p["hurst_target"] for p in window_params]
     # v3: ret_std (was ret_sigma in v1/v2)
-    std_v   = [p.get("ret_std", p.get("ret_sigma", 0.0)) for p in param_log]
-    wick_v  = [p["wick_lambda"]  for p in param_log]
+    std_v   = [p.get("ret_std", p.get("ret_sigma", 0.0)) for p in window_params]
+    wick_v  = [p["wick_lambda"]  for p in window_params]
 
     axes[1, 0].plot(windows, df_vals, marker="o", ms=3, color="tab:red")
     axes[1, 0].set_title("Student-t df  (low = fat tail)")
