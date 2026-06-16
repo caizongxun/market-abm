@@ -1,30 +1,29 @@
 """
 calibrator.py  v1
 =================
-AdaptiveCalibrator：以壓測本身為訓練來源的線上校正器。
+AdaptiveCalibrator：replay buffer + XGBoost 校正模型。
 
 架構
 ----
-每個滾動視窗結束後，記錄一筆：
-  context  : 7 維市場特徵（波動率 regime、ek、skew、hurst…）
-  action   : 校正後參數調整量（std_scale、ek_adjust、chi2_skip）
-  reward   : -（std_err + kurt_err_norm + hurst_err + dir_penalty）
+  - ReplayBuffer        : 環形 buffer，儲存 (context, action, reward) 三元組
+  - CalibAction         : 對 StatParams 各欄位的加法/乘法修正量
+  - AdaptiveCalibrator  : 主類，predict() + record() + fit() + save/load
 
-累積 min_train 筆後，用 XGBoost（或 Ridge fallback）擬合
-  context → best_action
-並在後續視窗預測校正量，逐步減少誤差。
+Context 特徵（9 維）
+  ret_std, ret_skew_a, ret_df, hurst_target, wick_lambda,
+  jump_freq, vol_persistence, acf_lag1, target_ek
 
-API
----
-  cal = AdaptiveCalibrator()
-  cal.load("models/calibrator.pkl")      # 可選：載入預訓練
+Action 輸出（4 維，對應最敏感的 4 個參數）
+  d_ret_std, d_hurst, d_target_ek, d_vol_persistence
+  -- 解釋為相對 delta（+0.05 = 乘以 1.05）
 
-  # 在 rolling_fit_generate 內部每個視窗呼叫：
-  action = cal.predict(context)           # 取得本視窗校正量
-  ...執行 generate()...
-  cal.record(context, action, reward)     # 記錄結果
+Reward（純量，越高越好）
+  reward = - (0.5*std_err_pct + 0.3*kurt_err/10 + 0.1*hurst_err/0.1 - 0.1*dir_hit)
+  bounded to [-5, +1]
 
-  cal.save("models/calibrator.pkl")       # 壓測結束後持久化
+持久化
+  calibrator.save(path)   # pickle
+  calibrator.load(path)   # 就地恢復
 """
 from __future__ import annotations
 
@@ -32,62 +31,164 @@ import os
 import pickle
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+# XGBoost 為可選依賴；若不存在則退化到 Ridge
+try:
+    from xgboost import XGBRegressor
+    _HAS_XGB = True
+except ImportError:
+    _HAS_XGB = False
+
 
 # ---------------------------------------------------------------------------
-# Action 結構
+# 常數
+# ---------------------------------------------------------------------------
+
+CONTEXT_KEYS: List[str] = [
+    "ret_std", "ret_skew_a", "ret_df",
+    "hurst_target", "wick_lambda",
+    "jump_freq", "vol_persistence", "acf_lag1", "target_ek",
+]
+
+ACTION_KEYS: List[str] = [
+    "d_ret_std", "d_hurst", "d_target_ek", "d_vol_persistence",
+]
+
+# action 合法範圍（相對 delta）
+ACTION_CLIP: Dict[str, tuple] = {
+    "d_ret_std":          (-0.40, 0.40),
+    "d_hurst":            (-0.15, 0.15),
+    "d_target_ek":        (-0.50, 0.50),
+    "d_vol_persistence":  (-0.30, 0.30),
+}
+
+# action 對應 StatParams 的欄位名稱
+ACTION_TARGET: Dict[str, str] = {
+    "d_ret_std":          "ret_std",
+    "d_hurst":            "hurst_target",
+    "d_target_ek":        "target_ek",
+    "d_vol_persistence":  "vol_persistence",
+}
+
+# StatParams 欄位的安全範圍（apply 後 clip）
+PARAM_SAFE: Dict[str, tuple] = {
+    "ret_std":          (1e-5,  0.20),
+    "hurst_target":     (0.30,  0.69),
+    "target_ek":        (1.0,   30.0),
+    "vol_persistence":  (0.0,   0.85),
+}
+
+
+# ---------------------------------------------------------------------------
+# CalibAction
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CalibAction:
-    """校正器輸出的參數調整量。"""
-    std_scale:  float = 1.0   # 乘以 ret_std（1.0 = 不調）
-    ek_adjust:  float = 0.0   # 加到 target_ek
-    skew_scale: float = 1.0   # 乘以 ret_skew_a
-    hurst_adj:  float = 0.0   # 加到 hurst_target
+    """校正向量，每個分量為相對 delta（d_x 表示乘以 (1+d_x)）。"""
+    d_ret_std:         float = 0.0
+    d_hurst:           float = 0.0
+    d_target_ek:       float = 0.0
+    d_vol_persistence: float = 0.0
 
-    def apply(self, params: dict) -> dict:
-        """把調整量套用到 StatParams dict，回傳新 dict。"""
-        p = dict(params)
-        p["ret_std"]      = float(np.clip(p["ret_std"]      * self.std_scale,  1e-6, 1.0))
-        p["target_ek"]    = float(np.clip(p["target_ek"]    + self.ek_adjust,   0.5, 60.0))
-        p["ret_skew_a"]   = float(np.clip(p["ret_skew_a"]   * self.skew_scale, -10.0, 10.0))
-        p["hurst_target"] = float(np.clip(p["hurst_target"] + self.hurst_adj,   0.3,  0.69))
-        return p
+    def apply(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """就地修改並回傳 params dict。"""
+        result = dict(params)
+        for action_key, param_key in ACTION_TARGET.items():
+            delta = getattr(self, action_key)
+            lo, hi = ACTION_CLIP[action_key]
+            delta = float(np.clip(delta, lo, hi))
+            old_val = float(result[param_key])
+            new_val = old_val * (1.0 + delta)
+            if param_key in PARAM_SAFE:
+                plo, phi = PARAM_SAFE[param_key]
+                new_val = float(np.clip(new_val, plo, phi))
+            result[param_key] = new_val
+        return result
+
+    def to_array(self) -> np.ndarray:
+        return np.array([self.d_ret_std, self.d_hurst,
+                         self.d_target_ek, self.d_vol_persistence], dtype=float)
+
+    @staticmethod
+    def from_array(arr: np.ndarray) -> "CalibAction":
+        arr = np.asarray(arr, dtype=float)
+        return CalibAction(
+            d_ret_std         = float(arr[0]),
+            d_hurst           = float(arr[1]),
+            d_target_ek       = float(arr[2]),
+            d_vol_persistence = float(arr[3]),
+        )
+
+    @staticmethod
+    def zero() -> "CalibAction":
+        return CalibAction(0.0, 0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
-# Replay Buffer
+# ReplayBuffer
 # ---------------------------------------------------------------------------
-
-@dataclass
-class _Experience:
-    context: np.ndarray    # shape (7,)
-    action:  np.ndarray    # shape (4,)  [std_scale, ek_adjust, skew_scale, hurst_adj]
-    reward:  float
-
 
 class ReplayBuffer:
-    def __init__(self, maxlen: int = 20_000):
-        self.maxlen = maxlen
-        self._buf: list[_Experience] = []
+    """固定容量的環形 buffer，存放 (context_vec, action_vec, reward) 三元組。"""
 
-    def push(self, context: np.ndarray, action: np.ndarray, reward: float) -> None:
-        if len(self._buf) >= self.maxlen:
-            self._buf.pop(0)
-        self._buf.append(_Experience(context.copy(), action.copy(), float(reward)))
+    def __init__(self, capacity: int = 5000):
+        self.capacity = capacity
+        self._ctx:    List[np.ndarray] = []
+        self._act:    List[np.ndarray] = []
+        self._reward: List[float]      = []
+        self._ptr: int = 0
+        self._full: bool = False
+
+    def push(self, ctx: np.ndarray, act: np.ndarray, reward: float) -> None:
+        if len(self._ctx) < self.capacity:
+            self._ctx.append(ctx)
+            self._act.append(act)
+            self._reward.append(reward)
+        else:
+            self._ctx[self._ptr]    = ctx
+            self._act[self._ptr]    = act
+            self._reward[self._ptr] = reward
+            self._ptr = (self._ptr + 1) % self.capacity
+            self._full = True
 
     def __len__(self) -> int:
-        return len(self._buf)
+        return len(self._ctx)
 
-    def sample_all(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        X = np.array([e.context for e in self._buf], dtype=float)
-        A = np.array([e.action  for e in self._buf], dtype=float)
-        R = np.array([e.reward  for e in self._buf], dtype=float)
-        return X, A, R
+    @property
+    def contexts(self) -> np.ndarray:
+        return np.array(self._ctx, dtype=float)
+
+    @property
+    def actions(self) -> np.ndarray:
+        return np.array(self._act, dtype=float)
+
+    @property
+    def rewards(self) -> np.ndarray:
+        return np.array(self._reward, dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Ridge fallback
+# ---------------------------------------------------------------------------
+
+def _ridge_fit_predict(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_pred:  np.ndarray,
+    alpha: float = 1.0,
+) -> np.ndarray:
+    """最小二乘 Ridge，回傳 X_pred 的預測值。"""
+    n, d = X_train.shape
+    XtX = X_train.T @ X_train + alpha * np.eye(d)
+    try:
+        w = np.linalg.solve(XtX, X_train.T @ y_train)
+    except np.linalg.LinAlgError:
+        w = np.linalg.lstsq(XtX, X_train.T @ y_train, rcond=None)[0]
+    return X_pred @ w
 
 
 # ---------------------------------------------------------------------------
@@ -96,110 +197,144 @@ class ReplayBuffer:
 
 class AdaptiveCalibrator:
     """
-    線上校正器：壓測每跑一個視窗就學一筆，跨 trial 持續累積知識。
+    跨 trial 持久化的校正器。
 
-    context 特徵（7 維）
-    --------------------
-    0  ret_std_norm      : ret_std / 0.015（相對正規化）
-    1  target_ek_norm    : target_ek / 10.0
-    2  skew_a            : ret_skew_a（原值）
-    3  hurst             : hurst_target
-    4  vol_persistence   : vol_persistence
-    5  acf_lag1          : acf_lag1
-    6  df_t_norm         : ret_df / 10.0
+    工作流程
+    --------
+    1. bench_generalize / rolling_fit_generate 呼叫 predict(ctx) 取得 CalibAction
+    2. 用 action.apply(params) 修正 StatParams
+    3. 產生模擬、計算誤差指標
+    4. 呼叫 record(ctx, action, **err_metrics) 將經驗存入 buffer
+    5. 每 update_interval 筆自動重新訓練 XGBoost 模型
     """
-
-    CONTEXT_DIM = 7
-    ACTION_DIM  = 4   # std_scale, ek_adjust, skew_scale, hurst_adj
 
     def __init__(
         self,
-        min_train:       int   = 50,
-        update_interval: int   = 20,
-        explore_std:     float = 0.05,
-        use_xgb:         bool  = True,
+        capacity:         int   = 5000,
+        min_train:        int   = 50,
+        update_interval:  int   = 20,
+        explore_std:      float = 0.03,
+        xgb_n_estimators: int   = 80,
+        xgb_max_depth:    int   = 4,
+        xgb_lr:           float = 0.10,
     ):
         self.min_train       = min_train
         self.update_interval = update_interval
-        self.explore_std     = explore_std
-        self.use_xgb         = use_xgb
+        self.explore_std     = explore_std   # Gaussian exploration noise
+        self.xgb_kwargs      = dict(
+            n_estimators = xgb_n_estimators,
+            max_depth    = xgb_max_depth,
+            learning_rate= xgb_lr,
+            subsample    = 0.8,
+            colsample_bytree=0.8,
+            verbosity    = 0,
+        )
 
-        self.buffer    = ReplayBuffer(maxlen=20_000)
-        self._models: list = []          # one model per action dim
-        self._trained  = False
-        self._step     = 0
-        self._rng      = np.random.default_rng(42)
+        self._buffer     = ReplayBuffer(capacity)
+        self._models: Optional[List[Any]] = None   # list of 4 regressors (one per action dim)
+        self._n_since_fit: int = 0
+        self.n_experiences: int = 0
 
     # ------------------------------------------------------------------
     # Context builder
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_context(params: dict) -> np.ndarray:
-        return np.array([
-            params["ret_std"]        / 0.015,
-            params["target_ek"]      / 10.0,
-            float(params["ret_skew_a"]),
-            float(params["hurst_target"]),
-            float(params["vol_persistence"]),
-            float(params["acf_lag1"]),
-            params["ret_df"]         / 10.0,
-        ], dtype=float)
+    def build_context(params: Dict[str, Any]) -> np.ndarray:
+        """從 StatParams dict 抽出 9 維 context 向量。"""
+        return np.array([float(params[k]) for k in CONTEXT_KEYS], dtype=float)
 
     # ------------------------------------------------------------------
-    # Reward builder
+    # Reward function
     # ------------------------------------------------------------------
 
     @staticmethod
-    def compute_reward(
+    def _compute_reward(
         std_err_pct: float,
         kurt_err:    float,
         hurst_err:   float,
         dir_hit:     float,
     ) -> float:
-        r = -(
-            1.0  * min(std_err_pct, 2.0)
-            + 0.3 * min(kurt_err / 50.0, 1.0)
-            + 2.0 * min(hurst_err * 10, 1.0)
-            + 1.5 * max(0.0, 0.52 - dir_hit) * 10
-        )
-        return float(r)
+        r = -(0.5 * std_err_pct
+              + 0.3 * kurt_err / 10.0
+              + 0.1 * hurst_err / 0.10
+              - 0.1 * dir_hit)
+        return float(np.clip(r, -5.0, 1.0))
 
     # ------------------------------------------------------------------
-    # Predict
+    # Fit internal models
     # ------------------------------------------------------------------
 
-    def predict(self, context: np.ndarray) -> CalibAction:
-        """根據市場 context 預測最佳校正量。未訓練時回傳 no-op。"""
-        if not self._trained:
-            return self._default_action()
+    def _fit_models(self) -> None:
+        if len(self._buffer) < self.min_train:
+            return
 
-        x = context.reshape(1, -1)
-        preds = []
-        for model in self._models:
-            try:
-                p = float(model.predict(x)[0])
-            except Exception:
-                p = 0.0
-            preds.append(p)
+        X = self._buffer.contexts   # (N, 9)
+        A = self._buffer.actions    # (N, 4)
+        R = self._buffer.rewards    # (N,)
 
-        # 加 exploration noise（training 時才用，可設 explore_std=0 關閉）
-        noise = self._rng.normal(0, self.explore_std, size=self.ACTION_DIM)
-        preds = np.array(preds) + noise
+        # 目標：對每個 action 維度，學習 context -> best_action_dim
+        # 簡化監督：用 reward 加權的 A 值作為目標
+        # target_i = sum(R * A[:,i]) / (sum(R) + eps)  -- reward-weighted regression
+        # 更完整做法：用 R 作 importance weight
+        R_shifted = R - R.min() + 1e-6   # 確保非負
+        w = R_shifted / R_shifted.sum()
 
-        return CalibAction(
-            std_scale  = float(np.clip(preds[0], 0.5, 2.0)),
-            ek_adjust  = float(np.clip(preds[1], -10.0, 10.0)),
-            skew_scale = float(np.clip(preds[2], 0.5, 2.0)),
-            hurst_adj  = float(np.clip(preds[3], -0.2, 0.2)),
-        )
+        self._models = []
+        for i in range(len(ACTION_KEYS)):
+            y = A[:, i]   # observed action value
+            # 加權目標：reward-weighted expected action
+            y_target = np.full_like(y, float(np.sum(w * y)))
+            # 用完整 y 訓練，以 reward 高的樣本拉近
+            y_blend = (1 - w) * y + w * y_target   # soft target
 
-    def _default_action(self) -> CalibAction:
-        return CalibAction(std_scale=1.0, ek_adjust=0.0, skew_scale=1.0, hurst_adj=0.0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if _HAS_XGB:
+                    m = XGBRegressor(**self.xgb_kwargs)
+                    m.fit(X, y_blend)
+                else:
+                    # Ridge fallback: 包成 lambda
+                    X_train, y_train = X.copy(), y_blend.copy()
+                    m = lambda xp, _X=X_train, _y=y_train: _ridge_fit_predict(
+                        _X, _y, np.atleast_2d(xp)
+                    ).flatten()
+            self._models.append(m)
+
+        self._n_since_fit = 0
 
     # ------------------------------------------------------------------
-    # Record & update
+    # Public API
     # ------------------------------------------------------------------
+
+    def predict(self, ctx: np.ndarray) -> CalibAction:
+        """給定 context，回傳校正 action。模型未訓練前回傳 zero action。"""
+        if self._models is None or len(self._buffer) < self.min_train:
+            action = CalibAction.zero()
+        else:
+            x = ctx.reshape(1, -1)
+            deltas = []
+            for i, m in enumerate(self._models):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    if _HAS_XGB:
+                        val = float(m.predict(x)[0])
+                    else:
+                        val = float(m(x))
+                lo, hi = ACTION_CLIP[ACTION_KEYS[i]]
+                deltas.append(float(np.clip(val, lo, hi)))
+            action = CalibAction.from_array(np.array(deltas))
+
+        # Gaussian exploration noise（訓練期間）
+        if self.explore_std > 0:
+            noise = np.random.normal(0, self.explore_std, size=len(ACTION_KEYS))
+            a_arr = action.to_array() + noise
+            for i, key in enumerate(ACTION_KEYS):
+                lo, hi = ACTION_CLIP[key]
+                a_arr[i] = float(np.clip(a_arr[i], lo, hi))
+            action = CalibAction.from_array(a_arr)
+
+        return action
 
     def record(
         self,
@@ -210,121 +345,37 @@ class AdaptiveCalibrator:
         hurst_err:   float,
         dir_hit:     float,
     ) -> None:
-        """記錄一筆經驗，並按 update_interval 觸發重新訓練。"""
-        reward = self.compute_reward(std_err_pct, kurt_err, hurst_err, dir_hit)
-        a_vec  = np.array([
-            action.std_scale,
-            action.ek_adjust,
-            action.skew_scale,
-            action.hurst_adj,
-        ], dtype=float)
-        self.buffer.push(context, a_vec, reward)
-        self._step += 1
+        """儲存一筆經驗，並在條件達成時重新訓練模型。"""
+        reward = self._compute_reward(std_err_pct, kurt_err, hurst_err, dir_hit)
+        self._buffer.push(context, action.to_array(), reward)
+        self.n_experiences += 1
+        self._n_since_fit  += 1
 
-        if (len(self.buffer) >= self.min_train
-                and self._step % self.update_interval == 0):
-            self._fit()
-
-    # ------------------------------------------------------------------
-    # Model fitting
-    # ------------------------------------------------------------------
-
-    def _fit(self) -> None:
-        X, A, R = self.buffer.sample_all()
-
-        # 目標：高 reward 的 action 更值得學
-        # 用 reward 做 sample weight（shift 到 0+）
-        w = R - R.min() + 1e-3
-        w = w / w.sum() * len(w)
-
-        models = []
-        for dim in range(self.ACTION_DIM):
-            y = A[:, dim]
-            model = self._fit_one(X, y, w)
-            models.append(model)
-
-        self._models  = models
-        self._trained = True
-
-    def _fit_one(self, X: np.ndarray, y: np.ndarray, w: np.ndarray):
-        if self.use_xgb:
-            try:
-                import xgboost as xgb
-                model = xgb.XGBRegressor(
-                    n_estimators=100,
-                    max_depth=4,
-                    learning_rate=0.05,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    random_state=42,
-                    verbosity=0,
-                )
-                model.fit(X, y, sample_weight=w)
-                return model
-            except ImportError:
-                pass  # fallback to Ridge
-
-        # Ridge fallback
-        return self._ridge_fit(X, y, w)
-
-    @staticmethod
-    def _ridge_fit(X: np.ndarray, y: np.ndarray, w: np.ndarray):
-        """加權 Ridge 回歸。"""
-        class _RidgeModel:
-            def __init__(self, coef, intercept):
-                self.coef_      = coef
-                self.intercept_ = intercept
-            def predict(self, X):
-                return X @ self.coef_ + self.intercept_
-
-        W     = np.diag(w)
-        XtW   = X.T @ W
-        alpha = 1.0
-        A_mat = XtW @ X + alpha * np.eye(X.shape[1])
-        b_vec = XtW @ y
-        try:
-            coef = np.linalg.solve(A_mat, b_vec)
-        except np.linalg.LinAlgError:
-            coef = np.linalg.lstsq(A_mat, b_vec, rcond=None)[0]
-        intercept = float(np.mean(y) - coef @ np.mean(X, axis=0))
-        return _RidgeModel(coef, intercept)
-
-    # ------------------------------------------------------------------
-    # Persist
-    # ------------------------------------------------------------------
+        if (self._n_since_fit >= self.update_interval
+                and len(self._buffer) >= self.min_train):
+            self._fit_models()
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump({
-                "buffer":    self.buffer,
-                "models":    self._models,
-                "trained":   self._trained,
-                "step":      self._step,
-                "min_train": self.min_train,
-                "update_interval": self.update_interval,
+                "buffer":          self._buffer,
+                "models":          self._models,
+                "n_experiences":   self.n_experiences,
                 "explore_std":     self.explore_std,
-                "use_xgb":         self.use_xgb,
+                "min_train":       self.min_train,
+                "update_interval": self.update_interval,
+                "xgb_kwargs":      self.xgb_kwargs,
             }, f)
 
     def load(self, path: str) -> None:
-        if not os.path.exists(path):
-            return
         with open(path, "rb") as f:
-            d = pickle.load(f)
-        self.buffer          = d["buffer"]
-        self._models         = d["models"]
-        self._trained        = d["trained"]
-        self._step           = d["step"]
-        self.min_train       = d.get("min_train",       self.min_train)
-        self.update_interval = d.get("update_interval", self.update_interval)
-        self.explore_std     = d.get("explore_std",     self.explore_std)
-        self.use_xgb         = d.get("use_xgb",         self.use_xgb)
-
-    @property
-    def n_experiences(self) -> int:
-        return len(self.buffer)
-
-    @property
-    def is_trained(self) -> bool:
-        return self._trained
+            state = pickle.load(f)
+        self._buffer          = state["buffer"]
+        self._models          = state.get("models")
+        self.n_experiences    = state.get("n_experiences", len(self._buffer))
+        self.explore_std      = state.get("explore_std",     self.explore_std)
+        self.min_train        = state.get("min_train",        self.min_train)
+        self.update_interval  = state.get("update_interval", self.update_interval)
+        self.xgb_kwargs       = state.get("xgb_kwargs",      self.xgb_kwargs)
+        self._n_since_fit     = 0
