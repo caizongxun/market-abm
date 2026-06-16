@@ -1,54 +1,31 @@
 """
-stat_process.py  v22
+stat_process.py  v23
 ====================
 純統計過程模型，完全不使用 agent。
 
-架構：回退到 v18 穩定骨架，新增三項市場微觀特徵
+v23 三項精準 patch（v18 骨架其餘不動）：
 ------------------------------------------------------
 
-v18 保留不動：
-  - mixture model: p_t 混合 t(df) + skewnorm(a)
-  - AR(1) copula rank-remap（hurst → rho）
-  - single linear rescale to (ret_mu, ret_std)
-  - soft anchor (real_anchor_weight=0.3)
-  - drift_correction（消化 window 間的 log 差距）
-  - trend_bias（延續前一 lookback 的動量方向）
+Patch A：additive AR(1)，不做 rank-remap（解決 skew 翻轉）
+  rank-remap 會破壞 skewnorm 邊際的非對稱性。
+  改為 additive AR(1)：
+    z_ar[0] = z_mix[0]
+    z_ar[i] = rho * z_ar[i-1] + sqrt(1-rho^2) * z_mix[i]
+  z_ar 保持 z_mix 的邊際分佈（含 skew），同時引入 AR(1) 自相關。
 
-v22 新增三項市場微觀特徵：
-------------------------------------------------------
+Patch B：jump 只壓縮 body，不壓縮 jump 本身（保留 kurtosis）
+  原 v22 在 jump 注入後對整體 std 做 rescale → 把 kurtosis 壓掉。
+  改為：只對非 jump 的 body 部分做 rescale，jump 樣本完全保留。
 
-特徵 A：Jump Component（解決 kurtosis 不足）
-  真實市場 kurtosis 10.6 主要來自跳空（earnings/macro），
-  不是連續 t 分布能模擬的。
-  fit()  新增：
-    jump_freq = count(|r| > 3*ret_std) / n           # 跳空機率
-    jump_std  = std(r where |r| > 3*ret_std) or 3*ret_std
-  generate() 新增（在 rescale 之後）：
-    jump_mask = Bernoulli(jump_freq)
-    jump_sizes = Normal(0, jump_std)
-    log_rets += where(jump_mask, jump_sizes, 0)
-    最後做一次 std rescale 保持整體 volatility 不膨脹
+Patch C：kurtosis-driven p_t（提高 t-mixture 比例）
+  原 p_t = 4/df，對高 df 的 window 比例過低。
+  改為由實際資料的 excess kurtosis 反推：
+    target_ek = max(kurtosis(log_rets), 0.5)
+    t_ek      = 6 / max(df - 4, 0.1)   # t(df) excess kurtosis
+    p_t       = clip(target_ek / t_ek, 0.1, 0.85)
+  df=10, target_ek=7.6 → p_t≈0.76（原本只有 0.40）
 
-特徵 B：GARCH-like Vol Clustering（解決序列相關性）
-  真實市場大波動後往往跟著大波動（波動叢聚）。
-  fit()  新增：
-    vol_persistence = corr(resid_sq[:-1], resid_sq[1:])  # ARCH(1) alpha
-    vol_persistence = clip(val, 0.0, 0.85)
-  generate() 新增（取代固定 ret_std）：
-    h_t[0] = ret_std^2
-    h_t[i] = (1 - alpha) * ret_std^2 + alpha * (log_ret[i-1])^2
-    innov[i] = z_final[i] * sqrt(h_t[i]) / ret_std   # 保持均值 std 不變
-
-特徵 C：ACF Lag-1 短期均值回歸 vs Momentum 分離
-  hurst 只捕捉長程依賴，1-bar ACF 反映短期 mean-reversion/momentum。
-  fit()  新增：
-    acf_lag1 = corr(log_rets[:-1], log_rets[1:])   # 1-bar autocorrelation
-  generate() 新增：
-    在 AR(1) copula 的 rho 之外，額外對 z_final 加入
-    z_final[i] += acf_lag1 * z_final[i-1] * 0.3    # dampen 0.3 避免爆炸
-    （只在 |acf_lag1| > 0.05 時啟用）
-
-v1-v22 修正歷程
+v1-v23 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -64,7 +41,9 @@ v1-v22 修正歷程
   Fix-20  : chi2 tail amp + AR(1) direct => kurtosis 1.92（chi2 被 rescale 抵消）
   Fix-21  : chi2 tail amp 移到 rescale 後 + skew_mean_contribution
              => kurtosis 8.98✅ hurst 0.705✅ 但 std 膨脹 0.025、skew -0.83
-  Fix-22  : 回退 v18 骨架 + jump component + GARCH vol clustering + ACF lag-1
+  Fix-22  : 回退 v18 骨架 + jump + GARCH + ACF lag-1
+             => hurst✅ 但 kurtosis 2.02、skew -0.30
+  Fix-23  : Patch A additive AR(1) + Patch B body-only rescale + Patch C kurtosis p_t
 """
 
 from __future__ import annotations
@@ -92,11 +71,13 @@ class StatParams(TypedDict):
     hurst_target:     float
     wick_lambda:      float
     atr_mean:         float
-    # v22 新增
+    # v22 持續保留
     jump_freq:        float
     jump_std:         float
     vol_persistence:  float
     acf_lag1:         float
+    # v23 新增（generate 用）
+    target_ek:        float
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +141,6 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
 
 
 def _fit_jump_params(log_rets: np.ndarray, ret_std: float) -> tuple[float, float]:
-    """
-    特徵 A：Jump Component fitting
-    跳空定義：|r| > 3 * ret_std
-    """
     threshold  = 3.0 * ret_std
     jump_mask  = np.abs(log_rets) > threshold
     jump_count = int(np.sum(jump_mask))
@@ -172,15 +149,11 @@ def _fit_jump_params(log_rets: np.ndarray, ret_std: float) -> tuple[float, float
         jump_std = float(np.std(log_rets[jump_mask]))
     else:
         jump_std = float(ret_std * 3.0)
-    jump_std = max(jump_std, ret_std * 2.0)  # 下限：至少 2x 日常波動
+    jump_std = max(jump_std, ret_std * 2.0)
     return jump_freq, jump_std
 
 
 def _fit_vol_persistence(log_rets: np.ndarray, ret_mu: float) -> float:
-    """
-    特徵 B：GARCH-like vol clustering
-    用 ARCH(1) correlation 代理 vol_persistence
-    """
     resid    = log_rets - ret_mu
     resid_sq = resid ** 2
     if len(resid_sq) < 4:
@@ -192,10 +165,6 @@ def _fit_vol_persistence(log_rets: np.ndarray, ret_mu: float) -> float:
 
 
 def _fit_acf_lag1(log_rets: np.ndarray) -> float:
-    """
-    特徵 C：1-bar autocorrelation
-    正值 = momentum，負值 = mean-reversion
-    """
     if len(log_rets) < 4:
         return 0.0
     with warnings.catch_warnings():
@@ -226,10 +195,15 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
     h                  = hurst_exponent(log_rets)
     wick_lam, atr_mean = _fit_wick_lambda(df_history)
 
-    # v22 新增特徵
     jump_freq, jump_std  = _fit_jump_params(log_rets, ret_std)
     vol_persistence      = _fit_vol_persistence(log_rets, ret_mu)
     acf_lag1             = _fit_acf_lag1(log_rets)
+
+    # Patch C: 記錄 target excess kurtosis 供 generate 使用
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ek = float(stats.kurtosis(log_rets))  # excess kurtosis (Fisher)
+    target_ek = float(np.clip(ek, 0.5, 30.0))
 
     # trend bias（Fix-18 保留）
     if apply_trend_bias:
@@ -242,18 +216,19 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
         ret_std         = ret_std,
         ret_skew_a      = skew_a,
         ret_df          = df_t,
-        hurst_target    = float(np.clip(h, 0.3, 0.65)),
+        hurst_target    = float(np.clip(h, 0.3, 0.72)),   # 上限從 0.65→0.72
         wick_lambda     = wick_lam,
         atr_mean        = atr_mean,
         jump_freq       = jump_freq,
         jump_std        = jump_std,
         vol_persistence = vol_persistence,
         acf_lag1        = acf_lag1,
+        target_ek       = target_ek,
     )
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v22: v18 base + jump + GARCH vol + ACF lag-1)
+# 2. GENERATE  (v23: Patch A/B/C)
 # ---------------------------------------------------------------------------
 
 def generate(
@@ -264,32 +239,31 @@ def generate(
     drift_correction: float = 0.0,
 ) -> pd.DataFrame:
     """
-    v22 generate pipeline:
+    v23 generate pipeline:
 
-    Step 1 — mixture sampling (v18 不變)
-      p_t = clip(4 / df_t, 0.1, 0.6)
-      z_mix = where(Bernoulli(p_t), t_sample, skewnorm_sample)
+    Step 1 — Patch C: kurtosis-driven mixture sampling
+      target_ek = params["target_ek"]
+      t_ek      = 6 / max(df_t - 4, 0.1)
+      p_t       = clip(target_ek / t_ek, 0.10, 0.85)
+      z_mix     = where(Bernoulli(p_t), t_sample, skewnorm_sample)
 
-    Step 2 — AR(1) copula rank-remap (v18 不變)
-      rho = 2^(2h-1) - 1
-      u_ar1 = AR(1)(rho, eps)
-      z_final = z_mix_sorted[rank(u_ar1)]
+    Step 2 — Patch A: additive AR(1)（不再 rank-remap）
+      rho    = 2^(2h-1) - 1
+      z_ar[0] = z_mix[0]
+      z_ar[i] = rho * z_ar[i-1] + sqrt(1-rho^2) * z_mix[i]
+      => 保留 skewnorm 的邊際分佈
 
-    Step 3 — ACF lag-1 微調 (v22 新增特徵 C)
-      若 |acf_lag1| > 0.05：
-        z_adj[i] = z_final[i] + acf_lag1 * z_final[i-1] * 0.3
+    Step 3 — ACF lag-1 微調 (v22 保留)
 
-    Step 4 — GARCH-like vol clustering (v22 新增特徵 B)
-      h_t[0] = ret_std^2
-      h_t[i] = (1-alpha)*ret_std^2 + alpha*z_adj[i-1]^2
-      z_garch[i] = z_adj[i] * sqrt(h_t[i]) / ret_std
+    Step 4 — GARCH-like vol clustering (v22 保留)
 
-    Step 5 — rescale to (ret_mu + drift_correction, ret_std) (v18 不變)
+    Step 5 — rescale to (ret_mu + drift_correction, ret_std)
 
-    Step 6 — Jump injection (v22 新增特徵 A)
-      jump_mask = Bernoulli(jump_freq)
-      log_rets += where(jump_mask, Normal(0, jump_std), 0)
-      最後 rescale 保持 std 不膨脹
+    Step 6 — Patch B: jump 只壓縮 body
+      jump_mask  = Bernoulli(jump_freq)
+      log_rets  += where(jump_mask, Normal(0, jump_std), 0)
+      只對 ~jump_mask 的部分做 std rescale
+      jump 樣本完全保留 => kurtosis 不被消除
     """
     rng = np.random.default_rng(seed)
 
@@ -304,11 +278,13 @@ def generate(
     jump_std        = params["jump_std"]
     vol_persistence = params["vol_persistence"]
     acf_lag1        = params["acf_lag1"]
+    target_ek       = params["target_ek"]
 
     # ------------------------------------------------------------------
-    # Step 1: mixture sampling (v18)
+    # Step 1: Patch C — kurtosis-driven p_t
     # ------------------------------------------------------------------
-    p_t  = float(np.clip(4.0 / max(df_t, 2.01), 0.1, 0.6))
+    t_ek = 6.0 / max(df_t - 4.0, 0.1)          # t(df) excess kurtosis
+    p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.85))
     mask = rng.uniform(size=n_bars) < p_t
 
     sn_samples = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
@@ -318,32 +294,28 @@ def generate(
     z_mix = np.where(mask, t_samples, sn_samples)
 
     # ------------------------------------------------------------------
-    # Step 2: AR(1) copula rank-remap (v18)
+    # Step 2: Patch A — additive AR(1)，不做 rank-remap
     # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
-    eps = rng.standard_normal(n_bars)
-    if abs(rho) > 1e-6:
-        u_ar1    = np.empty(n_bars)
-        u_ar1[0] = eps[0]
+    if abs(rho) > 1e-6 and n_bars > 1:
         innov_sc = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+        z_ar     = np.empty(n_bars)
+        z_ar[0]  = z_mix[0]
         for i in range(1, n_bars):
-            u_ar1[i] = rho * u_ar1[i-1] + innov_sc * eps[i]
+            z_ar[i] = rho * z_ar[i - 1] + innov_sc * z_mix[i]
     else:
-        u_ar1 = eps.copy()
+        z_ar = z_mix.copy()
 
-    rank_ar1      = np.argsort(np.argsort(u_ar1))
-    z_mix_sorted  = np.sort(z_mix)
-    z_final       = z_mix_sorted[rank_ar1]
+    z_final = z_ar
 
     # ------------------------------------------------------------------
-    # Step 3: ACF lag-1 微調 (v22 特徵 C)
+    # Step 3: ACF lag-1 微調 (v22 保留)
     # ------------------------------------------------------------------
     if abs(acf_lag1) > 0.05 and n_bars > 1:
         _LAG1_DAMP = 0.3
         z_adj    = z_final.copy()
         for i in range(1, n_bars):
             z_adj[i] = z_final[i] + acf_lag1 * z_final[i-1] * _LAG1_DAMP
-        # 重新 normalize 保持 z 的 std=1
         z_std = float(np.std(z_adj))
         if z_std > 1e-10:
             z_adj = z_adj / z_std
@@ -351,17 +323,17 @@ def generate(
         z_adj = z_final
 
     # ------------------------------------------------------------------
-    # Step 4: GARCH-like vol clustering (v22 特徵 B)
+    # Step 4: GARCH-like vol clustering (v22 保留)
     # ------------------------------------------------------------------
-    alpha = vol_persistence  # ARCH(1) coefficient
+    alpha = vol_persistence
     if alpha > 0.01 and n_bars > 1:
-        base_var  = ret_std ** 2
-        h_t       = np.empty(n_bars)
-        h_t[0]    = base_var
-        z_garch   = np.empty(n_bars)
+        base_var   = ret_std ** 2
+        h_t        = np.empty(n_bars)
+        h_t[0]     = base_var
+        z_garch    = np.empty(n_bars)
         z_garch[0] = z_adj[0]
         for i in range(1, n_bars):
-            prev_ret  = z_garch[i-1] * ret_std  # 近似上一根實際 return
+            prev_ret  = z_garch[i-1] * ret_std
             h_t[i]    = (1.0 - alpha) * base_var + alpha * prev_ret ** 2
             vol_scale = float(np.sqrt(max(h_t[i], 1e-12)) / (ret_std + 1e-10))
             vol_scale = float(np.clip(vol_scale, 0.3, 3.0))
@@ -370,7 +342,7 @@ def generate(
         z_garch = z_adj
 
     # ------------------------------------------------------------------
-    # Step 5: single linear rescale to (ret_mu, ret_std) (v18)
+    # Step 5: single linear rescale to (ret_mu, ret_std)
     # ------------------------------------------------------------------
     z_mean = float(np.mean(z_garch))
     z_std  = float(np.std(z_garch))
@@ -382,18 +354,23 @@ def generate(
     log_rets = z_scaled.copy()
 
     # ------------------------------------------------------------------
-    # Step 6: Jump injection (v22 特徵 A)
-    # 在 rescale 之後注入，不被標準化消除
+    # Step 6: Patch B — jump 注入，只壓縮 body std
     # ------------------------------------------------------------------
+    jump_mask = np.zeros(n_bars, dtype=bool)
     if jump_freq > 0 and n_bars > 0:
         jump_mask  = rng.uniform(size=n_bars) < jump_freq
         jump_sizes = rng.normal(0.0, jump_std, size=n_bars)
         log_rets   = log_rets + np.where(jump_mask, jump_sizes, 0.0)
 
-        # 保持整體 std 不因 jump 膨脹：把 jump 貢獻分離出來再 rescale
-        body_std = float(np.std(log_rets - ret_mu))
-        if body_std > 1e-10 and body_std > ret_std * 1.05:
-            log_rets = (log_rets - ret_mu) * (ret_std / body_std) + ret_mu
+        # Patch B: 只對 body 部分做 rescale，jump 完全保留
+        body_mask = ~jump_mask
+        if body_mask.sum() > 10:
+            body_std = float(np.std(log_rets[body_mask] - ret_mu))
+            if body_std > ret_std * 1.1:
+                body_scale = ret_std / body_std
+                log_rets[body_mask] = (
+                    (log_rets[body_mask] - ret_mu) * body_scale + ret_mu
+                )
 
     # ------------------------------------------------------------------
     # Rebuild OHLC
@@ -540,6 +517,7 @@ def rolling_fit_generate(
                 f"jfreq={params['jump_freq']:.3f}  "
                 f"vp={params['vol_persistence']:.3f}  "
                 f"acf1={params['acf_lag1']:+.3f}  "
+                f"tgt_ek={params['target_ek']:.2f}  "
                 f"loss={loss:.4f}"
             )
             print(
