@@ -1,26 +1,25 @@
 """
-stat_process.py  v44
+stat_process.py  v45
 ====================
 純統計過程模型，完全不使用 agent。
 
-v44: 修復 v43 body-only renorm 導致 std 爆炸的 bug
-  - v43 bug：tail 做 mean_shift 時用的是 z_gjr 的 mean，
-    而 body 已用 body_mean/body_std 對齊，兩套參考點不一致，
-    尾部 shift 方向錯誤，導致尾部幅度乘以 GJR-GARCH scale 後完全失控。
-  - 修正：body renorm 完成後，對整體 z_scaled 再做一次
-    純 mean shift（不改變任何 std），確保 mean == ret_mu。
-  - 新增 tail hard-clip：z_scaled 每個元素 clip 在
-    [ret_mu - 8*ret_std, ret_mu + 8*ret_std]，
-    防止 jump + chi2 amp 疊加後出現物理上不合理的極端值。
-  - _TARGET_EK_MAX 維持 30（v43 的放寬）。
+v45: 三項修正，解決 v44 的 std+50%、skew 反轉、kurtosis+67% 問題
+  1. final exact rescale
+     - hard-clip 之後強制 (z - mean) / std * ret_std + ret_mu
+     - 直接保證輸出 std == ret_std、mean == ret_mu，不受任何前層影響
+  2. skew-aware chi2 amp
+     - 正尾 amp factor = base * (1 + clamp(skew_a/10, -0.5, 0.5))
+     - 負尾 amp factor = base * (1 - clamp(skew_a/10, -0.5, 0.5))
+     - skew_a > 0 → 正尾放大 > 負尾，恢復右偏
+  3. jump ↔ chi2 互斥
+     - target_ek < 5：完全跳過 chi2 amp
+     - target_ek >= 5 且做 chi2 amp：jump_freq_eff *= 0.25
 
-v43: body-only renorm（有 mean_shift bug，已修正）
-  - hard renorm 改為只對 body (|z - mu| < 2σ) 做 std 對齊
-  - _TARGET_EK_MAX 15 → 30
-
-v42: hard renorm patch — 修正 std_err_pct 12.5x overshoot
+v44: 修復 body-only renorm tail explosion + ±8σ hard-clip
+v43: body-only renorm（有 mean_shift bug，已修正於 v44）
+v42: hard renorm patch
 v41b: 修復 OnlineRidgePredictor._ridge_predict 括號 typo
-v41 patch: target_ek clip 30→15, HIGH_EK_THRESH 20→12, chi2 amp 4→2.5
+v41 patch: target_ek clip / HIGH_EK_THRESH / chi2 amp 上限
 v40: AdaptiveCalibrator 整合
 v1-v39: 見舊 docstring
 """
@@ -199,7 +198,7 @@ def _path_corr(real_closes, sim_closes):
 # 1. FIT
 # ---------------------------------------------------------------------------
 
-_TARGET_EK_MAX = 30.0   # v43: 15→30
+_TARGET_EK_MAX = 30.0
 
 
 def fit(
@@ -251,28 +250,22 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v44: 修復 body-only renorm tail explosion)
+# 2. GENERATE  (v45)
 #
-# v43 的 bug：
-#   body 用 body_mean/body_std 對齊後，tail 的 mean_shift 參考的是
-#   原始 z_gjr 的 mean，兩個座標系不對齊，導致尾部在已放大的幅度上
-#   再被錯誤平移，GJR-GARCH 累積後 std 爆炸到 0.68。
-#
-# v44 的修正：
-#   1. body renorm：(body - body_mean) / body_std * ret_std + ret_mu  [不變]
-#   2. tail renorm：保留相對於 z_scaled_body_mean 的偏差，再做 scale 壓縮
-#      tail 目標：讓 |tail - ret_mu| 在合理倍數內
-#      具體做法：tail = ret_mu + sign * |deviation_from_body_mean| * tail_scale
-#      tail_scale = ret_std / body_std（讓尾部也用 body 的 std 比例壓縮）
-#      但保留相對放大（尾部仍比 body 大）
-#   3. 全域 mean shift：body+tail renorm 後，整體 mean 微調到 ret_mu
-#   4. tail hard-clip：±8σ，防止 jump+chi2 疊加後物理上不合理
+# 修正摘要：
+#   Fix-1  final exact rescale
+#          hard-clip 後一次 (z-mean)/std*ret_std+ret_mu，保證 std==ret_std
+#   Fix-2  skew-aware chi2 amp
+#          正尾/負尾用不同的 amp factor，skew_a > 0 → 正尾 > 負尾 → 右偏
+#   Fix-3  jump ↔ chi2 互斥
+#          target_ek < 5: 不做 chi2 amp
+#          target_ek >= 5 且做 chi2: jump_freq_eff *= 0.25
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP     = 50
 _HIGH_EK_THRESH = 12.0
 _CHI2_AMP_MAX   = 2.5
-_TAIL_HARD_CLIP = 8.0   # v44: ±8σ hard clip
+_TAIL_HARD_CLIP = 8.0
 
 
 def generate(
@@ -299,11 +292,14 @@ def generate(
 
     total = n_bars + _AR1_WARMUP
 
+    # Fix-3: jump ↔ chi2 互斥 — 決定 chi2 是否啟用，並相應縮減 jump_freq
+    use_chi2_amp   = target_ek >= 5.0
+    jump_freq_eff  = jump_freq * 0.25 if use_chi2_amp else jump_freq
+
     HIGH_EK_THRESH = _HIGH_EK_THRESH
 
     # --- 基礎分佈採樣 ---
     if target_ek > HIGH_EK_THRESH:
-        use_nig    = False
         df_t_eff   = float(np.clip(df_t, 2.5, 8.0))
         t_ek_eff   = 6.0 / max(df_t_eff - 4.0, 0.1)
         p_t        = float(np.clip(target_ek / (t_ek_eff + 1e-8), 0.10, 0.98))
@@ -337,7 +333,6 @@ def generate(
                                       size=total, random_state=rng)
             z_raw = np.where(mask, t_samples, sn_samples)
     else:
-        use_nig = False
         t_ek = 6.0 / max(df_t - 4.0, 0.1)
         p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.92))
         mask       = rng.uniform(size=total) < p_t
@@ -401,15 +396,13 @@ def generate(
     else:
         z_gjr = z_adj
 
-    # --- v44: body-only renorm（修正版）---
-    # 步驟 1：識別 body / tail
+    # --- body-only renorm（v44 修正版） ---
     z_mean = float(np.mean(z_gjr))
     z_std  = float(np.std(z_gjr))
     if z_std > 1e-10:
         body_mask = np.abs(z_gjr - z_mean) < 2.0 * z_std
         z_scaled  = z_gjr.copy()
 
-        # 步驟 2：body 做精確 std 對齊
         if np.any(body_mask):
             body_mean = float(np.mean(z_gjr[body_mask]))
             body_std  = float(np.std(z_gjr[body_mask]))
@@ -419,30 +412,32 @@ def generate(
                 )
             else:
                 z_scaled[body_mask] = ret_mu
-        else:
-            body_std = z_std
 
-        # 步驟 3：tail 用相同 scale 壓縮（保留相對 body 的放大比例）
-        # tail_scale = ret_std / z_std，讓尾部和 body 用相同比例換算到真實 std 空間
         if np.any(~body_mask):
-            tail_scale = ret_std / z_std  # 統一比例，尾部比 body 大是因為原始 z 就大
+            tail_scale = ret_std / z_std
             z_scaled[~body_mask] = (
                 (z_gjr[~body_mask] - z_mean) * tail_scale + ret_mu
             )
 
-        # 步驟 4：全域 mean shift，確保 mean == ret_mu（body+tail 共同處理後的微調）
         cur_mean = float(np.mean(z_scaled))
         z_scaled += (ret_mu - cur_mean)
     else:
         z_scaled = np.full(n_bars, ret_mu)
 
-    # --- chi2 tail amp（在 body-only renorm 後進一步放大尾部）---
-    tail_threshold = 1.2 * ret_std
-    tail_mask      = np.abs(z_scaled - ret_mu) > tail_threshold
+    # --- Fix-2: skew-aware chi2 tail amp ---
+    # Fix-3: target_ek < 5 時完全跳過 chi2 amp
+    if use_chi2_amp and target_ek <= HIGH_EK_THRESH:
+        tail_threshold = 1.2 * ret_std
+        tail_mask      = np.abs(z_scaled - ret_mu) > tail_threshold
 
-    if target_ek <= HIGH_EK_THRESH:
         nu_raw   = 3.0 / max(df_t - 4.0, 0.1)
         nu_boost = float(np.clip(nu_raw, 0.5, 3.0))
+
+        # skew_a 決定正尾/負尾的放大比例
+        # skew_a > 0 → 正尾 factor 大 → 右偏；反之左偏
+        skew_factor = float(np.clip(skew_a / 10.0, -0.5, 0.5))
+        pos_tail_boost = 1.0 + skew_factor   # skew_a=+5 → 1.5x base
+        neg_tail_boost = 1.0 - skew_factor   # skew_a=+5 → 0.5x base
 
         if np.any(tail_mask):
             chi2_raw  = rng.chisquare(df=max(df_t, 3.0), size=int(np.sum(tail_mask)))
@@ -453,30 +448,42 @@ def generate(
                 np.clip(chi2_norm, 0.5, 5.0),
                 np.clip(chi2_norm, 0.5, 3.5),
             )
-            amp = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, _CHI2_AMP_MAX)
-            sign_mask = np.sign(z_scaled[tail_mask] - ret_mu)
+            base_amp   = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, _CHI2_AMP_MAX)
+            sign_mask  = np.sign(z_scaled[tail_mask] - ret_mu)
+
+            # 正尾/負尾分別套用不同 boost
+            directional_boost = np.where(sign_mask > 0, pos_tail_boost, neg_tail_boost)
+            amp = np.clip(1.0 + (base_amp - 1.0) * directional_boost, 0.5, _CHI2_AMP_MAX)
+
             z_scaled[tail_mask] = (
                 ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
             )
 
-    # --- jump ---
-    if jump_freq > 0 and n_bars > 0:
-        n_jumps = int(rng.binomial(n_bars, jump_freq))
+    # --- jump（Fix-3: 使用縮減後的 jump_freq_eff）---
+    if jump_freq_eff > 0 and n_bars > 0:
+        n_jumps = int(rng.binomial(n_bars, jump_freq_eff))
         if n_jumps > 0:
             jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
             jump_sizes = rng.normal(0.0, jump_std, size=n_jumps)
             z_scaled[jump_idx] += jump_sizes
 
-    # --- v44: tail hard-clip ±8σ（防止 jump+chi2 疊加後出現不合理極端值）---
-    clip_lo = ret_mu - _TAIL_HARD_CLIP * ret_std
-    clip_hi = ret_mu + _TAIL_HARD_CLIP * ret_std
-    z_scaled = np.clip(z_scaled, clip_lo, clip_hi)
+    # --- tail hard-clip ±8σ ---
+    clip_lo  = ret_mu - _TAIL_HARD_CLIP * ret_std
+    clip_hi  = ret_mu + _TAIL_HARD_CLIP * ret_std
+    z_clipped = np.clip(z_scaled, clip_lo, clip_hi)
+
+    # --- Fix-1: final exact rescale — 保證 std == ret_std、mean == ret_mu ---
+    z_cur_std = float(np.std(z_clipped))
+    if z_cur_std > 1e-10:
+        z_final_out = (z_clipped - float(np.mean(z_clipped))) / z_cur_std * ret_std + ret_mu
+    else:
+        z_final_out = np.full(n_bars, ret_mu)
 
     # --- 價格序列 ---
     prices    = np.empty(n_bars + 1)
     prices[0] = start_price
     for i in range(n_bars):
-        prices[i + 1] = prices[i] * np.exp(z_scaled[i])
+        prices[i + 1] = prices[i] * np.exp(z_final_out[i])
 
     opens  = prices[:-1].copy()
     closes = prices[1:].copy()
