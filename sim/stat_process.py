@@ -1,36 +1,31 @@
 """
-stat_process.py  v20
+stat_process.py  v21
 ====================
 純統計過程模型，完全不使用 agent。
 
-Fix-20 — 三項修改（針對 v19 剩餘問題）
+Fix-21 — 修正 v20 三個根因
 --------------------------------------
-修改一：chi2 variance-mixture tail amplifier（修復 kurtosis 持續偏低）
-  v19 的 GARCH 遞迴在 n_bars=20 時 warm-up 不足，無法有效放大尾部。
-  v20 改回對 z_mix 直接做 variance-mixture：
-    nu = max(df_t, 3.0)
-    chi2_scale = clip(sqrt(nu / chi2(nu)), 0.5, 4.0)
-    tail_mask = |z_norm| > 1.5
-    z_amplified = where(tail_mask, z_norm * chi2_scale, z_norm)
-  只放大 |z| > 1.5σ 的尾部，中心段不動，kurtosis 自然升高。
-  chi2_scale 的期望值 = 1（當 nu 很大時），不改變整體 std 的期望。
+根因一：chi2 tail amplifier 被 rescale 抵消（kurtosis 無效）
+  v20 在 rescale 之前做 chi2 放大，最後的 z-score rescale 把尾部壓回去了。
+  v21 把 chi2 tail amplifier 移到 rescale 之後（Step 5），
+  放大後不再被標準化消除，kurtosis 自然保留。
 
-修改二：skew_a amplifier x1.5（修復 skew 符號偏負）
-  v19 的 directed t-mixture 讓 skew 從 -0.377 收到 -0.104，
-  但目標是 +0.449。t 成分稀釋了 skewnorm 的偏態，
-  用 skew_a_amp = skew_a * 1.5 補償這個稀釋效果。
+根因二：全 z-score 標準化消除了 skew 的 mean offset（skew 符號丟失）
+  skewnorm 的 mean offset 是 skew 方向的訊號，
+  全 z-score (z - mean) / std 把這個訊號清零。
+  v21 標準化後把 skew_mean_contribution 還原：
+    skew_offset = z_mean_mix / (z_std_mix + 1e-10)
+    skew_mean_contribution = skew_offset * ret_std * 0.5  (dampen 0.5 防漂移)
+  最後 log_rets = z_scaled + ret_mu + skew_mean_contribution
 
-修改三：AR(1) 直接遞迴（修復 hurst 偏低）
-  v19 移除 rank-remap 後 hurst 從 0.688 降到 0.638。
-  rank-remap 破壞 kurtosis，直接遞迴不破壞：
-    z_ar[i] = rho * z_ar[i-1] + innov_scale * z_amplified[i]
-  z_amplified 的尾部形狀保留，時序相關由 rho 決定。
-  最後做一次 rescale 確保 std == ret_std。
+根因三：skew_a 放大倍數不足（skew 仍偏負）
+  保留 v20 的 skew_a * 1.5 amplifier。
 
 Fix-18 保留：soft anchor, drift_correction, trend_bias
 Fix-19 保留：directed t-mixture (|t| * sign(skew_a))
+Fix-20 保留：AR(1) direct recursion
 
-v1-v20 修正歷程
+v1-v21 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -48,6 +43,8 @@ v1-v20 修正歷程
   Fix-19  : GARCH(1,1) + directed t-mixture
              => skew -0.104 (接近 0) ✅  kurtosis 1.84 ❌  hurst 0.638 ❌
   Fix-20  : chi2 tail amp + skew_a*1.5 + AR(1) direct recursion
+             => kurtosis 1.92 ❌（chi2 被 rescale 抵消）skew -0.167 ❌
+  Fix-21  : chi2 tail amp 移到 rescale 後 + skew_mean_contribution
 """
 
 from __future__ import annotations
@@ -177,14 +174,17 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Fix-20)
+# 2. GENERATE  (Fix-21)
 # ---------------------------------------------------------------------------
 
 # skew amplifier：補償 t 成分對 skewnorm 偏態的稀釋
 _SKEW_AMP = 1.5
 
-# chi2 tail amplifier threshold：只放大 |z| > 此值的尾部
-_TAIL_THRESHOLD = 1.5
+# chi2 tail amplifier threshold（以 ret_std 為單位）
+_TAIL_THRESHOLD_SIGMA = 1.5
+
+# skew mean contribution dampen factor（防止 price 漂移）
+_SKEW_DAMPEN = 0.5
 
 
 def generate(
@@ -195,26 +195,29 @@ def generate(
     drift_correction: float = 0.0,
 ) -> pd.DataFrame:
     """
-    Fix-20 generate pipeline:
+    Fix-21 generate pipeline:
 
     Step 1 — directed t-mixture with amplified skew_a
-      skew_a_amp = skew_a * 1.5  (補償 t 成分稀釋)
-      p_t = clip(4 / df_t, 0.1, 0.6)
-      t_directed = |t| * sign(skew_a)  if |skew_a| > 0.3
-      z_mix = where(mask, t_directed, skewnorm(skew_a_amp))
+      skew_a_amp = skew_a * 1.5
+      z_mix = where(mask, |t|*sign(skew_a), skewnorm(skew_a_amp))
 
-    Step 2 — chi2 variance-mixture tail amplifier
-      nu = max(df_t, 3.0)
+    Step 2 — z-score normalize，保留 skew_mean_contribution
+      z_mean_mix = mean(z_mix)
+      z_norm = (z_mix - z_mean_mix) / std(z_mix)
+      skew_offset = z_mean_mix / std(z_mix)
+      skew_mean_contribution = skew_offset * ret_std * 0.5
+
+    Step 3 — AR(1) direct recursion
+      z_ar[i] = rho * z_ar[i-1] + innov_scale * z_norm[i]
+
+    Step 4 — rescale to ret_std（只 scale，不 z-score）
+      z_scaled = z_ar / std(z_ar) * ret_std
+
+    Step 5 — chi2 tail amplifier（在 rescale 之後，kurtosis 不被消除）
       chi2_scale = clip(sqrt(nu / chi2(nu)), 0.5, 4.0)
-      z_amplified = where(|z_norm| > 1.5, z_norm * chi2_scale, z_norm)
-      => kurtosis 升高，中心段不變
-
-    Step 3 — AR(1) direct recursion（保留時序相關）
-      rho = 2^(2h-1) - 1
-      z_ar[i] = rho * z_ar[i-1] + innov_scale * z_amplified[i]
-      => 不破壞 z_amplified 的尾部形狀
-
-    Step 4 — rescale to (ret_mu + drift_correction, ret_std)
+      tail_mask = |z_scaled| > 1.5 * ret_std
+      log_rets = where(tail_mask, z_scaled * chi2_scale, z_scaled)
+                 + ret_mu + skew_mean_contribution
     """
     rng = np.random.default_rng(seed)
 
@@ -230,15 +233,14 @@ def generate(
     # Step 1: directed t-mixture with amplified skew_a
     # ------------------------------------------------------------------
     skew_a_amp = float(np.clip(skew_a * _SKEW_AMP, -10.0, 10.0))
-    p_t   = float(np.clip(4.0 / max(df_t, 2.01), 0.1, 0.6))
-    mask  = rng.uniform(size=n_bars) < p_t
+    p_t  = float(np.clip(4.0 / max(df_t, 2.01), 0.1, 0.6))
+    mask = rng.uniform(size=n_bars) < p_t
 
     sn = stats.skewnorm.rvs(a=skew_a_amp, loc=0, scale=1,
                              size=n_bars, random_state=rng)
     t_raw = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
                          size=n_bars, random_state=rng)
 
-    # directed: t 成分與 skewnorm 同偏方向
     if abs(skew_a) > 0.3:
         t_directed = np.abs(t_raw) * float(np.sign(skew_a))
     else:
@@ -246,44 +248,52 @@ def generate(
 
     z_mix = np.where(mask, t_directed, sn)
 
-    # 標準化 z_mix
-    z_mean = float(np.mean(z_mix))
-    z_std  = float(np.std(z_mix))
-    if z_std > 1e-10:
-        z_norm = (z_mix - z_mean) / z_std
+    # ------------------------------------------------------------------
+    # Step 2: z-score normalize，但保留 skew mean offset
+    # ------------------------------------------------------------------
+    z_mean_mix = float(np.mean(z_mix))
+    z_std_mix  = float(np.std(z_mix))
+    if z_std_mix > 1e-10:
+        z_norm      = (z_mix - z_mean_mix) / z_std_mix
+        skew_offset = z_mean_mix / z_std_mix
     else:
-        z_norm = z_mix.copy()
+        z_norm      = z_mix.copy()
+        skew_offset = 0.0
+
+    # skew 方向的 mean 貢獻（dampen 防止 price 漂移）
+    skew_mean_contribution = skew_offset * ret_std * _SKEW_DAMPEN
 
     # ------------------------------------------------------------------
-    # Step 2: chi2 variance-mixture tail amplifier
+    # Step 3: AR(1) direct recursion
+    # ------------------------------------------------------------------
+    rho         = _ar1_hurst_rho(hurst)
+    innov_scale = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+
+    z_ar    = np.empty(n_bars)
+    z_ar[0] = z_norm[0]
+    for i in range(1, n_bars):
+        z_ar[i] = rho * z_ar[i - 1] + innov_scale * z_norm[i]
+
+    # ------------------------------------------------------------------
+    # Step 4: rescale to ret_std（只 scale，不做完整 z-score）
+    # ------------------------------------------------------------------
+    z_ar_std = float(np.std(z_ar))
+    if z_ar_std > 1e-10:
+        z_scaled = z_ar / z_ar_std * ret_std
+    else:
+        z_scaled = np.full(n_bars, 0.0)
+
+    # ------------------------------------------------------------------
+    # Step 5: chi2 tail amplifier（在 rescale 之後）
     # ------------------------------------------------------------------
     nu         = max(float(df_t), 3.0)
     chi2_draw  = rng.chisquare(nu, size=n_bars)
     chi2_scale = np.clip(np.sqrt(nu / np.maximum(chi2_draw, 1e-8)), 0.5, 4.0)
 
-    tail_mask   = np.abs(z_norm) > _TAIL_THRESHOLD
-    z_amplified = np.where(tail_mask, z_norm * chi2_scale, z_norm)
+    tail_mask = np.abs(z_scaled) > _TAIL_THRESHOLD_SIGMA * ret_std
+    z_tailed  = np.where(tail_mask, z_scaled * chi2_scale, z_scaled)
 
-    # ------------------------------------------------------------------
-    # Step 3: AR(1) direct recursion（保留尾部形狀 + 加入時序相關）
-    # ------------------------------------------------------------------
-    rho          = _ar1_hurst_rho(hurst)
-    innov_scale  = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
-
-    z_ar    = np.empty(n_bars)
-    z_ar[0] = z_amplified[0]
-    for i in range(1, n_bars):
-        z_ar[i] = rho * z_ar[i - 1] + innov_scale * z_amplified[i]
-
-    # ------------------------------------------------------------------
-    # Step 4: rescale to (ret_mu, ret_std)
-    # ------------------------------------------------------------------
-    z_ar_mean = float(np.mean(z_ar))
-    z_ar_std  = float(np.std(z_ar))
-    if z_ar_std > 1e-10:
-        log_rets = (z_ar - z_ar_mean) / z_ar_std * ret_std + ret_mu
-    else:
-        log_rets = np.full(n_bars, ret_mu)
+    log_rets = z_tailed + ret_mu + skew_mean_contribution
 
     # ------------------------------------------------------------------
     # Rebuild OHLC
