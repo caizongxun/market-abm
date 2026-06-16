@@ -1,24 +1,28 @@
 """
-stat_process.py  v26
+stat_process.py  v27
 ====================
 純統計過程模型，完全不使用 agent。
 
-v26 新增（v25 骨架不動）：
+v27 三項 fix（v26 骨架不動）：
 ------------------------------------------------------
-方向 A — variance-mixture tail booster（generate()）
-  在 z_scaled 完成後、jump 之前插入：
-  - 對 |z - ret_mu| > 1.5*ret_std 的尾部樣本乘 chi2 scaling factor
-  - chi2_scale = sqrt(nu_boost / chi2(nu_boost)), nu_boost = max(ret_df*0.5, 3.0)
-  - clip chi2_scale 到 (0.5, 2.5)
-  - 事後 body-only rescale：確保非跳躍 bar 的 std 回到 ret_std，不膨脹
-  目標：kurtosis 從 2.9 拉高，同時 std 不受影響
+Fix-A  全局 std 正規化
+  chi2 boost 完之後、jump 之前插入：
+  global_std = np.std(z_scaled)
+  z_scaled *= ret_std / global_std
+  強制對齊整體 std，kurtosis 形狀不受影響。
 
-方向 B — target_ek 加入 predictor（adaptive_params.py）
-  TARGET_NAMES 新增 target_ek 為第 4 個預測目標
-  Ridge 學習何時市場尾部特別肥，自適應調整 p_t 的上游參數
-  predict_and_blend() blend target_ek，clip 到 (1.0, 25.0)
+Fix-B  激進 nu_boost
+  nu_boost = clip(ret_df * 0.3, 2.5, 8.0)
+  比 v26 的 max(ret_df*0.5, 3.0) 更小的 nu => 更肥的尾部
+  chi2_scale clip 同步放寬到 (0.5, 3.5)
 
-v1-v26 修正歷程
+Fix-C  skew 符號保護
+  boost 完、全局 rescale 之後，計算 sample skew
+  若 sign(sample_skew) != sign(skew_a)，對 ret_mu 做 mirror flip：
+  log_rets = ret_mu - (log_rets - ret_mu)
+  只翻轉符號，不改變 std 或 kurtosis。
+
+v1-v27 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -41,7 +45,10 @@ v1-v26 修正歷程
   Fix-25  : OnlineRidgePredictor => skew +0.023✅ hurst 0.717✅ 方向命中率 0.516✅
              kurtosis 2.90 退步
   Fix-26  : variance-mixture tail booster + target_ek in predictor
-             => 目標 kurtosis 7+ 同時 std 不膨脹
+             => kurtosis 5.43✅↑ hurst 0.719✅ std 膨脹 1.858 skew -0.203 仍偏負
+  Fix-27  : Fix-A global std rescale + Fix-B aggressive nu_boost +
+             Fix-C skew sign protection
+             => 目標 kurtosis 8+ std≈real skew符號正確
 """
 
 from __future__ import annotations
@@ -226,7 +233,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v26: + variance-mixture tail booster)
+# 2. GENERATE  (v27: Fix-A + Fix-B + Fix-C)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -313,39 +320,59 @@ def generate(
         z_scaled = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
-    # v26: variance-mixture tail booster
-    # 只作用在尾部 (|z - mu| > 1.5*std)，中心段不動
-    # chi2_scale ~ sqrt(nu/chi2(nu))，等價於 Student-t 的 variance mixing
-    # 事後 body-only rescale 確保 std 不膨脹
+    # v26/v27: variance-mixture tail booster
+    # Fix-B: nu_boost = clip(df_t * 0.3, 2.5, 8.0)  —— 比 v26 更激進
+    # chi2_scale clip 放寬到 (0.5, 3.5)
     # ------------------------------------------------------------------
-    tail_threshold = 1.5 * ret_std
+    tail_threshold  = 1.5 * ret_std
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
 
     if tail_mask_boost.sum() >= 2:
-        nu_boost = float(np.clip(df_t * 0.5, 3.0, 15.0))
+        # Fix-B: 更小的 nu => 更肥的 chi2 尾部
+        nu_boost   = float(np.clip(df_t * 0.3, 2.5, 8.0))
         chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
-        chi2_scale = np.clip(chi2_scale, 0.5, 2.5)
+        chi2_scale = np.clip(chi2_scale, 0.5, 3.5)   # v27: 放寬上限
 
-        z_boosted = z_scaled.copy()
-        # 圍繞 ret_mu 做尾部放大，保留方向
-        tail_vals = z_scaled[tail_mask_boost]
+        z_boosted  = z_scaled.copy()
+        tail_vals  = z_scaled[tail_mask_boost]
         z_boosted[tail_mask_boost] = ret_mu + (tail_vals - ret_mu) * chi2_scale
 
-        # body-only rescale：讓非尾部 bar 的 std 回到 ret_std
+        # body-only rescale（保留自 v26）
         body_mask = ~tail_mask_boost
         if body_mask.sum() > 5:
             body_vals = z_boosted[body_mask]
             body_std  = float(np.std(body_vals - ret_mu))
             if body_std > 1e-10:
                 target_body_std = ret_std * float(np.sqrt(1.0 - p_t * 0.3))
-                body_scale = target_body_std / body_std
-                body_scale = float(np.clip(body_scale, 0.5, 2.0))
+                body_scale = float(np.clip(target_body_std / body_std, 0.5, 2.0))
                 z_boosted[body_mask] = ret_mu + (body_vals - ret_mu) * body_scale
 
         z_scaled = z_boosted
-    # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Fix-A: 全局 std 正規化
+    # boost 完之後強制 std = ret_std，保留 kurtosis 形狀
+    # ------------------------------------------------------------------
+    global_std = float(np.std(z_scaled))
+    if global_std > 1e-8:
+        z_scaled = ret_mu + (z_scaled - ret_mu) * (ret_std / global_std)
+
+    # ------------------------------------------------------------------
+    # Fix-C: skew 符號保護
+    # 若 sample skew 與 skew_a 符號不一致，對 ret_mu 做 mirror
+    # 只翻轉偏態方向，std / kurtosis 不受影響
+    # ------------------------------------------------------------------
+    if abs(skew_a) > 0.2:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sample_skew = float(stats.skew(z_scaled))
+        target_sign = int(np.sign(skew_a))
+        actual_sign = int(np.sign(sample_skew))
+        if actual_sign != 0 and actual_sign != target_sign:
+            z_scaled = ret_mu - (z_scaled - ret_mu)
+
+    # ------------------------------------------------------------------
     log_rets = z_scaled.copy()
 
     jump_mask = np.zeros(n_bars, dtype=bool)
@@ -388,7 +415,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. ROLLING FIT -> GENERATE  (v25 邏輯不動，v26 只新增 use_adaptive 路徑)
+# 3. ROLLING FIT -> GENERATE  (v25 邏輯不動，v27 只繼承 use_adaptive 路徑)
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
