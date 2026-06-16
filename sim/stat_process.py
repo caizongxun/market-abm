@@ -1,31 +1,26 @@
 """
-stat_process.py  v23
+stat_process.py  v24
 ====================
 純統計過程模型，完全不使用 agent。
 
-v23 三項精準 patch（v18 骨架其餘不動）：
+v24 三項精準修改（v23 骨架其餘不動）：
 ------------------------------------------------------
 
-Patch A：additive AR(1)，不做 rank-remap（解決 skew 翻轉）
-  rank-remap 會破壞 skewnorm 邊際的非對稱性。
-  改為 additive AR(1)：
-    z_ar[0] = z_mix[0]
-    z_ar[i] = rho * z_ar[i-1] + sqrt(1-rho^2) * z_mix[i]
-  z_ar 保持 z_mix 的邊際分佈（含 skew），同時引入 AR(1) 自相關。
+Fix 1：AR(1) warm-up 50 步（解決 skew transient bias）
+  additive AR(1) 在 n_bars=20 的短 window 中，
+  前幾 bar 的 transient 偏差佔比 25%，破壞 skewnorm 邊際 skew。
+  修正：先跑 50 步 warm-up 讓序列達到 stationary，再取後 n_bars 段。
 
-Patch B：jump 只壓縮 body，不壓縮 jump 本身（保留 kurtosis）
-  原 v22 在 jump 注入後對整體 std 做 rescale → 把 kurtosis 壓掉。
-  改為：只對非 jump 的 body 部分做 rescale，jump 樣本完全保留。
+Fix 2：target_ek 用全局下限補正（解決 kurtosis 低估）
+  60-bar window 的樣本 kurtosis 普遍低於全局值（865 bar 為 10.6）。
+  rolling_fit_generate() 先算完整序列的 kurtosis 作為 global_ek_floor，
+  fit() 新增 ek_global_floor 參數，target_ek = max(window_ek, floor)。
+  預設 floor=3.0，rolling 時傳入實際全局值。
 
-Patch C：kurtosis-driven p_t（提高 t-mixture 比例）
-  原 p_t = 4/df，對高 df 的 window 比例過低。
-  改為由實際資料的 excess kurtosis 反推：
-    target_ek = max(kurtosis(log_rets), 0.5)
-    t_ek      = 6 / max(df - 4, 0.1)   # t(df) excess kurtosis
-    p_t       = clip(target_ek / t_ek, 0.1, 0.85)
-  df=10, target_ek=7.6 → p_t≈0.76（原本只有 0.40）
+Fix 3：hurst clip 上限從 0.72 降回 0.69
+  v23 調到 0.72 導致 sim hurst=0.74 偏高，改回 clip(h, 0.3, 0.69)。
 
-v1-v23 修正歷程
+v1-v24 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -38,12 +33,12 @@ v1-v23 修正歷程
   Fix-17  : 雙層 rank-remap => 結構正確但 kurtosis 偏低
   Fix-18  : soft anchor + mixture model + trend bias => hurst✅ 方向命中率✅
   Fix-19  : GARCH + directed t-mixture => skew 接近 0 但 kurtosis 1.84
-  Fix-20  : chi2 tail amp + AR(1) direct => kurtosis 1.92（chi2 被 rescale 抵消）
-  Fix-21  : chi2 tail amp 移到 rescale 後 + skew_mean_contribution
-             => kurtosis 8.98✅ hurst 0.705✅ 但 std 膨脹 0.025、skew -0.83
-  Fix-22  : 回退 v18 骨架 + jump + GARCH + ACF lag-1
-             => hurst✅ 但 kurtosis 2.02、skew -0.30
-  Fix-23  : Patch A additive AR(1) + Patch B body-only rescale + Patch C kurtosis p_t
+  Fix-20  : chi2 tail amp + AR(1) direct => kurtosis 1.92
+  Fix-21  : chi2 tail amp 移到 rescale 後 => kurtosis 8.98 但 std 膨脹、skew -0.83
+  Fix-22  : 回退 v18 + jump + GARCH + ACF => hurst✅ 但 kurtosis 2.02、skew -0.30
+  Fix-23  : additive AR(1) + body-only rescale + kurtosis-driven p_t
+             => kurtosis 3.97✅↑ hurst 0.74 偏高 skew -0.24
+  Fix-24  : AR(1) warmup + global ek floor + hurst clip 0.69
 """
 
 from __future__ import annotations
@@ -71,12 +66,10 @@ class StatParams(TypedDict):
     hurst_target:     float
     wick_lambda:      float
     atr_mean:         float
-    # v22 持續保留
     jump_freq:        float
     jump_std:         float
     vol_persistence:  float
     acf_lag1:         float
-    # v23 新增（generate 用）
     target_ek:        float
 
 
@@ -181,7 +174,11 @@ def _ar1_hurst_rho(h: float) -> float:
 # 1. FIT
 # ---------------------------------------------------------------------------
 
-def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
+def fit(
+    df_history:      pd.DataFrame,
+    apply_trend_bias: bool = True,
+    ek_global_floor:  float = 3.0,   # Fix 2: global kurtosis floor
+) -> StatParams:
     closes   = df_history["Close"].values
     log_rets = _log_returns(closes)
     if len(log_rets) < 5:
@@ -195,17 +192,17 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
     h                  = hurst_exponent(log_rets)
     wick_lam, atr_mean = _fit_wick_lambda(df_history)
 
-    jump_freq, jump_std  = _fit_jump_params(log_rets, ret_std)
-    vol_persistence      = _fit_vol_persistence(log_rets, ret_mu)
-    acf_lag1             = _fit_acf_lag1(log_rets)
+    jump_freq, jump_std = _fit_jump_params(log_rets, ret_std)
+    vol_persistence     = _fit_vol_persistence(log_rets, ret_mu)
+    acf_lag1            = _fit_acf_lag1(log_rets)
 
-    # Patch C: 記錄 target excess kurtosis 供 generate 使用
+    # Fix 2: target_ek = max(window sample kurtosis, global floor)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ek = float(stats.kurtosis(log_rets))  # excess kurtosis (Fisher)
-    target_ek = float(np.clip(ek, 0.5, 30.0))
+        ek = float(stats.kurtosis(log_rets))  # Fisher excess kurtosis
+    target_ek = float(max(np.clip(ek, 0.5, 30.0), ek_global_floor))
 
-    # trend bias（Fix-18 保留）
+    # trend bias (Fix-18 保留)
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
         trend_bias = float(np.sign(real_trend) * abs(ret_mu) * 0.3)
@@ -216,7 +213,7 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
         ret_std         = ret_std,
         ret_skew_a      = skew_a,
         ret_df          = df_t,
-        hurst_target    = float(np.clip(h, 0.3, 0.72)),   # 上限從 0.65→0.72
+        hurst_target    = float(np.clip(h, 0.3, 0.69)),  # Fix 3: 上限 0.69
         wick_lambda     = wick_lam,
         atr_mean        = atr_mean,
         jump_freq       = jump_freq,
@@ -228,8 +225,11 @@ def fit(df_history: pd.DataFrame, apply_trend_bias: bool = True) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v23: Patch A/B/C)
+# 2. GENERATE  (v24)
 # ---------------------------------------------------------------------------
+
+_AR1_WARMUP = 50  # Fix 1: warmup steps
+
 
 def generate(
     params:           StatParams,
@@ -239,31 +239,14 @@ def generate(
     drift_correction: float = 0.0,
 ) -> pd.DataFrame:
     """
-    v23 generate pipeline:
+    v24 generate pipeline:
 
-    Step 1 — Patch C: kurtosis-driven mixture sampling
-      target_ek = params["target_ek"]
-      t_ek      = 6 / max(df_t - 4, 0.1)
-      p_t       = clip(target_ek / t_ek, 0.10, 0.85)
-      z_mix     = where(Bernoulli(p_t), t_sample, skewnorm_sample)
-
-    Step 2 — Patch A: additive AR(1)（不再 rank-remap）
-      rho    = 2^(2h-1) - 1
-      z_ar[0] = z_mix[0]
-      z_ar[i] = rho * z_ar[i-1] + sqrt(1-rho^2) * z_mix[i]
-      => 保留 skewnorm 的邊際分佈
-
-    Step 3 — ACF lag-1 微調 (v22 保留)
-
-    Step 4 — GARCH-like vol clustering (v22 保留)
-
-    Step 5 — rescale to (ret_mu + drift_correction, ret_std)
-
-    Step 6 — Patch B: jump 只壓縮 body
-      jump_mask  = Bernoulli(jump_freq)
-      log_rets  += where(jump_mask, Normal(0, jump_std), 0)
-      只對 ~jump_mask 的部分做 std rescale
-      jump 樣本完全保留 => kurtosis 不被消除
+    Step 1  Patch C: kurtosis-driven p_t (v23)
+    Step 2  Fix 1: additive AR(1) with 50-step warmup
+    Step 3  ACF lag-1 微調 (v22)
+    Step 4  GARCH vol clustering (v22)
+    Step 5  rescale to (ret_mu, ret_std)
+    Step 6  Patch B: jump body-only rescale (v23)
     """
     rng = np.random.default_rng(seed)
 
@@ -281,41 +264,42 @@ def generate(
     target_ek       = params["target_ek"]
 
     # ------------------------------------------------------------------
-    # Step 1: Patch C — kurtosis-driven p_t
+    # Step 1: kurtosis-driven p_t (Patch C, v23)
     # ------------------------------------------------------------------
-    t_ek = 6.0 / max(df_t - 4.0, 0.1)          # t(df) excess kurtosis
+    t_ek = 6.0 / max(df_t - 4.0, 0.1)
     p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.85))
-    mask = rng.uniform(size=n_bars) < p_t
 
+    total = n_bars + _AR1_WARMUP
+    mask       = rng.uniform(size=total) < p_t
     sn_samples = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
-                                    size=n_bars, random_state=rng)
+                                    size=total, random_state=rng)
     t_samples  = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
-                              size=n_bars, random_state=rng)
-    z_mix = np.where(mask, t_samples, sn_samples)
+                              size=total, random_state=rng)
+    z_mix_ext = np.where(mask, t_samples, sn_samples)
 
     # ------------------------------------------------------------------
-    # Step 2: Patch A — additive AR(1)，不做 rank-remap
+    # Step 2: Fix 1 — additive AR(1) with warmup
     # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
-    if abs(rho) > 1e-6 and n_bars > 1:
-        innov_sc = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
-        z_ar     = np.empty(n_bars)
-        z_ar[0]  = z_mix[0]
-        for i in range(1, n_bars):
-            z_ar[i] = rho * z_ar[i - 1] + innov_sc * z_mix[i]
+    if abs(rho) > 1e-6:
+        innov_sc   = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+        z_ar_ext   = np.empty(total)
+        z_ar_ext[0] = z_mix_ext[0]
+        for i in range(1, total):
+            z_ar_ext[i] = rho * z_ar_ext[i - 1] + innov_sc * z_mix_ext[i]
+        z_ar = z_ar_ext[_AR1_WARMUP:]   # 捨棄 warmup 段
     else:
-        z_ar = z_mix.copy()
+        z_ar = z_mix_ext[_AR1_WARMUP:].copy()
 
     z_final = z_ar
 
     # ------------------------------------------------------------------
-    # Step 3: ACF lag-1 微調 (v22 保留)
+    # Step 3: ACF lag-1 微調 (v22)
     # ------------------------------------------------------------------
     if abs(acf_lag1) > 0.05 and n_bars > 1:
-        _LAG1_DAMP = 0.3
-        z_adj    = z_final.copy()
+        z_adj = z_final.copy()
         for i in range(1, n_bars):
-            z_adj[i] = z_final[i] + acf_lag1 * z_final[i-1] * _LAG1_DAMP
+            z_adj[i] = z_final[i] + acf_lag1 * z_final[i - 1] * 0.3
         z_std = float(np.std(z_adj))
         if z_std > 1e-10:
             z_adj = z_adj / z_std
@@ -323,7 +307,7 @@ def generate(
         z_adj = z_final
 
     # ------------------------------------------------------------------
-    # Step 4: GARCH-like vol clustering (v22 保留)
+    # Step 4: GARCH vol clustering (v22)
     # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.01 and n_bars > 1:
@@ -333,16 +317,17 @@ def generate(
         z_garch    = np.empty(n_bars)
         z_garch[0] = z_adj[0]
         for i in range(1, n_bars):
-            prev_ret  = z_garch[i-1] * ret_std
-            h_t[i]    = (1.0 - alpha) * base_var + alpha * prev_ret ** 2
-            vol_scale = float(np.sqrt(max(h_t[i], 1e-12)) / (ret_std + 1e-10))
-            vol_scale = float(np.clip(vol_scale, 0.3, 3.0))
+            prev_ret   = z_garch[i - 1] * ret_std
+            h_t[i]     = (1.0 - alpha) * base_var + alpha * prev_ret ** 2
+            vol_scale  = float(np.clip(
+                np.sqrt(max(h_t[i], 1e-12)) / (ret_std + 1e-10), 0.3, 3.0
+            ))
             z_garch[i] = z_adj[i] * vol_scale
     else:
         z_garch = z_adj
 
     # ------------------------------------------------------------------
-    # Step 5: single linear rescale to (ret_mu, ret_std)
+    # Step 5: rescale to (ret_mu, ret_std)
     # ------------------------------------------------------------------
     z_mean = float(np.mean(z_garch))
     z_std  = float(np.std(z_garch))
@@ -354,7 +339,7 @@ def generate(
     log_rets = z_scaled.copy()
 
     # ------------------------------------------------------------------
-    # Step 6: Patch B — jump 注入，只壓縮 body std
+    # Step 6: jump injection, body-only rescale (Patch B, v23)
     # ------------------------------------------------------------------
     jump_mask = np.zeros(n_bars, dtype=bool)
     if jump_freq > 0 and n_bars > 0:
@@ -362,7 +347,6 @@ def generate(
         jump_sizes = rng.normal(0.0, jump_std, size=n_bars)
         log_rets   = log_rets + np.where(jump_mask, jump_sizes, 0.0)
 
-        # Patch B: 只對 body 部分做 rescale，jump 完全保留
         body_mask = ~jump_mask
         if body_mask.sum() > 10:
             body_std = float(np.std(log_rets[body_mask] - ret_mu))
@@ -415,6 +399,13 @@ def rolling_fit_generate(
     if n_forward is None:
         n_forward = step
 
+    # Fix 2: 先算完整序列的 kurtosis 作為 global floor
+    full_rets = _log_returns(df_real["Close"].values)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        global_ek = float(stats.kurtosis(full_rets))
+    ek_floor = float(np.clip(global_ek, 3.0, 20.0))
+
     n_total    = len(df_real)
     sim_chunks: list[pd.DataFrame] = []
     param_log:  list[dict]         = []
@@ -431,9 +422,9 @@ def rolling_fit_generate(
             break
 
         df_window = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
-        params    = fit(df_window, apply_trend_bias=True)
+        params    = fit(df_window, apply_trend_bias=True, ek_global_floor=ek_floor)
 
-        # soft anchor（Fix-18 保留）
+        # soft anchor
         real_close = float(df_real["Close"].iloc[fit_end - 1])
         if sim_last_close is None or real_anchor_weight >= 1.0:
             start_px = real_close
@@ -446,7 +437,7 @@ def rolling_fit_generate(
                 + w * np.log(max(real_close, 1e-10))
             ))
 
-        # drift_correction（Fix-18 保留）
+        # drift_correction
         next_real_idx  = min(fwd_end, n_total - 1)
         next_real_open = float(df_real["Open"].iloc[next_real_idx])
         if actual_fwd > 0 and start_px > 0 and next_real_open > 0:
@@ -475,7 +466,6 @@ def rolling_fit_generate(
         else:
             loss = 0.0
 
-        # OHLC comparison log
         real_o = float(real_fwd["Open"].iloc[0])   if len(real_fwd) > 0 else float("nan")
         real_h = float(real_fwd["High"].max())      if len(real_fwd) > 0 else float("nan")
         real_l = float(real_fwd["Low"].min())       if len(real_fwd) > 0 else float("nan")
@@ -493,8 +483,8 @@ def rolling_fit_generate(
             "fit_bars": [fit_start, fit_end],
             "fwd_bars": [pos, fwd_end],
             **{k: params[k] for k in params},
-            "drift_corr":      round(drift_corr, 6),
-            "loss":            round(loss, 4),
+            "drift_corr":  round(drift_corr, 6),
+            "loss":        round(loss, 4),
             "ohlc_real": {"O": round(real_o,2), "H": round(real_h,2),
                           "L": round(real_l,2), "C": round(real_c,2)},
             "ohlc_sim":  {"O": round(sim_o,2),  "H": round(sim_h,2),
