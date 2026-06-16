@@ -1,26 +1,17 @@
 """
-stat_process.py  v47
+stat_process.py  v48
 ====================
 純統計過程模型，完全不使用 agent。
 
+v48 fixes (3 targeted patches):
+  1. std inflation  – rolling concat 後加一次全局 exact-std-rescale；
+                      GARCH vol_scale 上限 1.5→1.3 防止 per-chunk 爆炸。
+  2. skew sign flip – b_nig 改用 stats.skew(log_rets) 計算，
+                      不再用 skewnorm shape 參數（兩者符號定義不同）。
+  3. kurtosis overshoot – NIG 啟動門檻 target_ek > 10 → > 15。
+
 v47: 加入成交量（Volume）的 fit / generate
-  新增 StatParams 欄位：
-    vol_log_mean  – mean(log(Volume)) in fitting window
-    vol_log_std   – std(log(Volume))  in fitting window
-    vol_ret_beta  – OLS: log(V_t) ~ beta * |ret_t|  (vol-return coupling)
-    vol_ar1       – AR(1) on log-volume residuals  (volume clustering)
-
-  generate() 新增 Step 8：
-    1. lognormal base：u_i ~ N(vol_log_mean, vol_log_std)
-    2. vol-return 耦合：u_i += vol_ret_beta * |z_final_i|
-    3. AR(1) 自相關殘差聚集
-    4. exp() → round → int64  (Volume 欄)
-
-  生成的 DataFrame 現在包含 Open / High / Low / Close / Volume。
-
-v46: 重寫 generate()
-  – 改為對稱 GARCH(1,1)，拿掉 GJR 非對稱項
-  – 拿掉 body-only renorm / chi2 amp，改為最後一次 exact rescale
+v46: 重寫 generate()：對稱 GARCH(1,1) + exact rescale
 v1-v45: 見舊 docstring
 """
 
@@ -58,10 +49,12 @@ class StatParams(TypedDict):
     acf_lag1:         float
     target_ek:        float
     # --- v47: volume params ---
-    vol_log_mean:     float   # mean of log(Volume) in fitting window
-    vol_log_std:      float   # std  of log(Volume) in fitting window
-    vol_ret_beta:     float   # OLS coef: log(V) ~ beta * |ret|
-    vol_ar1:          float   # AR(1) coef on log-vol residuals
+    vol_log_mean:     float
+    vol_log_std:      float
+    vol_ret_beta:     float
+    vol_ar1:          float
+    # --- v48: carry raw skew for NIG ---
+    ret_skew_raw:     float   # stats.skew(log_rets)
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +154,21 @@ def _ar1_hurst_rho(h):
     return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
 
 
-def _nig_params_from_moments(std, skew, kurt_excess):
+def _nig_params_from_moments(std, skew_raw, kurt_excess):
+    """
+    v48 fix: use raw moment skewness (stats.skew) directly for b_nig.
+    Previously used skewnorm shape parameter `a` which has a different
+    sign convention and can flip the tail direction.
+    """
     if kurt_excess < 0.5:
         return None
     try:
         a_est = float(np.sqrt(3.0 / max(kurt_excess, 0.1)))
         a_est = float(np.clip(a_est, 0.15, 5.0))
-        b_est = float(skew * a_est / 3.0)
+        # b_nig controls skewness in NIG: positive b → right tail
+        # Moment skewness of NIG = 3 * b / (a * sqrt(a^2 - b^2)) * (something)
+        # Simple approximation: b ≈ skew_raw * a / 3
+        b_est = float(skew_raw * a_est / 3.0)
         b_est = float(np.clip(b_est, -0.95 * a_est, 0.95 * a_est))
         return a_est, b_est
     except Exception:
@@ -204,34 +205,20 @@ def _path_corr(real_closes, sim_closes):
 # ---------------------------------------------------------------------------
 
 def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
-    """
-    從 df_ohlc 擬合成交量模型參數。
-    要求 df_ohlc 含 Volume 欄，且 len(df_ohlc) == len(log_rets) + 1
-    （log_rets 是 diff(log(Close))，比 close 序列少一筆）。
-
-    回傳：
-        vol_log_mean  – 對數成交量均值
-        vol_log_std   – 對數成交量標準差
-        vol_ret_beta  – OLS: log(V[1:]) ~ beta * |ret|  （vol-return coupling）
-        vol_ar1       – AR(1) on log-volume 殘差  （volume clustering）
-    """
     if "Volume" not in df_ohlc.columns:
         return 0.0, 1.0, 0.0, 0.0
 
     raw_vol = df_ohlc["Volume"].values.astype(float)
-    raw_vol = np.maximum(raw_vol, 1.0)   # 防止 log(0)
+    raw_vol = np.maximum(raw_vol, 1.0)
     log_v   = np.log(raw_vol)
 
     vol_log_mean = float(np.mean(log_v))
     vol_log_std  = float(max(np.std(log_v, ddof=1), 1e-6))
 
-    # OLS: log(V[1:]) ~ const + beta * |ret|
-    # 對齊 len：log_rets 對應 bar 1..n，Volume[1:] 對應同一批 bar
     n_ret = len(log_rets)
     if n_ret >= 4 and len(log_v) > n_ret:
-        lv_aligned = log_v[-n_ret:]        # 末尾對齊
+        lv_aligned = log_v[-n_ret:]
         abs_ret    = np.abs(log_rets)
-        # OLS with intercept
         X = np.column_stack([np.ones(n_ret), abs_ret])
         try:
             coefs, _, _, _ = np.linalg.lstsq(X, lv_aligned, rcond=None)
@@ -241,7 +228,6 @@ def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
     else:
         beta = 0.0
 
-    # AR(1) on residuals: resid_t = log_v_t - vol_log_mean
     resid = log_v - vol_log_mean
     if len(resid) >= 4:
         with warnings.catch_warnings():
@@ -255,44 +241,27 @@ def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
 
 
 def _generate_volume(
-    z_final:      np.ndarray,   # 已 rescale 的 log-returns，shape (n_bars,)
+    z_final:      np.ndarray,
     vol_log_mean: float,
     vol_log_std:  float,
     vol_ret_beta: float,
     vol_ar1:      float,
     rng:          np.random.Generator,
 ) -> np.ndarray:
-    """
-    生成整數成交量陣列，shape (n_bars,)。
-
-    管線：
-      1. base noise:  u_i ~ N(0, vol_log_std)
-      2. coupling:    u_i += vol_ret_beta * |z_final_i|
-      3. AR(1) wrap:  v_i = ar1 * v_{i-1} + sqrt(1-ar1^2) * u_i
-      4. shift:       log_vol_i = vol_log_mean + v_i
-      5. exp + round → int64
-    """
     n = len(z_final)
     if n == 0:
         return np.array([], dtype=np.int64)
 
-    # Step 1: base noise
     u = rng.normal(0.0, vol_log_std, size=n)
-
-    # Step 2: vol-return coupling（量價耦合）
     u = u + vol_ret_beta * np.abs(z_final)
 
-    # Step 3: AR(1) on residuals（成交量自相關聚集）
     innov_sc = float(np.sqrt(max(1.0 - vol_ar1 ** 2, 0.0)))
     v = np.empty(n)
     v[0] = u[0]
     for i in range(1, n):
         v[i] = vol_ar1 * v[i - 1] + innov_sc * u[i]
 
-    # Step 4: shift to actual log-volume level
     log_vol = vol_log_mean + v
-
-    # Step 5: exp + clip + round
     raw = np.exp(log_vol)
     raw = np.clip(raw, 1.0, 1e13)
     return np.round(raw).astype(np.int64)
@@ -330,6 +299,9 @@ def fit(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ek = float(stats.kurtosis(log_rets))
+        # v48: store raw moment skew for NIG b_nig calculation
+        skew_raw = float(stats.skew(log_rets))
+
     target_ek = float(max(np.clip(ek, 0.5, _TARGET_EK_MAX), ek_global_floor))
 
     if apply_trend_bias:
@@ -337,13 +309,13 @@ def fit(
         trend_bias = float(np.sign(real_trend) * abs(ret_mu) * 0.3)
         ret_mu = ret_mu + trend_bias
 
-    # v47: volume params
     vol_log_mean, vol_log_std, vol_ret_beta, vol_ar1 = _fit_volume_params(df_history, log_rets)
 
     return StatParams(
         ret_mu          = ret_mu,
         ret_std         = ret_std,
         ret_skew_a      = skew_a,
+        ret_skew_raw    = skew_raw,
         ret_df          = df_t,
         hurst_target    = float(np.clip(h, 0.3, 0.69)),
         wick_lambda     = wick_lam,
@@ -361,20 +333,22 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v47: 加入 Step 8 Volume)
+# 2. GENERATE  (v48: fix std/skew/kurtosis)
 #
 # 管線：
 #   Step 1  採樣基礎分佈（skewnorm+t 混合 or NIG）
-#   Step 2  AR1 Hurst 过濾
+#           v48: NIG trigger raised 10→15; b_nig uses ret_skew_raw
+#   Step 2  AR1 Hurst 過濾
 #   Step 3  ACF lag1 微調
-#   Step 4  對稱 GARCH(1,1) — vol 谷峰聚集，不改 skew
+#   Step 4  對稱 GARCH(1,1)  v48: vol_scale clipped [0.7, 1.3]
 #   Step 5  jump 疊加
-#   Step 6  single exact rescale 到 (ret_mu, ret_std)
+#   Step 6  exact rescale 到 (ret_mu, ret_std)
 #   Step 7  OHLC wick
-#   Step 8  Volume（lognormal + vol-return coupling + AR1）[NEW v47]
+#   Step 8  Volume（lognormal + vol-return coupling + AR1）
 # ---------------------------------------------------------------------------
 
-_AR1_WARMUP = 50
+_AR1_WARMUP   = 50
+_NIG_TRIGGER  = 15.0   # v48: raised from 10.0
 
 
 def generate(
@@ -389,6 +363,7 @@ def generate(
     ret_mu          = params["ret_mu"] + drift_correction
     ret_std         = params["ret_std"]
     skew_a          = params["ret_skew_a"]
+    skew_raw        = float(params.get("ret_skew_raw", 0.0))   # v48
     df_t            = params["ret_df"]
     hurst           = params["hurst_target"]
     wick_lam        = params["wick_lambda"]
@@ -399,7 +374,6 @@ def generate(
     acf_lag1        = params["acf_lag1"]
     target_ek       = params["target_ek"]
 
-    # v47 volume params（backward-compat: default 0 if key missing）
     vol_log_mean  = float(params.get("vol_log_mean", 0.0))
     vol_log_std   = float(params.get("vol_log_std",  1.0))
     vol_ret_beta  = float(params.get("vol_ret_beta", 0.0))
@@ -409,9 +383,10 @@ def generate(
 
     # ------------------------------------------------------------------
     # Step 1: 採樣基礎分佈
+    # v48: NIG trigger raised to _NIG_TRIGGER; b_nig from skew_raw
     # ------------------------------------------------------------------
-    if target_ek > 10.0:
-        nig_ab = _nig_params_from_moments(ret_std, skew_a, target_ek)
+    if target_ek > _NIG_TRIGGER:
+        nig_ab = _nig_params_from_moments(ret_std, skew_raw, target_ek)
         if nig_ab is not None:
             a_nig, b_nig = nig_ab
             with warnings.catch_warnings():
@@ -428,7 +403,7 @@ def generate(
 
         if z_raw is None:
             df_t_eff = float(np.clip(df_t, 2.5, 6.0))
-            p_t      = float(np.clip(target_ek / 15.0, 0.30, 0.90))
+            p_t      = float(np.clip(target_ek / 20.0, 0.30, 0.90))
             mask     = rng.uniform(size=total) < p_t
             z_raw    = np.where(
                 mask,
@@ -472,6 +447,8 @@ def generate(
 
     # ------------------------------------------------------------------
     # Step 4: 對稱 GARCH(1,1)
+    # v48: vol_scale clipped to [0.7, 1.3] (was [0.5, 1.5]) to reduce
+    #      per-chunk std inflation that accumulates on concat
     # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.02 and n_bars > 1:
@@ -488,7 +465,7 @@ def generate(
         for i in range(1, n_bars):
             h_t[i]   = omega + beta * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
             h_t[i]   = max(h_t[i], base_var * 0.01)
-            vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.5, 1.5))
+            vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.7, 1.3))  # v48: tighter
             z_garch[i] = z_ar[i] * vol_scale
     else:
         z_garch = z_ar
@@ -530,7 +507,7 @@ def generate(
     lows    = np.maximum(np.minimum(opens, closes) - lower_w, 1e-6)
 
     # ------------------------------------------------------------------
-    # Step 8: Volume  [NEW v47]
+    # Step 8: Volume
     # ------------------------------------------------------------------
     if vol_log_mean != 0.0 or vol_log_std != 1.0:
         volume = _generate_volume(
@@ -542,7 +519,6 @@ def generate(
             rng          = rng,
         )
     else:
-        # fallback: no volume data in history
         volume = np.zeros(n_bars, dtype=np.int64)
 
     return pd.DataFrame({
@@ -606,7 +582,7 @@ class OnlineRidgePredictor:
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
         new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
@@ -615,6 +591,7 @@ class OnlineRidgePredictor:
 
 # ---------------------------------------------------------------------------
 # 4. Rolling fit-generate
+# v48: add global std-rescale after concat
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
@@ -744,7 +721,47 @@ def rolling_fit_generate(
         result_chunks.append(df_sim)
         pos += step
 
+    # -----------------------------------------------------------------------
+    # v48 fix: global std-rescale after concat
+    # Each chunk's exact-rescale is correct locally, but regime shifts
+    # between chunks inflate the concatenated series' std.
+    # Solution: rescale only std (not mean) to match the real tail's std.
+    # -----------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
+
+    n_real_tail = len(df_result)
+    if n_real_tail > 1:
+        real_tail_rets = np.diff(np.log(np.maximum(
+            df_real["Close"].values[-n_real_tail:].astype(float), 1e-10
+        )))
+        sim_all_rets = np.diff(np.log(np.maximum(
+            df_result["Close"].values.astype(float), 1e-10
+        )))
+        real_global_std = float(np.std(real_tail_rets))
+        sim_global_std  = float(np.std(sim_all_rets))
+
+        if sim_global_std > 1e-10 and real_global_std > 1e-10:
+            scale = real_global_std / sim_global_std
+            if 0.5 < scale < 2.0:   # sanity guard
+                # rescale prices: preserve start, apply cumulative scale
+                orig_closes = df_result["Close"].values.astype(float)
+                orig_opens  = df_result["Open"].values.astype(float)
+                orig_highs  = df_result["High"].values.astype(float)
+                orig_lows   = df_result["Low"].values.astype(float)
+
+                log_ret_sim = np.diff(np.log(np.maximum(orig_closes, 1e-10)))
+                scaled_rets = log_ret_sim * scale
+                new_closes = np.empty(len(orig_closes))
+                new_closes[0] = orig_closes[0]
+                for i in range(1, len(new_closes)):
+                    new_closes[i] = new_closes[i - 1] * np.exp(scaled_rets[i - 1])
+
+                price_ratio = new_closes / np.maximum(orig_closes, 1e-10)
+                df_result = df_result.copy()
+                df_result["Close"] = new_closes
+                df_result["Open"]  = orig_opens  * price_ratio
+                df_result["High"]  = orig_highs  * price_ratio
+                df_result["Low"]   = orig_lows   * price_ratio
 
     if all_dtw or all_pcorr:
         dtw_mean   = float(np.mean(all_dtw))     if all_dtw   else float("nan")
