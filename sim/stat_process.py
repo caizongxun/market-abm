@@ -1,31 +1,27 @@
 """
-stat_process.py  v46
+stat_process.py  v47
 ====================
 純統計過程模型，完全不使用 agent。
 
-v46: 兩大問題的根本原因找到，重寫 generate()
+v47: 加入成交量（Volume）的 fit / generate
+  新增 StatParams 欄位：
+    vol_log_mean  – mean(log(Volume)) in fitting window
+    vol_log_std   – std(log(Volume))  in fitting window
+    vol_ret_beta  – OLS: log(V_t) ~ beta * |ret_t|  (vol-return coupling)
+    vol_ar1       – AR(1) on log-volume residuals  (volume clustering)
 
-  問題 1: GJR-GARCH 的非對稱 alpha_d/alpha_u 是 skew 反轉的根本原因
-    負向衝擊讓 h_t 更大 → 負尾被放大更多 → 結果永遠左偏
-    → 改為標準對稱 GARCH(1,1)，「skew」由採樣分佈負責
+  generate() 新增 Step 8：
+    1. lognormal base：u_i ~ N(vol_log_mean, vol_log_std)
+    2. vol-return 耦合：u_i += vol_ret_beta * |z_final_i|
+    3. AR(1) 自相關殘差聚集
+    4. exp() → round → int64  (Volume 欄)
 
-  問題 2: body-only renorm + chi2 amp + jump 三層疊加 → std/kurt 失控
-    → 拜除所有中間層，改為最後一步做平均一次 exact rescale
+  生成的 DataFrame 現在包含 Open / High / Low / Close / Volume。
 
-  新的 generate() 管線：
-    1. 採樣：skewnorm + t 混合（由 skew_a 和 df_t 控制，nig for high ek）
-    2. AR1 Hurst 过濾
-    3. ACF lag1 微調
-    4. 對稱 GARCH(1,1)（不再非對稱）— 只做 vol 谷峰聚集，不改變 skew
-    5. jump 疊加
-    6. 一次 exact rescale 到 (ret_mu, ret_std)
-    7. 價格序列 + OHLC wick
-
-v45: skew-aware chi2 amp + jump/chi2 互斥（但 GJR 仍導致 skew 反轉）
-v44: body-only renorm tail explosion 修復
-v43: body-only renorm
-v42: hard renorm patch
-v1-v41: 見舊 docstring
+v46: 重寫 generate()
+  – 改為對稱 GARCH(1,1)，拿掉 GJR 非對稱項
+  – 拿掉 body-only renorm / chi2 amp，改為最後一次 exact rescale
+v1-v45: 見舊 docstring
 """
 
 from __future__ import annotations
@@ -61,6 +57,11 @@ class StatParams(TypedDict):
     vol_persistence:  float
     acf_lag1:         float
     target_ek:        float
+    # --- v47: volume params ---
+    vol_log_mean:     float   # mean of log(Volume) in fitting window
+    vol_log_std:      float   # std  of log(Volume) in fitting window
+    vol_ret_beta:     float   # OLS coef: log(V) ~ beta * |ret|
+    vol_ar1:          float   # AR(1) coef on log-vol residuals
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +200,105 @@ def _path_corr(real_closes, sim_closes):
 
 
 # ---------------------------------------------------------------------------
+# v47: Volume helpers
+# ---------------------------------------------------------------------------
+
+def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
+    """
+    從 df_ohlc 擬合成交量模型參數。
+    要求 df_ohlc 含 Volume 欄，且 len(df_ohlc) == len(log_rets) + 1
+    （log_rets 是 diff(log(Close))，比 close 序列少一筆）。
+
+    回傳：
+        vol_log_mean  – 對數成交量均值
+        vol_log_std   – 對數成交量標準差
+        vol_ret_beta  – OLS: log(V[1:]) ~ beta * |ret|  （vol-return coupling）
+        vol_ar1       – AR(1) on log-volume 殘差  （volume clustering）
+    """
+    if "Volume" not in df_ohlc.columns:
+        return 0.0, 1.0, 0.0, 0.0
+
+    raw_vol = df_ohlc["Volume"].values.astype(float)
+    raw_vol = np.maximum(raw_vol, 1.0)   # 防止 log(0)
+    log_v   = np.log(raw_vol)
+
+    vol_log_mean = float(np.mean(log_v))
+    vol_log_std  = float(max(np.std(log_v, ddof=1), 1e-6))
+
+    # OLS: log(V[1:]) ~ const + beta * |ret|
+    # 對齊 len：log_rets 對應 bar 1..n，Volume[1:] 對應同一批 bar
+    n_ret = len(log_rets)
+    if n_ret >= 4 and len(log_v) > n_ret:
+        lv_aligned = log_v[-n_ret:]        # 末尾對齊
+        abs_ret    = np.abs(log_rets)
+        # OLS with intercept
+        X = np.column_stack([np.ones(n_ret), abs_ret])
+        try:
+            coefs, _, _, _ = np.linalg.lstsq(X, lv_aligned, rcond=None)
+            beta = float(np.clip(coefs[1], 0.0, 20.0))
+        except Exception:
+            beta = 0.0
+    else:
+        beta = 0.0
+
+    # AR(1) on residuals: resid_t = log_v_t - vol_log_mean
+    resid = log_v - vol_log_mean
+    if len(resid) >= 4:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ar1 = float(np.corrcoef(resid[:-1], resid[1:])[0, 1])
+        ar1 = float(np.clip(ar1 if np.isfinite(ar1) else 0.0, -0.9, 0.9))
+    else:
+        ar1 = 0.0
+
+    return vol_log_mean, vol_log_std, beta, ar1
+
+
+def _generate_volume(
+    z_final:      np.ndarray,   # 已 rescale 的 log-returns，shape (n_bars,)
+    vol_log_mean: float,
+    vol_log_std:  float,
+    vol_ret_beta: float,
+    vol_ar1:      float,
+    rng:          np.random.Generator,
+) -> np.ndarray:
+    """
+    生成整數成交量陣列，shape (n_bars,)。
+
+    管線：
+      1. base noise:  u_i ~ N(0, vol_log_std)
+      2. coupling:    u_i += vol_ret_beta * |z_final_i|
+      3. AR(1) wrap:  v_i = ar1 * v_{i-1} + sqrt(1-ar1^2) * u_i
+      4. shift:       log_vol_i = vol_log_mean + v_i
+      5. exp + round → int64
+    """
+    n = len(z_final)
+    if n == 0:
+        return np.array([], dtype=np.int64)
+
+    # Step 1: base noise
+    u = rng.normal(0.0, vol_log_std, size=n)
+
+    # Step 2: vol-return coupling（量價耦合）
+    u = u + vol_ret_beta * np.abs(z_final)
+
+    # Step 3: AR(1) on residuals（成交量自相關聚集）
+    innov_sc = float(np.sqrt(max(1.0 - vol_ar1 ** 2, 0.0)))
+    v = np.empty(n)
+    v[0] = u[0]
+    for i in range(1, n):
+        v[i] = vol_ar1 * v[i - 1] + innov_sc * u[i]
+
+    # Step 4: shift to actual log-volume level
+    log_vol = vol_log_mean + v
+
+    # Step 5: exp + clip + round
+    raw = np.exp(log_vol)
+    raw = np.clip(raw, 1.0, 1e13)
+    return np.round(raw).astype(np.int64)
+
+
+# ---------------------------------------------------------------------------
 # 1. FIT
 # ---------------------------------------------------------------------------
 
@@ -237,6 +337,9 @@ def fit(
         trend_bias = float(np.sign(real_trend) * abs(ret_mu) * 0.3)
         ret_mu = ret_mu + trend_bias
 
+    # v47: volume params
+    vol_log_mean, vol_log_std, vol_ret_beta, vol_ar1 = _fit_volume_params(df_history, log_rets)
+
     return StatParams(
         ret_mu          = ret_mu,
         ret_std         = ret_std,
@@ -250,23 +353,25 @@ def fit(
         vol_persistence = vol_persistence,
         acf_lag1        = acf_lag1,
         target_ek       = target_ek,
+        vol_log_mean    = vol_log_mean,
+        vol_log_std     = vol_log_std,
+        vol_ret_beta    = vol_ret_beta,
+        vol_ar1         = vol_ar1,
     )
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v46 重寫)
+# 2. GENERATE  (v47: 加入 Step 8 Volume)
 #
 # 管線：
 #   Step 1  採樣基礎分佈（skewnorm+t 混合 or NIG）
-#           「skew」完全由分佈層負責，後續不再加入任何非對稱視武器
 #   Step 2  AR1 Hurst 过濾
 #   Step 3  ACF lag1 微調
-#   Step 4  對稱 GARCH(1,1) — 只做 vol 谷峰聚集，不改變 skew
-#           重要：不再使用 GJR，避免非對稱链對尾部的影響
+#   Step 4  對稱 GARCH(1,1) — vol 谷峰聚集，不改 skew
 #   Step 5  jump 疊加
 #   Step 6  single exact rescale 到 (ret_mu, ret_std)
-#           不管前面層疊加多少，最後一步保證結果精確
 #   Step 7  OHLC wick
+#   Step 8  Volume（lognormal + vol-return coupling + AR1）[NEW v47]
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -294,13 +399,18 @@ def generate(
     acf_lag1        = params["acf_lag1"]
     target_ek       = params["target_ek"]
 
+    # v47 volume params（backward-compat: default 0 if key missing）
+    vol_log_mean  = float(params.get("vol_log_mean", 0.0))
+    vol_log_std   = float(params.get("vol_log_std",  1.0))
+    vol_ret_beta  = float(params.get("vol_ret_beta", 0.0))
+    vol_ar1       = float(params.get("vol_ar1",      0.0))
+
     total = n_bars + _AR1_WARMUP
 
     # ------------------------------------------------------------------
-    # Step 1: 採樣基礎分佈（分佈層負責 skew 和 fat tail）
+    # Step 1: 採樣基礎分佈
     # ------------------------------------------------------------------
     if target_ek > 10.0:
-        # NIG: 能同時控制 skew 和 kurtosis
         nig_ab = _nig_params_from_moments(ret_std, skew_a, target_ek)
         if nig_ab is not None:
             a_nig, b_nig = nig_ab
@@ -317,7 +427,6 @@ def generate(
             z_raw = None
 
         if z_raw is None:
-            # fallback: skewnorm + heavy-t 混合
             df_t_eff = float(np.clip(df_t, 2.5, 6.0))
             p_t      = float(np.clip(target_ek / 15.0, 0.30, 0.90))
             mask     = rng.uniform(size=total) < p_t
@@ -327,7 +436,6 @@ def generate(
                 stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total, random_state=rng),
             )
     else:
-        # skewnorm + t 混合，比例由 target_ek 决定
         df_t_eff = float(np.clip(df_t, 2.5, 20.0))
         t_ek     = 6.0 / max(df_t_eff - 4.0, 0.1) if df_t_eff > 4.0 else 3.0
         p_t      = float(np.clip(target_ek / max(t_ek, 0.5), 0.05, 0.85))
@@ -363,15 +471,13 @@ def generate(
         z_ar = z_acf / z_s if z_s > 1e-10 else z_acf
 
     # ------------------------------------------------------------------
-    # Step 4: 對稱 GARCH(1,1) — 不再使用 GJR 非對稱項
-    # 目的：vol 谷峰聚集、不改變分佈對稱性
-    # vol_scale clip (0.5, 1.5)，防止過度放大造成 std 失控
+    # Step 4: 對稱 GARCH(1,1)
     # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.02 and n_bars > 1:
         beta     = float(np.clip(alpha * 0.8, 0.0, 0.89))
-        alpha_s  = float(np.clip(alpha * 0.15, 0.01, 0.20))   # 對稱 ARCH 項
-        base_var = 1.0   # z_ar 已標準化，base var = 1
+        alpha_s  = float(np.clip(alpha * 0.15, 0.01, 0.20))
+        base_var = 1.0
         omega    = base_var * max(1.0 - beta - alpha_s, 0.01)
 
         h_t      = np.empty(n_bars)
@@ -382,7 +488,6 @@ def generate(
         for i in range(1, n_bars):
             h_t[i]   = omega + beta * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
             h_t[i]   = max(h_t[i], base_var * 0.01)
-            # clip vol_scale 在 (0.5, 1.5)，保留谷峰但不按照平方放大
             vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.5, 1.5))
             z_garch[i] = z_ar[i] * vol_scale
     else:
@@ -396,12 +501,11 @@ def generate(
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
             jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
-            jump_sizes = rng.normal(0.0, 1.0, size=n_jumps)   # unit-std jumps
+            jump_sizes = rng.normal(0.0, 1.0, size=n_jumps)
             z_work[jump_idx] += jump_sizes
 
     # ------------------------------------------------------------------
-    # Step 6: single exact rescale 到 (ret_mu, ret_std)
-    # 不管之前層疊加多少，最後一步保證
+    # Step 6: exact rescale
     # ------------------------------------------------------------------
     z_std = float(np.std(z_work))
     if z_std > 1e-10:
@@ -410,7 +514,7 @@ def generate(
         z_final = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
-    # Step 7: OHLC 價格序列 + wick
+    # Step 7: OHLC
     # ------------------------------------------------------------------
     prices    = np.empty(n_bars + 1)
     prices[0] = start_price
@@ -425,7 +529,29 @@ def generate(
     highs   = np.maximum(opens, closes) + upper_w
     lows    = np.maximum(np.minimum(opens, closes) - lower_w, 1e-6)
 
-    return pd.DataFrame({"Open": opens, "High": highs, "Low": lows, "Close": closes})
+    # ------------------------------------------------------------------
+    # Step 8: Volume  [NEW v47]
+    # ------------------------------------------------------------------
+    if vol_log_mean != 0.0 or vol_log_std != 1.0:
+        volume = _generate_volume(
+            z_final      = z_final,
+            vol_log_mean = vol_log_mean,
+            vol_log_std  = vol_log_std,
+            vol_ret_beta = vol_ret_beta,
+            vol_ar1      = vol_ar1,
+            rng          = rng,
+        )
+    else:
+        # fallback: no volume data in history
+        volume = np.zeros(n_bars, dtype=np.int64)
+
+    return pd.DataFrame({
+        "Open":   opens,
+        "High":   highs,
+        "Low":    lows,
+        "Close":  closes,
+        "Volume": volume,
+    })
 
 
 # ---------------------------------------------------------------------------
