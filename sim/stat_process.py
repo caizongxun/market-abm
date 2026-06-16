@@ -1,94 +1,33 @@
 """
-stat_process.py  v39
+stat_process.py  v40
 ====================
 純統計過程模型，完全不使用 agent。
 
-v39 新增（v38 骨架不動）：
+v40 新增（v39 骨架不動）：
 ------------------------------------------------------
-Fix-39-P1  高 ek 路徑跳過 chi2 尾部放大
-  問題：target_ek > 20 時截斷 t-mixture 已有足夠重尾，
-        chi2 疊加後 kurt 被 final_scale 壓縮，兩段抵消（GOOGL=267）。
-  修法：target_ek > HIGH_EK_THRESH(20) 時完全跳過 chi2 尾部放大區塊，
-        讓截斷 t-mixture 自己控尾部。
-  預期：GOOGL/XLE kurt_err 大幅下降。
+Fix-40  AdaptiveCalibrator 整合
+  rolling_fit_generate() 接受可選的 calibrator 參數。
+  每個視窗執行流程：
+    1. fit(df_fit) → 取得基礎 StatParams
+    2. calibrator.predict(context) → 取得 CalibAction
+    3. action.apply(params) → 套用校正量
+    4. generate(corrected_params) → 產生模擬序列
+    5. 計算誤差 → calibrator.record(context, action, reward_components)
+  OnlineRidgePredictor 保留作為 baseline fallback。
 
-Fix-39-P2  final_scale 下限 0.5 → 0.4
-  問題：final_scale clip(0.5, scale_max) 在高 std 品種（TLT/GLD/SPY）
-        壓縮空間不足，std_err% 中位數 14.7%。
-  修法：下限從 0.5 改 0.4，讓高 std 品種能夠被壓更多。
-  預期：std_err% 中位數 14.7% → 10% 以下。
-
-v1-v39 修正歷程
---------------
-  Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
-  Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
-  Fix-9~11: 失敗—線性 t-blend 消除 skew
-  Fix-12  : Gaussian Copula + skewnorm 邊際 => skew 修復但 kurtosis≈2.5
-  Fix-13  : quantile-blend => kurtosis 4.78 但 skew 翻轉 -0.82
-  Fix-14  : Tail Amplifier => kurtosis↑ 但 skew 仍翻轉
-  Fix-15  : center-masked amp + variance-mixture => kurtosis 9.74 但 std 偏高
-  Fix-16  : symmetric clip + std rescale => std✅ hurst✅ skew仍翻轉
-  Fix-17  : 雙層 rank-remap => 結構正確但 kurtosis 偏低
-  Fix-18  : soft anchor + mixture model + trend bias => hurst✅ 方向命中率✅
-  Fix-19  : GARCH + directed t-mixture => skew 接近 0 但 kurtosis 1.84
-  Fix-20  : chi2 tail amp + AR(1) direct => kurtosis 1.92
-  Fix-21  : chi2 tail amp 移到 rescale 後 => kurtosis 8.98 但 std 膨脹、skew -0.83
-  Fix-22  : 回退 v18 + jump + GARCH + ACF => hurst✅ 但 kurtosis 2.02、skew -0.30
-  Fix-23  : additive AR(1) + body-only rescale + kurtosis-driven p_t
-             => kurtosis 3.97✅↑ hurst 0.74 偏高 skew -0.24
-  Fix-24  : AR(1) warmup + global ek floor + hurst clip 0.69
-             => skew -0.068✅ hurst 0.720✅ kurtosis 2.62 偏低
-  Fix-25  : OnlineRidgePredictor => skew +0.023✅ hurst 0.717✅ 方向命中率 0.516✅
-             kurtosis 2.90 退步
-  Fix-26  : variance-mixture tail booster + target_ek in predictor
-             => kurtosis 5.43✅↑ hurst 0.719✅ std 膨脹 1.858 skew -0.203 仍偏負
-  Fix-27  : Fix-A global std rescale + Fix-B aggressive nu_boost +
-             Fix-C skew sign protection
-             => kurtosis 4.85 退步（Fix-A 把尾部壓回去了）
-             skew +0.741✅ hurst 0.690✅ std 1.763
-  Fix-28  : Fix-A 改為 body-only rescale（scale_a=0.85），不碰尾部
-             => kurtosis 4.07 退步（兩次 body rescale 疊加）
-  Fix-29  : 移除 chi2 boost 內的舊 body rescale，只留 Fix-A 的單次縮放
-             => kurtosis 4.32↑ hurst 0.690✅ skew +0.712✅ std 1.812 偏高
-             方向命中率 0.519✅
-  Fix-30  : chi2 更激進 + 全局 std 收斂(z_scaled) + skew 幅度限制
-             => kurtosis 8.82✅↑ skew +0.466✅ hurst 0.678✅ std 1.810 仍偏高
-             方向命中率 0.539✅
-  Fix-31  : 移除 jump 後 body rescale，改為 jump 後 final global std 收斂
-             => kurtosis 13.03 過衝 skew +0.188✅ hurst 0.681✅ std 1.785 仍偏高
-             方向命中率 0.539✅
-  Fix-32  : chi2 clip 5.0→3.0 抑制 kurtosis 過衝
-             final_scale clip (0.6,1.4)→(0.5,1.0) 只允許縮
-             => kurtosis 5.64 skew +0.152 hurst 0.685✅ std 1.662✅
-             方向命中率 0.529✅
-  Fix-33  : chi2 clip 3.0→4.0 繼續推 kurtosis
-             final_scale skew-adaptive：skew_a>0.3 → max 1.15，else max 1.0
-             新增 DTW distance + path_corr 走勢相似性指標（不進 loss，只記錄）
-             => kurtosis 7.62 skew +0.172 hurst 0.682✅ std 1.672✅
-             方向命中率 0.535✅
-  Fix-34  : Fix-I tail_threshold 1.5σ→1.2σ + chi2 clip 4.0→3.5
-             Fix-J global_scale skew-aware（正尾允許微幅放大至 1.05）
-             Fix-K nu_boost 改為與 df_t 反比：6/(df_t-2) clip(1.5,5.0)
-             => kurtosis 4.08 skew +0.607✅ hurst 0.694✅ std 1.650✅
-             方向命中率 0.519✅
-             (Fix-K 實際上 clip 全在 1.5 下界，差異化失效)
-  Fix-35  : Fix-L nu_boost = 3/(df_t-4) clip(0.5,3.0) 真正差異化
-             Fix-M chi2 極端尾部（>2.5σ）允許 clip(0.5,5.0)，普通尾部仍 3.5
-             Fix-N p_t clip 上限 0.85 → 0.92
-  Fix-36  : Fix-O scale_max = clip(1.0+(target_ek-3)*0.02, 1.0, 1.4)
-             不再因 skew 為負就鎖死 final_scale 上限在 1.0
-  Fix-37  : Fix-P GJR-GARCH 槓桿效應（下跌期波動率放大）
-             Fix-Q NIG 尾部採樣（target_ek>6 時替換 t-mixture）
-  Fix-38  : Fix-38-P1 NIG a_nig >= 0.15 下限 + target_ek > 20 截斷 t-mixture
-             Fix-38-P2 GJR vol_scale clip(0.3,2.5) + scale_max 係數 0.02→0.015 上限 1.4→1.2
-  Fix-39  : Fix-39-P1 target_ek > 20 跳過 chi2 尾部放大（截斷 t-mixture 自控尾部）
-             Fix-39-P2 final_scale 下限 0.5 → 0.4（讓高 std 品種壓縮空間更大）
+v1-v40 修正歷程（節錄）
+-----------------------
+  Fix-1~36 : 見 v36 docstring
+  Fix-37   : GJR-GARCH + NIG 尾部採樣
+  Fix-38   : NIG a_nig >= 0.15 + 截斷 t-mixture + GJR vol_scale 收緊
+  Fix-39   : 高 ek 路徑跳過 chi2 放大；final_scale 下限 0.5→0.4
+  Fix-40   : AdaptiveCalibrator 整合（跨 trial 持久化校正知識）
 """
 
 from __future__ import annotations
 
 import warnings
-from typing import TypedDict
+from typing import TYPE_CHECKING, Optional, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -96,6 +35,9 @@ from scipy import stats
 from scipy.optimize import minimize_scalar
 
 from sim.metrics import hurst_exponent
+
+if TYPE_CHECKING:
+    from sim.calibrator import AdaptiveCalibrator
 
 
 # ---------------------------------------------------------------------------
@@ -214,23 +156,13 @@ def _ar1_hurst_rho(h: float) -> float:
     return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
 
 
-# ---------------------------------------------------------------------------
-# Fix-Q v37 / Fix-38-P1: NIG 矩匹配工具函數
-# ---------------------------------------------------------------------------
-
 def _nig_params_from_moments(
     std: float, skew: float, kurt_excess: float
 ) -> tuple[float, float] | None:
-    """
-    從超額峰度和偏度推算 NIG(a, b) 參數（scipy norminvgauss 形式）。
-    Fix-38-P1: a_nig 強制 >= 0.15（防止柯西退化）。
-    target_ek > 20 時由呼叫方改走截斷 t-mixture，不進此函數。
-    """
     if kurt_excess < 0.5:
         return None
     try:
         a_est = float(np.sqrt(3.0 / max(kurt_excess, 0.1)))
-        # Fix-38-P1: 下限保護 0.15，防止 a→0 退化成柯西分佈
         a_est = float(np.clip(a_est, 0.15, 5.0))
         b_est = float(skew * a_est / 3.0)
         b_est = float(np.clip(b_est, -0.95 * a_est, 0.95 * a_est))
@@ -238,10 +170,6 @@ def _nig_params_from_moments(
     except Exception:
         return None
 
-
-# ---------------------------------------------------------------------------
-# Fix-H v33: 走勢相似性輔助函數
-# ---------------------------------------------------------------------------
 
 def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
     n, m = len(s), len(t)
@@ -253,8 +181,7 @@ def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
         for j in range(1, m + 1):
             cost = abs(s[i - 1] - t[j - 1])
             dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
-    raw = dtw[n, m]
-    return float(raw / max(n, m))
+    return float(dtw[n, m] / max(n, m))
 
 
 def _path_corr(real_closes: np.ndarray, sim_closes: np.ndarray) -> float:
@@ -322,7 +249,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v39: Fix-39-P1 高ek跳過chi2 + Fix-39-P2 final_scale下限0.4)
+# 2. GENERATE  (v40：與 v39 邏輯相同，介面不變)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -352,16 +279,9 @@ def generate(
 
     total = n_bars + _AR1_WARMUP
 
-    # ------------------------------------------------------------------
-    # Fix-38-P1: 根據 target_ek 選擇基礎分佈
-    #   target_ek <= 6  : t-mixture（原路徑）
-    #   6 < target_ek <= 20 : NIG（矩匹配，a_nig >= 0.15）
-    #   target_ek > 20  : 高 ek 截斷 t-mixture（p_t→0.98, nu_boost↑）
-    # ------------------------------------------------------------------
     HIGH_EK_THRESH = 20.0
 
     if target_ek > HIGH_EK_THRESH:
-        # 截斷 t-mixture：幾乎純 t，df 強制收緊到真實重尾範圍
         use_nig    = False
         df_t_eff   = float(np.clip(df_t, 2.5, 8.0))
         t_ek_eff   = 6.0 / max(df_t_eff - 4.0, 0.1)
@@ -373,7 +293,6 @@ def generate(
                                   size=total, random_state=rng)
         z_raw = np.where(mask, t_samples, sn_samples)
     elif target_ek > 6.0:
-        # NIG 路徑（Fix-Q + Fix-38-P1 保護）
         nig_ab = _nig_params_from_moments(ret_std, skew_a, target_ek)
         use_nig = nig_ab is not None
         if use_nig:
@@ -397,7 +316,6 @@ def generate(
                                       size=total, random_state=rng)
             z_raw = np.where(mask, t_samples, sn_samples)
     else:
-        # 原 t-mixture 路徑（target_ek <= 6）
         use_nig = False
         t_ek = 6.0 / max(df_t - 4.0, 0.1)
         p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.92))
@@ -408,9 +326,6 @@ def generate(
                                   size=total, random_state=rng)
         z_raw = np.where(mask, t_samples, sn_samples)
 
-    # ------------------------------------------------------------------
-    # AR(1) / Hurst 結構
-    # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 1e-6:
         innov_sc    = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
@@ -422,9 +337,6 @@ def generate(
     else:
         z_ar = z_raw[_AR1_WARMUP:].copy()
 
-    # ------------------------------------------------------------------
-    # ACF(1) 修正
-    # ------------------------------------------------------------------
     z_final = z_ar
     if abs(acf_lag1) > 0.05 and n_bars > 1:
         z_adj = z_final.copy()
@@ -436,10 +348,6 @@ def generate(
     else:
         z_adj = z_final
 
-    # ------------------------------------------------------------------
-    # Fix-P v37 / Fix-38-P2: GJR-GARCH（不對稱槓桿效應）
-    # Fix-38-P2: vol_scale clip 收緊至 (0.3, 2.5)（原 3.5）
-    # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.01 and n_bars > 1:
         gamma    = float(np.clip(alpha * 0.6, 0.0, 0.4))
@@ -462,7 +370,6 @@ def generate(
                 resid_term = alpha_u * prev_ret ** 2
             h_t[i]   = omega + beta * h_t[i - 1] + resid_term
             h_t[i]   = max(h_t[i], base_var * 0.01)
-            # Fix-38-P2: clip 上限 3.5 → 2.5
             vol_scale = float(np.clip(
                 np.sqrt(h_t[i]) / (ret_std + 1e-10), 0.3, 2.5
             ))
@@ -470,9 +377,6 @@ def generate(
     else:
         z_gjr = z_adj
 
-    # ------------------------------------------------------------------
-    # 全局 std 收斂（body-only rescale，不碰尾部）
-    # ------------------------------------------------------------------
     z_mean = float(np.mean(z_gjr))
     z_std  = float(np.std(z_gjr))
     if z_std > 1e-10:
@@ -486,40 +390,28 @@ def generate(
     else:
         z_scaled = np.full(n_bars, ret_mu)
 
-    # ------------------------------------------------------------------
-    # Chi2 尾部放大（Fix-I/L/M 繼承）
-    # Fix-39-P1: target_ek > HIGH_EK_THRESH 時完全跳過此區塊
-    #            截斷 t-mixture 已有足夠重尾，不再疊加 chi2 放大
-    # ------------------------------------------------------------------
     tail_threshold = 1.2 * ret_std
     tail_mask      = np.abs(z_scaled - ret_mu) > tail_threshold
 
     if target_ek <= HIGH_EK_THRESH:
-        # 正常路徑：chi2 尾部放大
-        nu_raw    = 3.0 / max(df_t - 4.0, 0.1)
-        nu_boost  = float(np.clip(nu_raw, 0.5, 3.0))
+        nu_raw   = 3.0 / max(df_t - 4.0, 0.1)
+        nu_boost = float(np.clip(nu_raw, 0.5, 3.0))
 
         if np.any(tail_mask):
-            chi2_raw = rng.chisquare(df=max(df_t, 3.0), size=int(np.sum(tail_mask)))
+            chi2_raw  = rng.chisquare(df=max(df_t, 3.0), size=int(np.sum(tail_mask)))
             chi2_norm = chi2_raw / max(df_t, 3.0)
-
             extreme_mask_local = chi2_norm > 2.5
             chi2_norm = np.where(
                 extreme_mask_local,
                 np.clip(chi2_norm, 0.5, 5.0),
                 np.clip(chi2_norm, 0.5, 3.5),
             )
-            amp = 1.0 + nu_boost * (chi2_norm - 1.0)
-            amp = np.clip(amp, 0.5, 4.0)
+            amp = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, 4.0)
             sign_mask = np.sign(z_scaled[tail_mask] - ret_mu)
             z_scaled[tail_mask] = (
                 ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
             )
-    # Fix-39-P1: target_ek > HIGH_EK_THRESH → 直接跳過，截斷 t-mixture 自控尾部
 
-    # ------------------------------------------------------------------
-    # Jump diffusion（Merton 跳躍項）
-    # ------------------------------------------------------------------
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
@@ -527,55 +419,34 @@ def generate(
             jump_sizes = rng.normal(0.0, jump_std, size=n_jumps)
             z_scaled[jump_idx] += jump_sizes
 
-    # ------------------------------------------------------------------
-    # Fix-38-P2: scale_max 係數 0.02→0.015，上限 1.4→1.2
-    # Fix-39-P2: final_scale 下限 0.5 → 0.4（讓高 std 品種壓縮空間更大）
-    # ------------------------------------------------------------------
     scale_max   = float(np.clip(1.0 + (target_ek - 3.0) * 0.015, 1.0, 1.2))
     final_mean  = float(np.mean(z_scaled))
     final_std   = float(np.std(z_scaled))
     if final_std > 1e-10:
-        # Fix-39-P2: 下限 0.5 → 0.4
         final_scale = float(np.clip(ret_std / final_std, 0.4, scale_max))
         z_scaled    = (z_scaled - final_mean) * final_scale + ret_mu
 
-    # ------------------------------------------------------------------
-    # 價格路徑重建
-    # ------------------------------------------------------------------
-    log_rets_sim = z_scaled
-    prices       = np.empty(n_bars + 1)
-    prices[0]    = start_price
+    prices  = np.empty(n_bars + 1)
+    prices[0] = start_price
     for i in range(n_bars):
-        prices[i + 1] = prices[i] * np.exp(log_rets_sim[i])
+        prices[i + 1] = prices[i] * np.exp(z_scaled[i])
 
     opens  = prices[:-1].copy()
     closes = prices[1:].copy()
-
     atr_adj = max(atr_mean, 1e-4)
     upper_w = rng.exponential(scale=wick_lam * atr_adj, size=n_bars)
     lower_w = rng.exponential(scale=wick_lam * atr_adj, size=n_bars)
     highs   = np.maximum(opens, closes) + upper_w
-    lows    = np.minimum(opens, closes) - lower_w
-    lows    = np.maximum(lows, 1e-6)
+    lows    = np.maximum(np.minimum(opens, closes) - lower_w, 1e-6)
 
-    return pd.DataFrame({
-        "Open":  opens,
-        "High":  highs,
-        "Low":   lows,
-        "Close": closes,
-    })
+    return pd.DataFrame({"Open": opens, "High": highs, "Low": lows, "Close": closes})
 
 
 # ---------------------------------------------------------------------------
-# 3. OnlineRidgePredictor  (自適應參數修正，v25+)
+# 3. OnlineRidgePredictor  (baseline，v25+，保留相容)
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
-    """
-    使用已完成視窗的 (fitted_params -> realised_moment) 配對，
-    以 Ridge 回歸修正下一個視窗的參數。
-    目前修正：ret_std、ret_skew_a（skew）、hurst_target、target_ek。
-    """
     def __init__(self, min_train: int = 10, max_blend: float = 0.50):
         self.min_train = min_train
         self.max_blend = max_blend
@@ -589,12 +460,9 @@ class OnlineRidgePredictor:
                realised_skew: float, realised_hurst: float,
                realised_ek: float) -> None:
         feat = [
-            params["ret_std"],
-            params["ret_skew_a"],
-            params["hurst_target"],
-            params["target_ek"],
-            params["ret_df"],
-            params["vol_persistence"],
+            params["ret_std"], params["ret_skew_a"],
+            params["hurst_target"], params["target_ek"],
+            params["ret_df"], params["vol_persistence"],
         ]
         self._X.append(feat)
         self._y_std.append(realised_std)
@@ -602,83 +470,56 @@ class OnlineRidgePredictor:
         self._y_hurst.append(realised_hurst)
         self._y_ek.append(realised_ek)
 
-    def _ridge_predict(self, X: np.ndarray, y: np.ndarray,
-                       x_new: np.ndarray, alpha: float = 1.0) -> float:
+    def _ridge_predict(self, X, y, x_new, alpha=1.0):
         n, d = X.shape
         XtX = X.T @ X + alpha * np.eye(d)
-        Xty = X.T @ y
         try:
-            w = np.linalg.solve(XtX, Xty)
+            w = np.linalg.solve(XtX, X.T @ y)
         except np.linalg.LinAlgError:
-            w = np.linalg.lstsq(XtX, Xty, rcond=None)[0]
-        pred = float(x_new @ w)
-        return pred
+            w = np.linalg.lstsq(XtX, X.T @ y, rcond=None)[0]
+        return float(x_new @ w)
 
-    def predict_correction(
-        self, params: StatParams, window_idx: int
-    ) -> StatParams:
+    def predict_correction(self, params: StatParams, window_idx: int) -> StatParams:
         n = len(self._X)
         if n < self.min_train:
             return params
-
         blend = float(np.clip(
             self.max_blend * (n - self.min_train) / max(self.min_train, 1),
             0.0, self.max_blend
         ))
-
-        X     = np.array(self._X, dtype=float)
+        X = np.array(self._X, dtype=float)
         x_new = np.array([
-            params["ret_std"],
-            params["ret_skew_a"],
-            params["hurst_target"],
-            params["target_ek"],
-            params["ret_df"],
-            params["vol_persistence"],
+            params["ret_std"], params["ret_skew_a"],
+            params["hurst_target"], params["target_ek"],
+            params["ret_df"], params["vol_persistence"],
         ], dtype=float)
-
-        pred_std   = self._ridge_predict(X, np.array(self._y_std),   x_new)
-        pred_skew  = self._ridge_predict(X, np.array(self._y_skew),  x_new)
-        pred_hurst = self._ridge_predict(X, np.array(self._y_hurst), x_new)
-        pred_ek    = self._ridge_predict(X, np.array(self._y_ek),    x_new)
-
-        new_std   = float(np.clip(
-            (1 - blend) * params["ret_std"]      + blend * pred_std,
-            params["ret_std"] * 0.3, params["ret_std"] * 3.0
-        ))
-        new_skew  = float(np.clip(
-            (1 - blend) * params["ret_skew_a"]   + blend * pred_skew,
-            -10.0, 10.0
-        ))
-        new_hurst = float(np.clip(
-            (1 - blend) * params["hurst_target"] + blend * pred_hurst,
-            0.3, 0.69
-        ))
-        new_ek    = float(np.clip(
-            (1 - blend) * params["target_ek"]    + blend * pred_ek,
-            1.0, 30.0
-        ))
-
+        new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
+        new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
+        new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, 30.0))
         corrected = dict(params)
-        corrected["ret_std"]      = new_std
-        corrected["ret_skew_a"]   = new_skew
-        corrected["hurst_target"] = new_hurst
-        corrected["target_ek"]    = new_ek
+        corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
+                          "hurst_target": new_hurst, "target_ek": new_ek})
         return StatParams(**corrected)
 
 
 # ---------------------------------------------------------------------------
-# 4. Rolling fit-generate  (滾動主函數)
+# 4. Rolling fit-generate  (v40: 整合 AdaptiveCalibrator)
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
-    df_real:   pd.DataFrame,
-    lookback:  int  = 60,
-    step:      int  = 20,
-    seed:      int  = 42,
-    verbose:   bool = False,
-    use_adapt: bool = True,
+    df_real:    pd.DataFrame,
+    lookback:   int  = 60,
+    step:       int  = 20,
+    seed:       int  = 42,
+    verbose:    bool = False,
+    use_adapt:  bool = True,
+    calibrator: "Optional[AdaptiveCalibrator]" = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
-
+    """
+    calibrator: 外部傳入的 AdaptiveCalibrator 實例（跨 trial 共享）。
+                None 時退化到 OnlineRidgePredictor（原行為）。
+    """
     n      = len(df_real)
     pos    = 0
     result_chunks: list[pd.DataFrame] = []
@@ -688,7 +529,7 @@ def rolling_fit_generate(
 
     predictor = OnlineRidgePredictor(min_train=10, max_blend=0.50) if use_adapt else None
 
-    all_dtw:  list[float] = []
+    all_dtw:   list[float] = []
     all_pcorr: list[float] = []
 
     while pos + lookback < n:
@@ -702,41 +543,43 @@ def rolling_fit_generate(
         df_fit = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         df_fwd = df_real.iloc[fwd_start:fwd_end].copy().reset_index(drop=True)
 
+        # ---- Step 1: fit ----
         params = fit(df_fit)
 
-        if predictor is not None:
-            params = predictor.predict_correction(params, window_idx)
-            if verbose and len(predictor._X) >= predictor.min_train:
-                n_hist = len(predictor._X)
-                blend_w = float(np.clip(
-                    predictor.max_blend * (n_hist - predictor.min_train) / max(predictor.min_train, 1),
-                    0.0, predictor.max_blend
-                ))
-                print(
-                    f"         [adapt] blend_w={blend_w:.2f}"
-                    f"  std {dict(params)['ret_std']:.4f}->{params['ret_std']:.4f}"
-                    f"  skew {dict(params)['ret_skew_a']:.3f}->{params['ret_skew_a']:.3f}"
-                    f"  hurst {dict(params)['hurst_target']:.3f}->{params['hurst_target']:.3f}"
-                    f"  tgt_ek {dict(params)['target_ek']:.2f}->{params['target_ek']:.2f}"
-                    f"  (n={n_hist})"
-                )
+        # ---- Step 2: AdaptiveCalibrator 校正（優先） ----
+        calib_action = None
+        if calibrator is not None:
+            from sim.calibrator import AdaptiveCalibrator
+            ctx = AdaptiveCalibrator.build_context(params)
+            calib_action = calibrator.predict(ctx)
+            params_dict  = calib_action.apply(dict(params))
+            params       = StatParams(**params_dict)
 
+        # ---- Step 3: OnlineRidgePredictor fallback（calibrator 未訓練時輔助） ----
+        elif predictor is not None:
+            params = predictor.predict_correction(params, window_idx)
+
+        # ---- Step 4: generate ----
         start_price = float(df_real["Open"].iloc[fwd_start])
         sim_seed    = int(rng.integers(0, 2**31))
+        df_sim = generate(params=params, n_bars=fwd_bars,
+                          start_price=start_price, seed=sim_seed)
 
-        df_sim = generate(
-            params      = params,
-            n_bars      = fwd_bars,
-            start_price = start_price,
-            seed        = sim_seed,
-        )
-
+        # ---- Step 5: 計算誤差指標 ----
         sim_rets  = np.diff(np.log(np.maximum(df_sim["Close"].values,  1e-10)))
         real_rets = np.diff(np.log(np.maximum(df_fwd["Close"].values,  1e-10)))
+
+        real_std_w = float(np.std(real_rets)) + 1e-10
+        std_err_pct = abs(float(np.std(sim_rets)) / real_std_w - 1.0) if len(sim_rets) > 1 else float("nan")
+        kurt_err    = abs(float(stats.kurtosis(sim_rets)) - float(stats.kurtosis(real_rets))) if len(sim_rets) > 3 else float("nan")
+        hurst_err   = abs(float(hurst_exponent(sim_rets)) - float(hurst_exponent(real_rets))) if len(sim_rets) > 10 else float("nan")
+        min_len     = min(len(real_rets), len(sim_rets))
+        dir_hit     = float(np.mean(np.sign(real_rets[:min_len]) == np.sign(sim_rets[:min_len]))) if min_len > 0 else float("nan")
+
         if len(sim_rets) > 1 and len(real_rets) > 1:
             loss = float(
-                abs(np.std(sim_rets) - np.std(real_rets)) / (np.std(real_rets) + 1e-10)
-                + abs(np.mean(sim_rets) - np.mean(real_rets)) / (np.std(real_rets) + 1e-10)
+                abs(np.std(sim_rets) - np.std(real_rets)) / real_std_w
+                + abs(np.mean(sim_rets) - np.mean(real_rets)) / real_std_w
             )
         else:
             loss = float("nan")
@@ -750,73 +593,54 @@ def rolling_fit_generate(
         if np.isfinite(dtw_val):   all_dtw.append(dtw_val)
         if np.isfinite(pcorr_val): all_pcorr.append(pcorr_val)
 
+        # ---- Step 6: 回饋給 calibrator ----
+        if calibrator is not None and calib_action is not None:
+            if all(np.isfinite(v) for v in [std_err_pct, kurt_err, hurst_err, dir_hit]):
+                calibrator.record(
+                    context     = ctx,
+                    action      = calib_action,
+                    std_err_pct = std_err_pct,
+                    kurt_err    = kurt_err,
+                    hurst_err   = hurst_err,
+                    dir_hit     = dir_hit,
+                )
+
+        # ---- Step 7: OnlineRidgePredictor 也記錄（calibrator 模式下仍更新） ----
         if predictor is not None and len(real_rets) > 3:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                r_std   = float(np.std(real_rets))
-                r_skew  = float(stats.skew(real_rets))
-                r_hurst = float(hurst_exponent(real_rets)) if len(real_rets) > 10 else params["hurst_target"]
-                r_ek    = float(stats.kurtosis(real_rets))
-            predictor.record(params, r_std, r_skew, r_hurst, r_ek)
+                predictor.record(
+                    params,
+                    float(np.std(real_rets)),
+                    float(stats.skew(real_rets)),
+                    float(hurst_exponent(real_rets)) if len(real_rets) > 10 else params["hurst_target"],
+                    float(stats.kurtosis(real_rets)),
+                )
 
-        real_o = float(df_fwd["Open"].iloc[0])
-        real_h = float(df_fwd["High"].max())
-        real_l = float(df_fwd["Low"].min())
         real_c = float(df_fwd["Close"].iloc[-1])
-        sim_o  = float(df_sim["Open"].iloc[0])
-        sim_h  = float(df_sim["High"].max())
-        sim_l  = float(df_sim["Low"].min())
         sim_c  = float(df_sim["Close"].iloc[-1])
         c_err  = (sim_c - real_c) / (real_c + 1e-10)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            fit_rets = np.diff(np.log(np.maximum(df_fit["Close"].values, 1e-10)))
-            skew_actual  = float(stats.skew(fit_rets))   if len(fit_rets) > 3 else 0.0
-            hurst_actual = float(hurst_exponent(fit_rets)) if len(fit_rets) > 10 else 0.5
-            wick_actual  = float(np.mean(_wilder_atr(
-                df_fit["High"].values, df_fit["Low"].values, df_fit["Close"].values, 14
-            )))
 
         if verbose:
             dtw_str   = f"{dtw_val:.4f}"   if np.isfinite(dtw_val)   else "  nan"
             pcorr_str = f"{pcorr_val:+.3f}" if np.isfinite(pcorr_val) else "  nan"
+            calib_str = f"  [calib n={calibrator.n_experiences}]" if calibrator else ""
             print(
-                f"[stat] window {window_idx:3d}"
-                f"  fit=[{fit_start}:{fit_end}]"
-                f"  fwd=[{fwd_start}:{fwd_end}]"
-                f"  df={params['ret_df']:.2f}"
-                f"  skew_a={params['ret_skew_a']:+.3f}"
-                f"  std={params['ret_std']:.4f}"
-                f"  hurst={params['hurst_target']:.3f}"
-                f"  wick={params['wick_lambda']:.3f}"
-                f"  jfreq={params['jump_freq']:.3f}"
-                f"  vp={params['vol_persistence']:.3f}"
-                f"  acf1={params['acf_lag1']:+.3f}"
-                f"  tgt_ek={params['target_ek']:.2f}"
-                f"  loss={loss:.4f}"
-                f"  dtw={dtw_str}"
-                f"  pcorr={pcorr_str}"
-            )
-            print(
-                f"         real OHLC"
-                f"  O={real_o:8.2f}  H={real_h:8.2f}  L={real_l:8.2f}  C={real_c:8.2f}"
-            )
-            print(
-                f"         sim  OHLC"
-                f"  O={sim_o:8.2f}  H={sim_h:8.2f}  L={sim_l:8.2f}  C={sim_c:8.2f}"
-                f"  (C err={c_err:+.1%})"
+                f"[stat] w{window_idx:3d}"
+                f"  std={params['ret_std']:.4f}  ek={params['target_ek']:.2f}"
+                f"  loss={loss:.4f}  dtw={dtw_str}  pcorr={pcorr_str}"
+                f"  dir={dir_hit:.3f}{calib_str}"
             )
 
         param_log.append({
-            "window":         window_idx,
-            "fit_range":      [fit_start, fit_end],
-            "fwd_bars":       [fwd_start, fwd_end],
+            "window":    window_idx,
+            "fit_range": [fit_start, fit_end],
+            "fwd_bars":  [fwd_start, fwd_end],
             **{k: float(v) for k, v in params.items()},
-            "loss":           loss if np.isfinite(loss) else None,
-            "dtw":            dtw_val if np.isfinite(dtw_val) else None,
-            "path_corr":      pcorr_val if np.isfinite(pcorr_val) else None,
-            "c_err":          float(c_err),
+            "loss":      loss       if np.isfinite(loss)      else None,
+            "dtw":       dtw_val    if np.isfinite(dtw_val)   else None,
+            "path_corr": pcorr_val  if np.isfinite(pcorr_val) else None,
+            "c_err":     float(c_err),
         })
 
         result_chunks.append(df_sim)
@@ -833,11 +657,11 @@ def rolling_fit_generate(
         print(f"[similarity] path_corr  mean={pc_mean:+.3f}  median={pc_median:+.3f}  (越接近 +1 越好)")
 
     param_log.append({
-        "_summary": True,
-        "n_windows": window_idx,
-        "dtw_mean":  float(np.mean(all_dtw))   if all_dtw   else None,
-        "dtw_median":float(np.median(all_dtw)) if all_dtw   else None,
-        "pcorr_mean":float(np.mean(all_pcorr)) if all_pcorr else None,
+        "_summary":   True,
+        "n_windows":  window_idx,
+        "dtw_mean":   float(np.mean(all_dtw))   if all_dtw   else None,
+        "dtw_median": float(np.median(all_dtw)) if all_dtw   else None,
+        "pcorr_mean": float(np.mean(all_pcorr)) if all_pcorr else None,
     })
 
     return df_result, param_log
