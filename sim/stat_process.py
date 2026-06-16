@@ -1,30 +1,20 @@
 """
-stat_process.py  v35
+stat_process.py  v36
 ====================
 純統計過程模型，完全不使用 agent。
 
-v35 fix（v34 骨架不動）：
+v36 fix（v35 骨架不動）：
 ------------------------------------------------------
-Fix-L v35-1：nu_boost 改用更激進的反比公式
-  原公式 6/(df_t-2) clip(1.5,5.0)，df_t=6.6~30 時全部 clip 到下界 1.5，
-  完全沒有差異化效果。
-  新公式：nu_boost = clip(3.0 / max(df_t-4.0, 0.1), 0.5, 3.0)
-  df_t=7  → 3/3=1.0   → 1.0（輕推，本身已肥）
-  df_t=10 → 3/6=0.5   → clip → 0.5（更肥）
-  df_t=20 → 3/16=0.19 → clip → 0.5
-  df_t=30 → 3/26=0.12 → clip → 0.5（最肥，接近 Normal 需要強推）
+Fix-O v36：final_scale scale_max 改為與 target_ek 掛鉤，不再依賴 skew 符號
+  原邏輯：scale_max = 1.15 if skew_a > 0.3 else 1.0
+    → skew 為負時 chi2 尾部空間被鎖死在 1.0，target_ek 高也無效。
+  新邏輯：scale_max = clip(1.0 + (target_ek - 3.0) * 0.02, 1.0, 1.4)
+    target_ek=3  → 1.00（不膨脹）
+    target_ek=10 → 1.14（任何 skew 方向都能讓尾部呼吸）
+    target_ek=15 → 1.24
+    target_ek=28 → 1.40（上限）
 
-Fix-M v35-2：chi2 clip 加入 quantile-based 極端尾部放大
-  普通 tail bar 仍 clip(0.5, 3.5) 避免過衝，
-  但 |z - ret_mu| > 2.5σ 的極端 bar 允許 clip(0.5, 5.0)
-  這樣只有真正極端的事件才會被強放大，不影響主體分佈。
-
-Fix-N v35-3：p_t clip 上限 0.85 → 0.92
-  t-path bar 比例從最高 85% 提升到 92%，
-  配合 Fix-L 的更小 nu_boost（更肥的 chi2），
-  讓 chi2 尾部放大有更多機會作用在 t-path 的 tail bars。
-
-v1-v35 修正歷程
+v1-v36 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -81,6 +71,8 @@ v1-v35 修正歷程
   Fix-35  : Fix-L nu_boost = 3/(df_t-4) clip(0.5,3.0) 真正差異化
              Fix-M chi2 極端尾部（>2.5σ）允許 clip(0.5,5.0)，普通尾部仍 3.5
              Fix-N p_t clip 上限 0.85 → 0.92
+  Fix-36  : Fix-O scale_max = clip(1.0+(target_ek-3)*0.02, 1.0, 1.4)
+             不再因 skew 為負就鎖死 final_scale 上限在 1.0
 """
 
 from __future__ import annotations
@@ -295,7 +287,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v35: Fix-L/M/N)
+# 2. GENERATE  (v36: Fix-O)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -496,12 +488,13 @@ def generate(
 
     # ------------------------------------------------------------------
     # Fix-D v31: jump 後 final global std 收斂
-    # Fix-G v33: skew-adaptive 上限
+    # Fix-O v36: scale_max = clip(1.0 + (target_ek-3)*0.02, 1.0, 1.4)
+    #   不再因 skew 符號而鎖死上限，target_ek 高時任何方向都能讓尾部呼吸
     # ------------------------------------------------------------------
     final_std = float(np.std(log_rets - ret_mu))
     if final_std > 1e-8:
         final_scale = ret_std / final_std
-        scale_max = 1.15 if skew_a > 0.3 else 1.0
+        scale_max = float(np.clip(1.0 + (target_ek - 3.0) * 0.02, 1.0, 1.4))
         final_scale = float(np.clip(final_scale, 0.5, scale_max))
         log_rets = ret_mu + (log_rets - ret_mu) * final_scale
 
