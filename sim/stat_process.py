@@ -1,8 +1,14 @@
 """
-stat_process.py  v49.1
+stat_process.py  v49.2
 ====================
 純統計過程模型，完全不使用 agent。
 
+v49.2: fix rolling level drift (downward bias)
+       1. start_price chaining: each window starts from prev sim Close
+          instead of real Open, eliminating boundary gaps across 40+ windows.
+       2. Global drift alignment after std-rescale: linear correction path
+          aligns sim mean log-return to real tail mean log-return.
+          Guard: |correction| < 0.005/bar to avoid over-fitting.
 v49.1: fix Fleishman mean-drift & skew sign
        - Reduce to 3-unknown system (a = -c analytic)
        - Loosen feasibility guard from 0.95 → 0.80
@@ -687,7 +693,7 @@ class OnlineRidgePredictor:
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
         new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
@@ -742,7 +748,13 @@ def rolling_fit_generate(
         elif predictor is not None:
             params = predictor.predict_correction(params, window_idx)
 
-        start_price = float(df_real["Open"].iloc[fwd_start])
+        # v49.2: chain start_price from previous sim chunk's last Close
+        # instead of real Open, to avoid accumulating boundary gaps.
+        if result_chunks:
+            start_price = float(result_chunks[-1]["Close"].iloc[-1])
+        else:
+            start_price = float(df_real["Open"].iloc[fwd_start])
+
         sim_seed    = int(rng.integers(0, 2**31))
         df_sim = generate(params=params, n_bars=fwd_bars,
                           start_price=start_price, seed=sim_seed)
@@ -862,6 +874,29 @@ def rolling_fit_generate(
                 df_result["Open"]  = orig_opens  * price_ratio
                 df_result["High"]  = orig_highs  * price_ratio
                 df_result["Low"]   = orig_lows   * price_ratio
+
+        # -------------------------------------------------------------------
+        # v49.2: global drift alignment
+        # Align sim mean log-return to real tail mean log-return.
+        # Guard: only correct when |drift_correction| < 0.005/bar to
+        # avoid over-fitting on short or highly volatile windows.
+        # -------------------------------------------------------------------
+        sim_all_rets_post = np.diff(np.log(np.maximum(
+            df_result["Close"].values.astype(float), 1e-10
+        )))
+        real_log_ret_mean = float(np.mean(real_tail_rets))
+        sim_log_ret_mean  = float(np.mean(sim_all_rets_post))
+        drift_correction  = real_log_ret_mean - sim_log_ret_mean
+
+        if abs(drift_correction) < 0.005:
+            final_closes = df_result["Close"].values.astype(float)
+            correction_path = np.exp(np.arange(len(final_closes)) * drift_correction)
+            ratio = correction_path / correction_path[0]
+            df_result = df_result.copy()
+            df_result["Close"] = final_closes * ratio
+            df_result["Open"]  = df_result["Open"].values  * ratio
+            df_result["High"]  = df_result["High"].values  * ratio
+            df_result["Low"]   = df_result["Low"].values   * ratio
 
     if all_dtw or all_pcorr:
         dtw_mean   = float(np.mean(all_dtw))     if all_dtw   else float("nan")
