@@ -1,15 +1,10 @@
 """
-stat_process.py  v48
+stat_process.py  v48.1
 ====================
 純統計過程模型，完全不使用 agent。
 
-v48 fixes (3 targeted patches):
-  1. std inflation  – rolling concat 後加一次全局 exact-std-rescale；
-                      GARCH vol_scale 上限 1.5→1.3 防止 per-chunk 爆炸。
-  2. skew sign flip – b_nig 改用 stats.skew(log_rets) 計算，
-                      不再用 skewnorm shape 參數（兩者符號定義不同）。
-  3. kurtosis overshoot – NIG 啟動門檻 target_ek > 10 → > 15。
-
+v48.1: fix bracket mismatch on line 585 (_y_ek] → _y_ek))
+v48: std inflation, skew sign flip, kurtosis overshoot fixes
 v47: 加入成交量（Volume）的 fit / generate
 v46: 重寫 generate()：對稱 GARCH(1,1) + exact rescale
 v1-v45: 見舊 docstring
@@ -582,7 +577,7 @@ class OnlineRidgePredictor:
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
         new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
