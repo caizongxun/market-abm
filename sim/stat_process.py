@@ -1,8 +1,13 @@
 """
-stat_process.py  v48.1
+stat_process.py  v49
 ====================
 純統計過程模型，完全不使用 agent。
 
+v49: Step 6b — Fleishman Power Transform
+     給定標準化樣本 z（mean=0, std=1），數值求解係數 (a, b, c, d) 使得：
+       znew = a + b*z + c*z^2 + d*z^3
+     同時匹配目標 skewness 和 excess kurtosis。
+     這是在 linear rescale 之外唯一能同時控制 skew 和 kurt 的方法。
 v48.1: fix bracket mismatch on line 585 (_y_ek] → _y_ek))
 v48: std inflation, skew sign flip, kurtosis overshoot fixes
 v47: 加入成交量（Volume）的 fit / generate
@@ -18,7 +23,7 @@ from typing import TYPE_CHECKING, Optional, TypedDict
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.optimize import minimize_scalar
+from scipy.optimize import fsolve, minimize_scalar
 
 from sim.metrics import hurst_exponent
 
@@ -160,9 +165,6 @@ def _nig_params_from_moments(std, skew_raw, kurt_excess):
     try:
         a_est = float(np.sqrt(3.0 / max(kurt_excess, 0.1)))
         a_est = float(np.clip(a_est, 0.15, 5.0))
-        # b_nig controls skewness in NIG: positive b → right tail
-        # Moment skewness of NIG = 3 * b / (a * sqrt(a^2 - b^2)) * (something)
-        # Simple approximation: b ≈ skew_raw * a / 3
         b_est = float(skew_raw * a_est / 3.0)
         b_est = float(np.clip(b_est, -0.95 * a_est, 0.95 * a_est))
         return a_est, b_est
@@ -193,6 +195,87 @@ def _path_corr(real_closes, sim_closes):
         warnings.simplefilter("ignore")
         corr = float(np.corrcoef(r_path, s_path)[0, 1])
     return corr if np.isfinite(corr) else float("nan")
+
+
+# ---------------------------------------------------------------------------
+# v49: Fleishman Power Transform helpers
+# ---------------------------------------------------------------------------
+
+def _fleishman_equations(coefs, target_skew: float, target_ek: float):
+    """
+    Four moment equations for Fleishman (1978) cubic polynomial:
+        Y = a + b*Z + c*Z^2 + d*Z^3,  Z ~ N(0,1)
+
+    Moments of Y expressed in (a, b, c, d):
+        E[Y]   = a + c                           → 0  (we want mean=0)
+        Var[Y] = b^2 + 6bd + 2c^2 + 15d^2       → 1  (we want std=1)
+        γ1(Y)  = 2c(b^2+24bd+105d^2+2)          → target_skew
+        γ2(Y)  = 24(bd+c^2(1+b^2+28bd)+d^2*(12+48bd+141c^2+225d^2)) → target_ek
+
+    Returns residuals of the four equations.
+    """
+    a, b, c, d = coefs
+    eq1 = a + c                                                           # mean = 0
+    eq2 = b**2 + 6*b*d + 2*c**2 + 15*d**2 - 1.0                         # var  = 1
+    eq3 = 2*c*(b**2 + 24*b*d + 105*d**2 + 2) - target_skew              # skew
+    eq4 = (24*(b*d + c**2*(1 + b**2 + 28*b*d) +
+               d**2*(12 + 48*b*d + 141*c**2 + 225*d**2))
+           - target_ek)                                                   # kurt
+    return [eq1, eq2, eq3, eq4]
+
+
+def _solve_fleishman(target_skew: float, target_ek: float):
+    """
+    Numerically solve Fleishman coefficients (a, b, c, d).
+
+    Strategy:
+    1. Try multiple starting points to avoid local minima.
+    2. Accept solution only if residual norm < 1e-4 and b > 0
+       (b > 0 ensures the transform is monotone near 0).
+    3. Returns (a, b, c, d) or None if no valid solution found.
+
+    Valid region: excess kurtosis >= skew^2 * 1.7 + 1 (Fleishman boundary).
+    """
+    # Feasibility pre-check: Fleishman cannot match arbitrary (skew, ek)
+    min_ek = target_skew ** 2 * 1.7 + 1.0
+    if target_ek < min_ek * 0.95:
+        return None
+
+    best     = None
+    best_res = np.inf
+
+    # Grid of starting points
+    for b0 in [1.0, 0.9, 1.1]:
+        for c0 in [0.0, target_skew * 0.05, -target_skew * 0.05]:
+            for d0 in [0.01, target_ek * 0.002, 0.05]:
+                a0 = -c0
+                x0 = [a0, b0, c0, d0]
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        sol, info, ier, _ = fsolve(
+                            _fleishman_equations, x0,
+                            args=(target_skew, target_ek),
+                            full_output=True,
+                        )
+                    if ier != 1:
+                        continue
+                    residual = float(np.linalg.norm(info["fvec"]))
+                    if residual < best_res and sol[1] > 0:  # b > 0
+                        best_res = residual
+                        best     = sol
+                except Exception:
+                    continue
+
+    if best is None or best_res > 1e-3:
+        return None
+    return tuple(float(x) for x in best)
+
+
+def _apply_fleishman(z: np.ndarray, coefs) -> np.ndarray:
+    """Apply Y = a + b*z + c*z^2 + d*z^3."""
+    a, b, c, d = coefs
+    return a + b * z + c * z**2 + d * z**3
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +377,6 @@ def fit(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ek = float(stats.kurtosis(log_rets))
-        # v48: store raw moment skew for NIG b_nig calculation
         skew_raw = float(stats.skew(log_rets))
 
     target_ek = float(max(np.clip(ek, 0.5, _TARGET_EK_MAX), ek_global_floor))
@@ -328,7 +410,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v48: fix std/skew/kurtosis)
+# 2. GENERATE  (v49: +Step 6b Fleishman moment-matching)
 #
 # 管線：
 #   Step 1  採樣基礎分佈（skewnorm+t 混合 or NIG）
@@ -338,6 +420,8 @@ def fit(
 #   Step 4  對稱 GARCH(1,1)  v48: vol_scale clipped [0.7, 1.3]
 #   Step 5  jump 疊加
 #   Step 6  exact rescale 到 (ret_mu, ret_std)
+#   Step 6b Fleishman Power Transform  ← v49 NEW
+#           標準化 → 求解 (a,b,c,d) → 變換 → re-rescale 到 (ret_mu, ret_std)
 #   Step 7  OHLC wick
 #   Step 8  Volume（lognormal + vol-return coupling + AR1）
 # ---------------------------------------------------------------------------
@@ -358,7 +442,7 @@ def generate(
     ret_mu          = params["ret_mu"] + drift_correction
     ret_std         = params["ret_std"]
     skew_a          = params["ret_skew_a"]
-    skew_raw        = float(params.get("ret_skew_raw", 0.0))   # v48
+    skew_raw        = float(params.get("ret_skew_raw", 0.0))
     df_t            = params["ret_df"]
     hurst           = params["hurst_target"]
     wick_lam        = params["wick_lambda"]
@@ -378,7 +462,6 @@ def generate(
 
     # ------------------------------------------------------------------
     # Step 1: 採樣基礎分佈
-    # v48: NIG trigger raised to _NIG_TRIGGER; b_nig from skew_raw
     # ------------------------------------------------------------------
     if target_ek > _NIG_TRIGGER:
         nig_ab = _nig_params_from_moments(ret_std, skew_raw, target_ek)
@@ -442,8 +525,6 @@ def generate(
 
     # ------------------------------------------------------------------
     # Step 4: 對稱 GARCH(1,1)
-    # v48: vol_scale clipped to [0.7, 1.3] (was [0.5, 1.5]) to reduce
-    #      per-chunk std inflation that accumulates on concat
     # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.02 and n_bars > 1:
@@ -460,7 +541,7 @@ def generate(
         for i in range(1, n_bars):
             h_t[i]   = omega + beta * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
             h_t[i]   = max(h_t[i], base_var * 0.01)
-            vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.7, 1.3))  # v48: tighter
+            vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.7, 1.3))
             z_garch[i] = z_ar[i] * vol_scale
     else:
         z_garch = z_ar
@@ -477,13 +558,52 @@ def generate(
             z_work[jump_idx] += jump_sizes
 
     # ------------------------------------------------------------------
-    # Step 6: exact rescale
+    # Step 6: exact rescale → (ret_mu, ret_std)
     # ------------------------------------------------------------------
     z_std = float(np.std(z_work))
     if z_std > 1e-10:
         z_final = (z_work - float(np.mean(z_work))) / z_std * ret_std + ret_mu
     else:
         z_final = np.full(n_bars, ret_mu)
+
+    # ------------------------------------------------------------------
+    # Step 6b: Fleishman Power Transform  (v49)
+    #
+    # Goal: simultaneously match target_skew (skew_raw) AND target_ek.
+    # Method:
+    #   1. Re-standardise z_final → z_std01 (mean=0, std=1)
+    #   2. Solve (a,b,c,d) via fsolve on the four Fleishman moment eqs
+    #   3. Apply Y = a + b*z + c*z^2 + d*z^3
+    #   4. Re-rescale back to (ret_mu, ret_std) so Steps 7-8 are unaffected
+    #
+    # Falls back silently (identity transform) when:
+    #   - Solver diverges or residual too large
+    #   - |skew_raw| < 0.05 and target_ek < 1.0  (normal enough, skip)
+    #   - n_bars < 20  (too few points to matter)
+    # ------------------------------------------------------------------
+    if n_bars >= 20 and (abs(skew_raw) >= 0.05 or target_ek >= 1.0):
+        z_mean = float(np.mean(z_final))
+        z_s2   = float(np.std(z_final))
+        if z_s2 > 1e-10:
+            z_std01 = (z_final - z_mean) / z_s2   # standardise to (0,1)
+
+            fleishman_coefs = _solve_fleishman(
+                target_skew = float(np.clip(skew_raw,   -3.0, 3.0)),
+                target_ek   = float(np.clip(target_ek,   0.5, 20.0)),
+            )
+
+            if fleishman_coefs is not None:
+                y_transformed = _apply_fleishman(z_std01, fleishman_coefs)
+
+                # Validate: transformed array must be finite and non-degenerate
+                if np.all(np.isfinite(y_transformed)):
+                    y_s = float(np.std(y_transformed))
+                    if y_s > 1e-10:
+                        # Re-rescale to original (ret_mu, ret_std)
+                        z_final = (
+                            (y_transformed - float(np.mean(y_transformed))) / y_s
+                            * ret_std + ret_mu
+                        )
 
     # ------------------------------------------------------------------
     # Step 7: OHLC
@@ -718,9 +838,6 @@ def rolling_fit_generate(
 
     # -----------------------------------------------------------------------
     # v48 fix: global std-rescale after concat
-    # Each chunk's exact-rescale is correct locally, but regime shifts
-    # between chunks inflate the concatenated series' std.
-    # Solution: rescale only std (not mean) to match the real tail's std.
     # -----------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -737,8 +854,7 @@ def rolling_fit_generate(
 
         if sim_global_std > 1e-10 and real_global_std > 1e-10:
             scale = real_global_std / sim_global_std
-            if 0.5 < scale < 2.0:   # sanity guard
-                # rescale prices: preserve start, apply cumulative scale
+            if 0.5 < scale < 2.0:
                 orig_closes = df_result["Close"].values.astype(float)
                 orig_opens  = df_result["Open"].values.astype(float)
                 orig_highs  = df_result["High"].values.astype(float)
