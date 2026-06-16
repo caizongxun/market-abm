@@ -1,21 +1,25 @@
 """
-stat_process.py  v29
+stat_process.py  v30
 ====================
 純統計過程模型，完全不使用 agent。
 
-v29 單項 fix（v28 骨架不動）：
+v30 三項 fix（v29 骨架不動）：
 ------------------------------------------------------
-Fix-A v29：移除 chi2 boost 段內的第一次 body rescale
-  問題根源：v28 有兩次 body rescale
-    第一次：chi2 boost 段末尾的 target_body_std / body_scale（v27 遺留）
-    第二次：Fix-A 段的 scale_a = ret_std * 0.85 / body_std_a（v28 新增）
-  兩次疊加導致 body 被過度壓縮，kurtosis 從 5.43(v26) 退步到 4.07(v28)。
+Fix-B v30：chi2 boost 更激進
+  v29: nu_boost = df_t * 0.3, clip(2.5, 8.0), chi2_scale clip(0.5, 3.5)
+  v30: nu_boost = df_t * 0.15, clip(1.5, 4.0), chi2_scale clip(0.5, 5.0)
+  更小的 nu → chi2 分佈右尾更肥 → scale 期望值更大 → kurtosis ↑
 
-  修正：移除第一次（chi2 boost 段內的 body_mask / target_body_std），
-  只保留 Fix-A 段的 body-only rescale（scale = 0.85）。
-  chi2 boost 後尾部完全不動，body 只被縮一次，kurtosis 貢獻得以保留。
+Fix-A2 v30：Fix-A body rescale 後加全局 std 收斂
+  等比縮放整體序列使 std 精確落回 ret_std。
+  等比縮放不改變 skew/kurtosis 的分佈形狀。
+  解決 v29 std 偏高 +13% 的問題。
 
-v1-v29 修正歷程
+Fix-C v30：skew 幅度限制（原有符號保護基礎上新增）
+  sample_skew 若超過 target_skew_mag * 1.5（上限 1.5）則阻尼壓縮。
+  避免 adaptive predictor 把 skew_a 推到 2.5+ 後整體 skew 偏大。
+
+v1-v30 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -46,7 +50,10 @@ v1-v29 修正歷程
   Fix-28  : Fix-A 改為 body-only rescale（scale_a=0.85），不碰尾部
              => kurtosis 4.07 退步（兩次 body rescale 疊加）
   Fix-29  : 移除 chi2 boost 內的舊 body rescale，只留 Fix-A 的單次縮放
-             預期 kurtosis 回升至 6+，std 收斂，skew 正號維持
+             => kurtosis 4.32↑ hurst 0.690✅ skew +0.712✅ std 1.812 偏高
+             方向命中率 0.519✅
+  Fix-30  : chi2 更激進 + 全局 std 收斂 + skew 幅度限制
+             預期 kurtosis 6+，std 收斂，skew ~0.4-0.5
 """
 
 from __future__ import annotations
@@ -231,7 +238,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v29: 移除 chi2 boost 段的舊 body rescale)
+# 2. GENERATE  (v30: aggressive chi2 + global std rescale + skew magnitude clamp)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -318,29 +325,27 @@ def generate(
         z_scaled = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
-    # variance-mixture tail booster (Fix-B: aggressive nu_boost)
-    # v29: 移除 boost 段末尾的舊 body rescale，避免與 Fix-A 疊加
+    # Fix-B v30: variance-mixture tail booster（更激進）
+    # nu_boost 更小 → chi2 右尾更肥 → scale 期望更大 → kurtosis ↑
     # ------------------------------------------------------------------
     tail_threshold  = 1.5 * ret_std
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
 
     if tail_mask_boost.sum() >= 2:
-        nu_boost   = float(np.clip(df_t * 0.3, 2.5, 8.0))
+        nu_boost   = float(np.clip(df_t * 0.15, 1.5, 4.0))   # v30: 更激進
         chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
-        chi2_scale = np.clip(chi2_scale, 0.5, 3.5)
+        chi2_scale = np.clip(chi2_scale, 0.5, 5.0)             # v30: 放開上限
 
         z_boosted = z_scaled.copy()
         tail_vals = z_scaled[tail_mask_boost]
         z_boosted[tail_mask_boost] = ret_mu + (tail_vals - ret_mu) * chi2_scale
-        # v29: 不再有 body_mask / target_body_std 段，交給下方 Fix-A 統一處理
 
         z_scaled = z_boosted
 
     # ------------------------------------------------------------------
     # Fix-A v29: body-only rescale（單次），不碰尾部
     # body_std 縮至 ret_std * 0.85，給尾部讓出 std 配額
-    # body 占 ~80% bar，整體 std 仍會收斂；尾部 kurtosis 貢獻保留
     # ------------------------------------------------------------------
     body_mask_a = np.abs(z_scaled - ret_mu) <= tail_threshold
     if body_mask_a.sum() > 5:
@@ -351,16 +356,42 @@ def generate(
             z_scaled[body_mask_a] = ret_mu + (z_scaled[body_mask_a] - ret_mu) * scale_a
 
     # ------------------------------------------------------------------
-    # Fix-C: skew 符號保護（v27 邏輯不動）
+    # Fix-A2 v30: 全局 std 收斂（等比縮放，不改形狀）
+    # 消除 chi2 boost 後整體 std 膨脹的問題
+    # ------------------------------------------------------------------
+    cur_std = float(np.std(z_scaled - ret_mu))
+    if cur_std > 1e-8:
+        global_scale = ret_std / cur_std
+        global_scale = float(np.clip(global_scale, 0.7, 1.3))
+        z_scaled = ret_mu + (z_scaled - ret_mu) * global_scale
+
+    # ------------------------------------------------------------------
+    # Fix-C v30: skew 符號保護 + 幅度限制
     # ------------------------------------------------------------------
     if abs(skew_a) > 0.2:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             sample_skew = float(stats.skew(z_scaled))
+
+        # 符號保護（v27 原有邏輯）
         target_sign = int(np.sign(skew_a))
         actual_sign = int(np.sign(sample_skew))
         if actual_sign != 0 and actual_sign != target_sign:
             z_scaled = ret_mu - (z_scaled - ret_mu)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sample_skew = float(stats.skew(z_scaled))
+
+        # v30 新增：幅度限制，避免 adaptive 把 skew_a 推高後整體 skew 過大
+        target_skew_mag = min(abs(skew_a), 1.5)
+        if abs(sample_skew) > target_skew_mag * 1.5 and abs(sample_skew) > 0.1:
+            # 對 body 部分做阻尼，尾部不動（保留 kurtosis）
+            damp = target_skew_mag * 1.5 / abs(sample_skew)
+            damp = float(np.clip(damp, 0.3, 1.0))
+            body_mask_c = np.abs(z_scaled - ret_mu) <= tail_threshold
+            z_scaled[body_mask_c] = (
+                ret_mu + (z_scaled[body_mask_c] - ret_mu) * damp
+            )
 
     # ------------------------------------------------------------------
     log_rets = z_scaled.copy()
