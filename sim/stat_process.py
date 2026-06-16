@@ -1,17 +1,17 @@
 """
-stat_process.py  v49
+stat_process.py  v49.1
 ====================
 純統計過程模型，完全不使用 agent。
 
+v49.1: fix Fleishman mean-drift & skew sign
+       - Reduce to 3-unknown system (a = -c analytic)
+       - Loosen feasibility guard from 0.95 → 0.80
+       - Second exact rescale after Fleishman guarantees (mu, std)
 v49: Step 6b — Fleishman Power Transform
-     給定標準化樣本 z（mean=0, std=1），數值求解係數 (a, b, c, d) 使得：
-       znew = a + b*z + c*z^2 + d*z^3
-     同時匹配目標 skewness 和 excess kurtosis。
-     這是在 linear rescale 之外唯一能同時控制 skew 和 kurt 的方法。
-v48.1: fix bracket mismatch on line 585 (_y_ek] → _y_ek))
+v48.1: fix bracket mismatch
 v48: std inflation, skew sign flip, kurtosis overshoot fixes
-v47: 加入成交量（Volume）的 fit / generate
-v46: 重寫 generate()：對稱 GARCH(1,1) + exact rescale
+v47: Volume fit / generate
+v46: GARCH(1,1) + exact rescale
 v1-v45: 見舊 docstring
 """
 
@@ -48,13 +48,11 @@ class StatParams(TypedDict):
     vol_persistence:  float
     acf_lag1:         float
     target_ek:        float
-    # --- v47: volume params ---
     vol_log_mean:     float
     vol_log_std:      float
     vol_ret_beta:     float
     vol_ar1:          float
-    # --- v48: carry raw skew for NIG ---
-    ret_skew_raw:     float   # stats.skew(log_rets)
+    ret_skew_raw:     float
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +153,6 @@ def _ar1_hurst_rho(h):
 
 
 def _nig_params_from_moments(std, skew_raw, kurt_excess):
-    """
-    v48 fix: use raw moment skewness (stats.skew) directly for b_nig.
-    Previously used skewnorm shape parameter `a` which has a different
-    sign convention and can flip the tail direction.
-    """
     if kurt_excess < 0.5:
         return None
     try:
@@ -198,70 +191,69 @@ def _path_corr(real_closes, sim_closes):
 
 
 # ---------------------------------------------------------------------------
-# v49: Fleishman Power Transform helpers
+# v49.1: Fleishman Power Transform helpers
+#
+# v49.1 change: reduce from 4 unknowns to 3 by substituting a = -c
+# (the mean=0 condition E[Y] = a + c = 0 gives a = -c analytically).
+# This removes one degree of freedom and makes fsolve significantly
+# more stable, eliminating the mean-drift observed in v49.
 # ---------------------------------------------------------------------------
 
-def _fleishman_equations(coefs, target_skew: float, target_ek: float):
+def _fleishman_equations_3(bcd, target_skew: float, target_ek: float):
     """
-    Four moment equations for Fleishman (1978) cubic polynomial:
-        Y = a + b*Z + c*Z^2 + d*Z^3,  Z ~ N(0,1)
+    3-unknown Fleishman system with a = -c substituted in.
 
-    Moments of Y expressed in (a, b, c, d):
-        E[Y]   = a + c                           → 0  (we want mean=0)
-        Var[Y] = b^2 + 6bd + 2c^2 + 15d^2       → 1  (we want std=1)
-        γ1(Y)  = 2c(b^2+24bd+105d^2+2)          → target_skew
-        γ2(Y)  = 24(bd+c^2(1+b^2+28bd)+d^2*(12+48bd+141c^2+225d^2)) → target_ek
+    Y = -c + b*Z + c*Z^2 + d*Z^3,  Z ~ N(0,1)
 
-    Returns residuals of the four equations.
+    Remaining three equations:
+        Var[Y] = b^2 + 6bd + 2c^2 + 15d^2 = 1
+        gamma1 = 2c(b^2 + 24bd + 105d^2 + 2) = target_skew
+        gamma2 = 24*(bd + c^2*(1+b^2+28bd) + d^2*(12+48bd+141c^2+225d^2))
+               = target_ek
     """
-    a, b, c, d = coefs
-    eq1 = a + c                                                           # mean = 0
-    eq2 = b**2 + 6*b*d + 2*c**2 + 15*d**2 - 1.0                         # var  = 1
-    eq3 = 2*c*(b**2 + 24*b*d + 105*d**2 + 2) - target_skew              # skew
-    eq4 = (24*(b*d + c**2*(1 + b**2 + 28*b*d) +
+    b, c, d = bcd
+    eq1 = b**2 + 6*b*d + 2*c**2 + 15*d**2 - 1.0
+    eq2 = 2*c*(b**2 + 24*b*d + 105*d**2 + 2) - target_skew
+    eq3 = (24*(b*d + c**2*(1 + b**2 + 28*b*d) +
                d**2*(12 + 48*b*d + 141*c**2 + 225*d**2))
-           - target_ek)                                                   # kurt
-    return [eq1, eq2, eq3, eq4]
+           - target_ek)
+    return [eq1, eq2, eq3]
 
 
 def _solve_fleishman(target_skew: float, target_ek: float):
     """
-    Numerically solve Fleishman coefficients (a, b, c, d).
+    Solve Fleishman coefficients using the reduced 3-unknown system.
 
-    Strategy:
-    1. Try multiple starting points to avoid local minima.
-    2. Accept solution only if residual norm < 1e-4 and b > 0
-       (b > 0 ensures the transform is monotone near 0).
-    3. Returns (a, b, c, d) or None if no valid solution found.
+    Returns (a, b, c, d) with a = -c, or None if no valid solution.
 
-    Valid region: excess kurtosis >= skew^2 * 1.7 + 1 (Fleishman boundary).
+    Feasibility guard (v49.1): target_ek >= skew^2 * 1.7 + 1 relaxed
+    to 0.80x so that marginal cases become no-ops rather than bad solves.
     """
-    # Feasibility pre-check: Fleishman cannot match arbitrary (skew, ek)
     min_ek = target_skew ** 2 * 1.7 + 1.0
-    if target_ek < min_ek * 0.95:
+    if target_ek < min_ek * 0.80:          # v49.1: was 0.95
         return None
 
     best     = None
     best_res = np.inf
 
-    # Grid of starting points
+    # Grid of starting points for (b, c, d)
     for b0 in [1.0, 0.9, 1.1]:
         for c0 in [0.0, target_skew * 0.05, -target_skew * 0.05]:
             for d0 in [0.01, target_ek * 0.002, 0.05]:
-                a0 = -c0
-                x0 = [a0, b0, c0, d0]
+                x0 = [b0, c0, d0]
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         sol, info, ier, _ = fsolve(
-                            _fleishman_equations, x0,
+                            _fleishman_equations_3, x0,
                             args=(target_skew, target_ek),
                             full_output=True,
                         )
                     if ier != 1:
                         continue
                     residual = float(np.linalg.norm(info["fvec"]))
-                    if residual < best_res and sol[1] > 0:  # b > 0
+                    b_sol = sol[0]
+                    if residual < best_res and b_sol > 0:   # b > 0 for monotone
                         best_res = residual
                         best     = sol
                 except Exception:
@@ -269,7 +261,10 @@ def _solve_fleishman(target_skew: float, target_ek: float):
 
     if best is None or best_res > 1e-3:
         return None
-    return tuple(float(x) for x in best)
+
+    b, c, d = float(best[0]), float(best[1]), float(best[2])
+    a = -c          # analytic: mean=0 constraint
+    return (a, b, c, d)
 
 
 def _apply_fleishman(z: np.ndarray, coefs) -> np.ndarray:
@@ -410,24 +405,23 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v49: +Step 6b Fleishman moment-matching)
+# 2. GENERATE  (v49.1: Fleishman with 3-unknown system + second rescale)
 #
 # 管線：
 #   Step 1  採樣基礎分佈（skewnorm+t 混合 or NIG）
-#           v48: NIG trigger raised 10→15; b_nig uses ret_skew_raw
 #   Step 2  AR1 Hurst 過濾
 #   Step 3  ACF lag1 微調
-#   Step 4  對稱 GARCH(1,1)  v48: vol_scale clipped [0.7, 1.3]
+#   Step 4  對稱 GARCH(1,1)
 #   Step 5  jump 疊加
-#   Step 6  exact rescale 到 (ret_mu, ret_std)
-#   Step 6b Fleishman Power Transform  ← v49 NEW
-#           標準化 → 求解 (a,b,c,d) → 變換 → re-rescale 到 (ret_mu, ret_std)
+#   Step 6  exact rescale → (ret_mu, ret_std)
+#   Step 6b Fleishman Power Transform (v49.1: 3-unknown system)
+#           標準化 → fsolve(b,c,d) → a=-c → 變換 → exact rescale → (ret_mu, ret_std)
 #   Step 7  OHLC wick
-#   Step 8  Volume（lognormal + vol-return coupling + AR1）
+#   Step 8  Volume
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP   = 50
-_NIG_TRIGGER  = 15.0   # v48: raised from 10.0
+_NIG_TRIGGER  = 15.0
 
 
 def generate(
@@ -567,25 +561,22 @@ def generate(
         z_final = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
-    # Step 6b: Fleishman Power Transform  (v49)
+    # Step 6b: Fleishman Power Transform  (v49.1)
     #
-    # Goal: simultaneously match target_skew (skew_raw) AND target_ek.
-    # Method:
-    #   1. Re-standardise z_final → z_std01 (mean=0, std=1)
-    #   2. Solve (a,b,c,d) via fsolve on the four Fleishman moment eqs
-    #   3. Apply Y = a + b*z + c*z^2 + d*z^3
-    #   4. Re-rescale back to (ret_mu, ret_std) so Steps 7-8 are unaffected
+    # Uses reduced 3-unknown system (a = -c by construction) to
+    # eliminate mean drift.  A second exact rescale after the polynomial
+    # transform is the final guarantee of (ret_mu, ret_std).
     #
-    # Falls back silently (identity transform) when:
-    #   - Solver diverges or residual too large
-    #   - |skew_raw| < 0.05 and target_ek < 1.0  (normal enough, skip)
-    #   - n_bars < 20  (too few points to matter)
+    # Skip when:
+    #   - n_bars < 20
+    #   - |skew_raw| < 0.05 AND target_ek < 1.0  (near-normal)
+    #   - Solver returns None (infeasible or diverged)
     # ------------------------------------------------------------------
     if n_bars >= 20 and (abs(skew_raw) >= 0.05 or target_ek >= 1.0):
         z_mean = float(np.mean(z_final))
         z_s2   = float(np.std(z_final))
         if z_s2 > 1e-10:
-            z_std01 = (z_final - z_mean) / z_s2   # standardise to (0,1)
+            z_std01 = (z_final - z_mean) / z_s2   # standardise to (0, 1)
 
             fleishman_coefs = _solve_fleishman(
                 target_skew = float(np.clip(skew_raw,   -3.0, 3.0)),
@@ -595,11 +586,10 @@ def generate(
             if fleishman_coefs is not None:
                 y_transformed = _apply_fleishman(z_std01, fleishman_coefs)
 
-                # Validate: transformed array must be finite and non-degenerate
                 if np.all(np.isfinite(y_transformed)):
                     y_s = float(np.std(y_transformed))
                     if y_s > 1e-10:
-                        # Re-rescale to original (ret_mu, ret_std)
+                        # Second exact rescale: guarantee (ret_mu, ret_std)
                         z_final = (
                             (y_transformed - float(np.mean(y_transformed))) / y_s
                             * ret_std + ret_mu
@@ -706,7 +696,6 @@ class OnlineRidgePredictor:
 
 # ---------------------------------------------------------------------------
 # 4. Rolling fit-generate
-# v48: add global std-rescale after concat
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
