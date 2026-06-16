@@ -1,73 +1,65 @@
 """
-stat_process.py  v13
+stat_process.py  v14
 ====================
 純統計過程模型，完全不使用 agent。
 
-Fix-13 — 修正 Fix-12 的兩個 bug
+Fix-14 — 修正 skew 符號翻轉問題
 ---------------------------------------
-Fix-12 結果：
-  skew   = +0.499  ✅ (真實 +0.449)
-  mean   = +0.00371 ❌ (真實 +0.00077, 偏差 4.8x)
-  kurtosis = 2.50  ❌ (真實 10.6)
+Fix-13 症狀：
+  kurtosis = 4.78 ✅(進步)
+  skew     = -0.82 ❌ (真實 +0.45，翻轉且幅度大)
+  mean     = +0.00090 ✅
 
-Bug-1 mean 偏移：
-  linspace 從超取樣 sorted pool 承接等距分位點。
-  skewnorm(a=+1.5) 的尾部正偏尾比負偏尾長，
-  linspace 選起麼点會包含更多正偏尾的樣本 =>均値偏移。
-  修正：直接用 skewnorm.rvs(size=n_bars) 隨機取樣，
-         不用超取樣 + linspace。
+Fix-13 的失敗原因：
+  q_mix(p) = (1-mix_t)*skewnorm.ppf(p,a) + mix_t*t.ppf(p,df)
+  當 skew_a < 0 的 window（共 18 個）：
+    - skewnorm.ppf(p, a=-2) 是左偏的
+    - t.ppf(p, df) 是對稱的， mix 後對稱成分導致
+      對稱的尾部放大，結合左偏 skewnorm => 左尾更大
+    - 18 個負 window 的導致對象決定了整體 skew 為負
 
-Bug-2 kurtosis 不足：
-  scipy 的 skewnorm(a) excess kurtosis 公式:
-    kurt_excess = (8-3π)δ⁴ / (1-(2/π)δ²)²，對 a=1 約 0.98
-  遠遠不夠 10.6。fat tail 必須來自 Student-t。
-  但 Fix-9~11 的線性混合會把 skew 拉向 0。
+  根本問題：
+    t.ppf 的對稱放大與 skewnorm 的方向交互 =>
+    負偏 window 的對稱尾部放大效果大於正偏 window
+    => 整體 skew 擅向負
 
-Fix-13 正確方案：
-  讓 skew 來自 skewnorm， fat tail 來自 t，透過 quantile-blend 合併。
+Fix-14 正確方案：尾部放大器（Tail Amplifier）
+  目標：增加 fat-tail 但不改變 skew 方向。
+  方法：對 skewnorm.ppf 的尾部分位點把尾部拉長，
+         中間分位點保持不變。
 
-  Step A: 建立混合尾部分佈的 marginal:
-    1. 取 n_large=5000 個 skewnorm(a, 0, 1) 樣本
-    2. 取 n_large=5000 個 t(df, 0, 1) 樣本
-    3. 按 quantile 混合 (mix_t=0.5):
-       對每個分位點 p ∈ (0,1):
-         q_sn(p) = skewnorm.ppf(p, a)
-         q_t(p)  = t.ppf(p, df)
-         q_mix(p) = (1-mix_t)*q_sn(p) + mix_t*q_t(p)
-       → q_mix 同時有 skewnorm 的 skew 形狀和 t 的 fat tail
-       → 不是線性混合分佈，而是 quantile 層面合併，skew 方向不會被消除
+  Tail Amplifier 定義：
+    t_q(p)  = |t.ppf(p, df)|         ← t 的尾部大小
+    n_q(p)  = |norm.ppf(p)|          ← Normal 的尾部大小
+    amp(p)  = t_q(p) / (n_q(p) + ε)  ← 尾部放大倍數（>1 在尾部）
 
-  Step B: 從 q_mix 直接 rvs n_bars 個樣本：
-    u_iid ~ Uniform(0,1), size=n_bars
-    samples = q_mix(u_iid)  ← 模擬直接從混合分佈取樣
+    q_mix(p) = skewnorm.ppf(p, a) * amp(p)
 
-  Step C: Gaussian Copula AR(1) rank-remap (同 Fix-12 Step 2-3):
-    samples_sorted = sort(samples)
-    u ~ AR(1) Gaussian => rank_of_u
-    z_final = samples_sorted[rank_of_u]
-    → 邊際 = q_mix 分佈（skew+fat-tail）
-    → 相關 = AR(1) 結構
+    特性：
+      - amp(p) > 1 在 p < 0.1 和 p > 0.9  => 尾部被拉長
+      - amp(p) ≈ 1 在 p ≈ 0.5           => 中間不變
+      - amp(p) 是關於 p=0.5 對稱的     => 不改變左右尾部的相對大小
+      - 因此 skewnorm 的算術 skew 符號被完全保留
 
-  Step D: Rescale:
-    log_rets = z_final * ret_std + ret_mu
+    kurtosis 來源：
+      amp(p) 在 p→0 和 p→1 時的增長幾乎跟 t(df) 的尾部行為一致
+      => 整體 kurtosis 接近 t(df) 的水準
 
-  選擇 mix_t=0.5 的依據：
-    t(df=8) 的 excess kurtosis = 6/(df-4) = 1.5
-    skewnorm(a=1) 的 excess kurtosis ≈ 0.98
-    重要： quantile 層面合併的 kurtosis 鄉尾部 q_t 控制，
-    mix_t=0.5 後尾部行為接近 t，kurtosis >> skewnorm 單獨。
-    AAPL 的真實 kurtosis=10.6 需要 df≈7.5 (excess≈1/(7.5-4)*6=2)
-    混合後約 3~5 excess，進步可以用 mix_t=0.7 提高。
+  Rescale：
+    z_mean = E[q_mix] = E[skewnorm(a)*amp]
+    z_std  = std[q_mix]
+    以 p_grid 上的 q_grid 計算 (uniform 積分)
+    z_norm = (z - z_mean) / z_std
+    log_rets = z_norm * ret_std + ret_mu
 
-v1-v13 修正歷程
+v1-v14 修正歷程
 --------------
-  Fix-1 : Student-t df 掃描 log-likelihood
-  Fix-2 : 改用 skewnorm 擬合
-  Fix-3 : wick_lambda 使用 rolling ATR (Wilder 14)
-  Fix-4~8: AR(1) 正規化、mean offset、rolling anchor
+  Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
+  Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
   Fix-9~11: 失敗—線性 t-blend 消除 skew
-  Fix-12: Gaussian Copula + skewnorm 邊際 => skew 修復但 kurtosis≈2.5
-  Fix-13: quantile-blend (skewnorm + t) 尾部，Gaussian Copula rank-remap
+  Fix-12  : Gaussian Copula + skewnorm 邊際 => skew 修復但 kurtosis≈2.5
+  Fix-13  : quantile-blend (skewnorm+t) => kurtosis 4.78 但 skew 翻轉 -0.82
+  Fix-14  : Tail Amplifier = t/normal 尾部比值 => kurtosis↑ + skew 符號保留
 """
 
 from __future__ import annotations
@@ -119,7 +111,6 @@ def _wilder_atr(hi: np.ndarray, lo: np.ndarray, cl: np.ndarray, period: int = 14
 
 
 def _fit_df_scan(log_rets: np.ndarray) -> float:
-    """Fix-1: bounded 1-D scan for best Student-t df in [2.1, 30]."""
     mu    = float(np.mean(log_rets))
     sigma = float(np.std(log_rets, ddof=1))
     def neg_ll(df):
@@ -128,7 +119,6 @@ def _fit_df_scan(log_rets: np.ndarray) -> float:
 
 
 def _fit_skewnorm(log_rets: np.ndarray) -> tuple[float, float, float]:
-    """Fix-2: MLE fit skewnorm, return (skew_a, loc, scale)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -142,7 +132,6 @@ def _fit_skewnorm(log_rets: np.ndarray) -> tuple[float, float, float]:
 
 
 def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
-    """Fix-3: normalize wick by Wilder ATR, return (wick_lambda, atr_mean)."""
     hi = df_ohlc["High"].values.astype(float)
     lo = df_ohlc["Low"].values.astype(float)
     op = df_ohlc["Open"].values.astype(float)
@@ -160,28 +149,35 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-def _build_quantile_blend_ppf(
+def _build_tail_amplified_ppf(
     skew_a: float,
     df_t: float,
-    mix_t: float = 0.5,
     n_grid: int = 5000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build a quantile-blended PPF grid from skewnorm + t.
-    q_mix(p) = (1-mix_t)*skewnorm.ppf(p,a) + mix_t*t.ppf(p,df)
+    Build a tail-amplified PPF:
+      q_mix(p) = skewnorm.ppf(p, a) * amp(p)
+    where:
+      amp(p) = |t.ppf(p, df)| / (|norm.ppf(p)| + eps)
 
-    Returns (p_grid, q_grid) for interpolation.
-    This is NOT linear mixture of distributions.
-    It's quantile-level blending: each quantile p gets a value
-    that is a weighted average of what skewnorm and t would assign.
-    Preserves skew direction (from skewnorm) and fat tails (from t).
+    amp(p) > 1 at tails (p near 0 or 1), amp(p) ≈ 1 at center.
+    Symmetric around p=0.5, so skew sign is fully preserved.
+    Fat-tail magnitude ≈ t(df) tails.
     """
     eps = 1e-4
-    p_grid = np.linspace(eps, 1.0 - eps, n_grid)
-    q_sn   = stats.skewnorm.ppf(p_grid, a=skew_a, loc=0, scale=1)
-    q_t    = stats.t.ppf(p_grid, df=max(df_t, 2.01), loc=0, scale=1)
-    q_mix  = (1.0 - mix_t) * q_sn + mix_t * q_t
-    return p_grid, q_mix
+    p = np.linspace(eps, 1.0 - eps, n_grid)
+
+    q_sn   = stats.skewnorm.ppf(p, a=skew_a, loc=0, scale=1)
+    q_t    = stats.t.ppf(p, df=max(df_t, 2.01), loc=0, scale=1)
+    q_norm = stats.norm.ppf(p, loc=0, scale=1)
+
+    # Tail amplifier: how much fatter t is vs normal at each quantile
+    amp = np.abs(q_t) / (np.abs(q_norm) + 1e-8)
+    # Clip amp to avoid extreme blowup at very deep tails
+    amp = np.clip(amp, 0.5, 8.0)
+
+    q_mix = q_sn * amp
+    return p, q_mix
 
 
 # ---------------------------------------------------------------------------
@@ -214,19 +210,11 @@ def fit(df_history: pd.DataFrame) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Fix-13: quantile-blend marginal + Gaussian Copula AR(1))
+# 2. GENERATE  (Fix-14: Tail Amplifier + Gaussian Copula)
 # ---------------------------------------------------------------------------
 
 def _ar1_hurst_rho(h: float) -> float:
     return float(np.clip(2 ** (2 * h - 1) - 1, -0.95, 0.95))
-
-
-# mix_t controls fat-tail intensity:
-#   0.0 = pure skewnorm  (kurtosis ~1)
-#   0.5 = balanced       (kurtosis ~3-4)
-#   0.7 = t-heavy        (kurtosis ~6-8)
-# AAPL excess kurtosis ~10.6 => use 0.7
-MIX_T_DEFAULT = 0.7
 
 
 def generate(
@@ -234,29 +222,24 @@ def generate(
     n_bars:      int,
     start_price: float = 100.0,
     seed:        int | None = None,
-    mix_t:       float = MIX_T_DEFAULT,
 ) -> pd.DataFrame:
     """
-    Fix-13: Quantile-blend marginal (skewnorm+t) + Gaussian Copula AR(1)
-    ---------------------------------------------------------------------
-    Marginal distribution = quantile blend of skewnorm and t:
-      q_mix(p) = (1-mix_t)*skewnorm.ppf(p,a) + mix_t*t.ppf(p,df)
+    Fix-14: Tail Amplifier marginal + Gaussian Copula AR(1)
+    --------------------------------------------------------
+    Marginal distribution:
+      q_mix(p) = skewnorm.ppf(p, a) * amp(p)
+      amp(p) = |t.ppf(p,df)| / |norm.ppf(p)|   (symmetric around p=0.5)
 
-    This is NOT a linear mixture of densities (which would destroy skew).
-    It is a blend at the quantile level:
-      - Left tail (p<0.5): q_t >> q_sn in absolute value  => fat left tail
-      - Right tail (p>0.5): q_t and q_sn blend, skewnorm shifts right => skew preserved
-      - Result: asymmetric fat tails with skewnorm's skew direction intact
+    Properties:
+      - amp(p=0.5) = 1  => center unchanged
+      - amp(p->0 or 1) > 1  => tails amplified like Student-t
+      - amp symmetric => skew sign of skewnorm is preserved exactly
+      - kurtosis elevated toward t(df) level
 
-    Autocorrelation is added via Gaussian Copula rank-remap (Fix-12 method).
+    Autocorrelation: Gaussian Copula rank-remap (same as Fix-12).
 
-    Steps:
-      A. Build q_mix PPF grid from (skew_a, df_t, mix_t)
-      B. Sample n_bars uniform values -> pass through q_mix -> i.i.d. samples
-         with target marginal
-      C. Generate Gaussian AR(1) -> get rank ordering
-      D. Rank-remap: assign sorted samples to AR(1) ranks
-      E. Rescale: log_rets = z_final * ret_std + ret_mu
+    Rescale: subtract E[q_mix], divide by std[q_mix] from p_grid
+    (theoretical moments, not empirical -> no tail compression).
     """
     rng = np.random.default_rng(seed)
 
@@ -268,16 +251,19 @@ def generate(
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Step A: build quantile-blend PPF grid
-    p_grid, q_grid = _build_quantile_blend_ppf(skew_a, df_t, mix_t=mix_t)
+    # Build tail-amplified PPF grid
+    p_grid, q_grid = _build_tail_amplified_ppf(skew_a, df_t)
 
-    # Step B: i.i.d. samples from blended marginal
-    # Generate uniform(0,1) -> interpolate through q_mix
+    # Theoretical mean and std from q_grid (uniform measure over p)
+    z_mean = float(np.mean(q_grid))
+    z_std  = float(np.std(q_grid))
+
+    # i.i.d. samples from blended marginal
     u_iid = rng.uniform(0.0, 1.0, size=n_bars)
     samples = np.interp(u_iid, p_grid, q_grid)
     samples_sorted = np.sort(samples)
 
-    # Step C: Gaussian AR(1) for rank ordering
+    # Gaussian AR(1) copula
     rho = _ar1_hurst_rho(hurst)
     eps = rng.standard_normal(n_bars)
     if abs(rho) > 0.01:
@@ -289,20 +275,13 @@ def generate(
     else:
         u_ar1 = eps.copy()
 
-    # Step D: rank-remap (Gaussian Copula)
-    rank_of_ar1 = np.argsort(np.argsort(u_ar1))  # 0..n_bars-1
+    # Rank remap
+    rank_of_ar1 = np.argsort(np.argsort(u_ar1))
     z_final = samples_sorted[rank_of_ar1]
 
-    # Step E: rescale
-    # z_final has mean = E[q_mix(U)] where U~Uniform(0,1)
-    # = integral of q_mix dp  = mean of the blended distribution
-    # For skewnorm(a,0,1): mean = delta*sqrt(2/pi), not 0.
-    # We need to subtract the theoretical mean of the blended distribution
-    # and then scale, so that log_rets has exactly ret_mu and ret_std.
-    z_mean = float(np.mean(q_grid))   # E[q_mix] = integral over uniform p
-    z_std  = float(np.std(q_grid))    # std of q_mix over uniform p
+    # Rescale using theoretical moments (no empirical std compression)
     if z_std > 1e-10:
-        z_norm = (z_final - z_mean) / z_std  # mean=0, std=1, skew/kurt preserved
+        z_norm = (z_final - z_mean) / z_std
     else:
         z_norm = z_final - z_mean
     log_rets = z_norm * ret_std + ret_mu
@@ -321,8 +300,7 @@ def generate(
     lower_wicks = rng.exponential(scale=wick_lam * atr_proxy)
     body_hi     = np.maximum(opens, closes)
     body_lo     = np.minimum(opens, closes)
-
-    volumes = rng.lognormal(mean=15.0, sigma=0.5, size=n_bars).astype(int)
+    volumes     = rng.lognormal(mean=15.0, sigma=0.5, size=n_bars).astype(int)
 
     return pd.DataFrame({
         "Open":   opens,
