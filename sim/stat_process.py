@@ -1,25 +1,20 @@
 """
-stat_process.py  v30
+stat_process.py  v31
 ====================
 純統計過程模型，完全不使用 agent。
 
-v30 三項 fix（v29 骨架不動）：
+v31 fix（v30 骨架不動）：
 ------------------------------------------------------
-Fix-B v30：chi2 boost 更激進
-  v29: nu_boost = df_t * 0.3, clip(2.5, 8.0), chi2_scale clip(0.5, 3.5)
-  v30: nu_boost = df_t * 0.15, clip(1.5, 4.0), chi2_scale clip(0.5, 5.0)
-  更小的 nu → chi2 分佈右尾更肥 → scale 期望值更大 → kurtosis ↑
+Fix-D v31：jump 注入後加 final global std 收斂，並移除 jump 後的 body rescale
+  問題根源：v30 的 Fix-A2 在 z_scaled 上做全局 std 收斂，但 jump 注入後
+  在 log_rets 上還有一段 body rescale（條件 body_std > ret_std * 1.1）。
+  這導致：Fix-A2 的 global_scale 被後續 jump body rescale 部分覆蓋，
+  整體 std 仍偏高 +13%（0.01810 vs 0.01603）。
+  修法：移除 jump 後的 body rescale（兩次 rescale 疊加干擾），
+  改為在 jump 注入後、OHLC 重建前做一次 final global std 收斂。
+  等比縮放不改變 skew/kurtosis 形狀，只讓 std 精確落回 ret_std。
 
-Fix-A2 v30：Fix-A body rescale 後加全局 std 收斂
-  等比縮放整體序列使 std 精確落回 ret_std。
-  等比縮放不改變 skew/kurtosis 的分佈形狀。
-  解決 v29 std 偏高 +13% 的問題。
-
-Fix-C v30：skew 幅度限制（原有符號保護基礎上新增）
-  sample_skew 若超過 target_skew_mag * 1.5（上限 1.5）則阻尼壓縮。
-  避免 adaptive predictor 把 skew_a 推到 2.5+ 後整體 skew 偏大。
-
-v1-v30 修正歷程
+v1-v31 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -52,8 +47,11 @@ v1-v30 修正歷程
   Fix-29  : 移除 chi2 boost 內的舊 body rescale，只留 Fix-A 的單次縮放
              => kurtosis 4.32↑ hurst 0.690✅ skew +0.712✅ std 1.812 偏高
              方向命中率 0.519✅
-  Fix-30  : chi2 更激進 + 全局 std 收斂 + skew 幅度限制
-             預期 kurtosis 6+，std 收斂，skew ~0.4-0.5
+  Fix-30  : chi2 更激進 + 全局 std 收斂(z_scaled) + skew 幅度限制
+             => kurtosis 8.82✅↑ skew +0.466✅ hurst 0.678✅ std 1.810 仍偏高
+             方向命中率 0.539✅
+  Fix-31  : 移除 jump 後 body rescale，改為 jump 後 final global std 收斂
+             => 預期 std 收斂至 ret_std，kurtosis/skew 形狀保留
 """
 
 from __future__ import annotations
@@ -238,7 +236,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v30: aggressive chi2 + global std rescale + skew magnitude clamp)
+# 2. GENERATE  (v31: final global std rescale after jump, remove jump body rescale)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -332,10 +330,10 @@ def generate(
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
 
     if tail_mask_boost.sum() >= 2:
-        nu_boost   = float(np.clip(df_t * 0.15, 1.5, 4.0))   # v30: 更激進
+        nu_boost   = float(np.clip(df_t * 0.15, 1.5, 4.0))
         chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
-        chi2_scale = np.clip(chi2_scale, 0.5, 5.0)             # v30: 放開上限
+        chi2_scale = np.clip(chi2_scale, 0.5, 5.0)
 
         z_boosted = z_scaled.copy()
         tail_vals = z_scaled[tail_mask_boost]
@@ -357,7 +355,6 @@ def generate(
 
     # ------------------------------------------------------------------
     # Fix-A2 v30: 全局 std 收斂（等比縮放，不改形狀）
-    # 消除 chi2 boost 後整體 std 膨脹的問題
     # ------------------------------------------------------------------
     cur_std = float(np.std(z_scaled - ret_mu))
     if cur_std > 1e-8:
@@ -373,7 +370,6 @@ def generate(
             warnings.simplefilter("ignore")
             sample_skew = float(stats.skew(z_scaled))
 
-        # 符號保護（v27 原有邏輯）
         target_sign = int(np.sign(skew_a))
         actual_sign = int(np.sign(sample_skew))
         if actual_sign != 0 and actual_sign != target_sign:
@@ -382,10 +378,8 @@ def generate(
                 warnings.simplefilter("ignore")
                 sample_skew = float(stats.skew(z_scaled))
 
-        # v30 新增：幅度限制，避免 adaptive 把 skew_a 推高後整體 skew 過大
         target_skew_mag = min(abs(skew_a), 1.5)
         if abs(sample_skew) > target_skew_mag * 1.5 and abs(sample_skew) > 0.1:
-            # 對 body 部分做阻尼，尾部不動（保留 kurtosis）
             damp = target_skew_mag * 1.5 / abs(sample_skew)
             damp = float(np.clip(damp, 0.3, 1.0))
             body_mask_c = np.abs(z_scaled - ret_mu) <= tail_threshold
@@ -396,20 +390,22 @@ def generate(
     # ------------------------------------------------------------------
     log_rets = z_scaled.copy()
 
-    jump_mask = np.zeros(n_bars, dtype=bool)
+    # jump 注入（v31: 移除 jump 後的 body rescale，改由 final global std 收斂統一處理）
     if jump_freq > 0 and n_bars > 0:
         jump_mask  = rng.uniform(size=n_bars) < jump_freq
         jump_sizes = rng.normal(0.0, jump_std, size=n_bars)
         log_rets   = log_rets + np.where(jump_mask, jump_sizes, 0.0)
+    # v30 的 jump 後 body rescale 已移除，由下方 Fix-D 統一處理
 
-        body_mask = ~jump_mask
-        if body_mask.sum() > 10:
-            body_std = float(np.std(log_rets[body_mask] - ret_mu))
-            if body_std > ret_std * 1.1:
-                body_scale = ret_std / body_std
-                log_rets[body_mask] = (
-                    (log_rets[body_mask] - ret_mu) * body_scale + ret_mu
-                )
+    # ------------------------------------------------------------------
+    # Fix-D v31: jump 後 final global std 收斂（等比縮放，保留 kurtosis/skew 形狀）
+    # 這是最後一道 std 收斂，確保 jump 不會膨脹整體 std
+    # ------------------------------------------------------------------
+    final_std = float(np.std(log_rets - ret_mu))
+    if final_std > 1e-8:
+        final_scale = ret_std / final_std
+        final_scale = float(np.clip(final_scale, 0.6, 1.4))
+        log_rets = ret_mu + (log_rets - ret_mu) * final_scale
 
     opens  = np.empty(n_bars)
     closes = np.empty(n_bars)
