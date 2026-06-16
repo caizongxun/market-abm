@@ -10,9 +10,20 @@ RegimeCalibrator: 每隔 `step` 根 K 棒，對前 `lookback` 根
 - EMA 平滑（alpha=0.4）：新估值影響 40%，歷史殘留 60%
   - alpha 大 → 跟得快但抖；alpha 小 → 穩定但反應慢
   - 0.4 是中間偏快的設定，避免參數斷層
-- loss 加入 p_up penalty + vol_err + abs_vol_pen
+- loss 加入 mean_err / p_up penalty / vol_err / abs_vol_pen
 - std_ratio 對稱 penalty：sim_std/real_std 超出 (cap, 1/cap) 區間時 loss *= 2.0
 - impact_coeff grid 收縮到 [0.0005, 0.0010, 0.0015]，抑制 sim_std 偏高
+
+修改說明（A+B 同步）
+--------------------
+A. momentum_scale grid 從 [0.5, 1.0, 2.0] 下移至 [0.2, 0.5, 1.0]。
+   原本上限 2.0 在 AAPL 長期上漲的 lookback 窗口中會持續注入正 drift，
+   導致 sim mean 是 real mean 的 3x 以上。新上限 1.0 能抑制系統性漂移。
+
+B. loss 加入 mean_err 懲罰（w_mean 預設 2.0）：
+     mean_err = |sim_mean - real_mean| / (|real_mean| + 1e-8)
+   calibrator 會主動避開讓 drift 偏離的參數組合。
+   _search_window() 同步計算 real_mean 並傳入 _loss()。
 
 Grid 更新說明（intra_noise_scale）
 -----------------------------------
@@ -42,6 +53,7 @@ loss 公式
        + w_kurt  * |kurt_err| / (|real_kurt| + 1)
        + w_vol   * |std_err|  / (real_std + 1e-8)
        + w_vol   * max(0, sim_std - 2*real_std) / (real_std + 1e-8)  <- abs_vol_pen
+       + w_mean  * |mean_err| / (|real_mean| + 1e-8)                 <- NEW
        + w_pup   * p_up penalty
 
   ratio = sim_std / real_std
@@ -68,12 +80,14 @@ from .metrics import compare, hurst_exponent, log_returns
 # ---------------------------------------------------------------------------
 # Small grid for per-window search
 # 3x3x3x4 = 108 combos, ~10 sims each = 1080 paths per window
-# intra_noise_scale lower bound extended from 0.7 → 0.4 to accommodate
-# the heavier t(4) tails after removing the hard clip in _t_draw().
+#
+# A: momentum_scale 下移至 [0.2, 0.5, 1.0]，原 [0.5, 1.0, 2.0]。
+#    原上限 2.0 在 AAPL 長期上漲的 lookback 中持續注入正 drift，
+#    導致 sim mean >> real mean。
 # ---------------------------------------------------------------------------
 ROLLING_GRID: dict[str, list] = {
     "impact_coeff":      [0.0005, 0.0010, 0.0015],
-    "momentum_scale":    [0.5,    1.0,    2.0   ],
+    "momentum_scale":    [0.2,    0.5,    1.0   ],   # A: was [0.5, 1.0, 2.0]
     "decay":             [0.90,   0.93,   0.97  ],
     "intra_noise_scale": [0.4,    0.7,    1.0,   1.5],
 }
@@ -95,8 +109,8 @@ class RegimeCalibrator:
         EMA 平滑係數。建議範圍 0.3–0.6。
     grid : dict
         參數搜尋網格，預設 ROLLING_GRID（3x3x3x4 = 108）。
-    w_hurst, w_dir, w_kurt, w_vol, w_pup : float
-        loss 各項權重。
+    w_hurst, w_dir, w_kurt, w_vol, w_pup, w_mean : float
+        loss 各項權重。w_mean 預設 2.0，懲罰 sim drift 偏離 real mean。
     p_up_lo, p_up_hi : float
         p_up 合理範圍，超出會加 penalty。
     std_ratio_cap : float
@@ -118,6 +132,7 @@ class RegimeCalibrator:
         w_kurt:  float = 0.5,
         w_vol:   float = 3.0,
         w_pup:   float = 1.5,
+        w_mean:  float = 2.0,
         p_up_lo: float = 0.25,
         p_up_hi: float = 0.60,
         std_ratio_cap: float = 1.5,
@@ -134,6 +149,7 @@ class RegimeCalibrator:
         self.w_kurt        = w_kurt
         self.w_vol         = w_vol
         self.w_pup         = w_pup
+        self.w_mean        = w_mean
         self.p_up_lo       = p_up_lo
         self.p_up_hi       = p_up_hi
         self.std_ratio_cap = std_ratio_cap
@@ -146,6 +162,7 @@ class RegimeCalibrator:
         real_hurst: float,
         real_kurtosis: float,
         real_std: float,
+        real_mean: float,
         p_up: float,
     ) -> float:
         sim = metrics["sim"]
@@ -158,12 +175,17 @@ class RegimeCalibrator:
 
         abs_vol_pen = max(0.0, sim_std - 2.0 * real_std) / (real_std + 1e-8)
 
+        # B: mean_err — 懲罰 sim 每根 bar 平均報酬偏離 real mean
+        sim_mean = sim.get("mean", 0.0)
+        mean_err = abs(sim_mean - real_mean) / (abs(real_mean) + 1e-8)
+
         loss = (
             self.w_hurst * hurst_err
             + self.w_dir  * dir_term
             + self.w_kurt * kurt_err
             + self.w_vol  * vol_err
             + self.w_vol  * abs_vol_pen
+            + self.w_mean * mean_err
             + self.w_pup  * pup_pen
         )
 
@@ -188,6 +210,7 @@ class RegimeCalibrator:
         from scipy import stats as scipy_stats
         real_kurtosis = float(scipy_stats.kurtosis(train_rets))
         real_std      = float(np.std(train_rets))
+        real_mean     = float(np.mean(train_rets))   # B: 用於 mean_err
 
         keys   = list(self.grid.keys())
         combos = list(itertools.product(*[self.grid[k] for k in keys]))
@@ -222,14 +245,16 @@ class RegimeCalibrator:
             final_rets = (close_mat[:, -1] - close_mat[:, 0]) / close_mat[:, 0]
             p_up = float((final_rets > 0).mean())
 
-            loss = self._loss(m, real_hurst, real_kurtosis, real_std, p_up)
+            loss = self._loss(m, real_hurst, real_kurtosis, real_std, real_mean, p_up)
             if loss < best_loss:
                 best_loss   = loss
                 best_params = {**params, "loss": loss, "p_up": p_up,
                                "hurst_sim": m["sim"]["hurst"],
                                "real_hurst": real_hurst,
                                "real_std": real_std,
-                               "sim_std": m["sim"]["std"]}
+                               "sim_std": m["sim"]["std"],
+                               "real_mean": real_mean,
+                               "sim_mean": m["sim"].get("mean", float("nan"))}
 
         return best_params
 
@@ -304,7 +329,7 @@ class RegimeCalibrator:
         current_params = {
             "impact_coeff":      float(np.median(self.grid["impact_coeff"])),
             "momentum_scale":    float(np.median(self.grid["momentum_scale"])),
-            "decay":             float(np.median(self.grid["decay"])),
+            "decay":             float(np.median(self.grid["decay\"])),
             "intra_noise_scale": float(np.median(self.grid["intra_noise_scale"])),
         }
 
@@ -336,7 +361,8 @@ class RegimeCalibrator:
                     f"noise={smoothed['intra_noise_scale']:.2f}  "
                     f"decay={smoothed['decay']:.3f}  "
                     f"loss={best.get('loss', float('nan')):.4f}  "
-                    f"std sim/real={best.get('sim_std', 0)*100:.3f}%/{best.get('real_std', 0)*100:.3f}%"
+                    f"std sim/real={best.get('sim_std', 0)*100:.3f}%/{best.get('real_std', 0)*100:.3f}%  "
+                    f"mean sim/real={best.get('sim_mean', float('nan'))*10000:.2f}/{best.get('real_mean', float('nan'))*10000:.2f}bps"
                 )
 
             param_log.append({
@@ -353,6 +379,8 @@ class RegimeCalibrator:
                 "real_hurst":        best.get("real_hurst", float("nan")),
                 "sim_std":           best.get("sim_std",    float("nan")),
                 "real_std":          best.get("real_std",   float("nan")),
+                "sim_mean":          best.get("sim_mean",   float("nan")),
+                "real_mean":         best.get("real_mean",  float("nan")),
             })
 
             # -------------------------------------------------------
