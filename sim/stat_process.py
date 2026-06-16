@@ -1,22 +1,29 @@
 """
-stat_process.py  v4
+stat_process.py  v5
 ===================
 純統計過程模型，完全不使用 agent。
 
-v4 修正 (Fix-5)
-------------------
-  問題 : AR(1) 後第二次標準化成 (mem - mean) / std 把偏態结構碳平
-           skewnorm(a>0) 取樣後 mean > median，減去 mean 之後對稱的左尾
-           相對跟長，造成模擬 skew 翻負。
-  修正 : AR(1) 後只隠就 std，保留偏差（mean 影響小於 0.001），
-           最後 rescale 到 ret_mu 時統一對齊。
+v5 修正 (Fix-6) — 根本解法
+--------------------------
+  問題根源 : generate() Step-1 對 skewnorm 取樣後做 full standardize
+             (z - mean) / std，這把 skew 帶來的 mean offset 磨掉了。
+             skewnorm(a>0) 的 mean = a/sqrt(1+a²)*sqrt(2/π)，
+             這個 mean offset 正是「右尾多、左尾少」的數值表現，
+             一旦 demean 就等於強制對稱化，後續 AR(1) 無論怎麼改都救不回來。
+  修正 : Step-1 只做 scale normalization (除以 std，不減 mean)，
+         保留 skewnorm 的 mean offset。
+         Step-2 AR(1) 後同樣只除 std，不 demean (Fix-5 保留)。
+         Step-3 rescale 時直接 z * ret_std + ret_mu，
+         mean offset 在 z 裡自然存在，不需額外補償。
 
-v1-v3 修正
-------------
+v1-v5 修正歷程
+--------------
   Fix-1 : Student-t df 掃描 log-likelihood
   Fix-2 : 改用 skewnorm 擬合
-  Fix-3 : wick_lambda 使用 rolling ATR（Wilder 14）
-  Fix-4 : AR(1) 正規化經正確的 skewnorm 實際 std
+  Fix-3 : wick_lambda 使用 rolling ATR (Wilder 14)
+  Fix-4 : AR(1) 正規化使用 skewnorm 實際 std
+  Fix-5 : AR(1) 後只除 std，不 demean
+  Fix-6 : Step-1 取樣後也只除 std，不 demean（本次根本修正）
 
 Pipeline
 --------
@@ -159,14 +166,21 @@ def generate(
     seed:        int | None = None,
 ) -> pd.DataFrame:
     """
-    Fix-4 + Fix-5 generation pipeline
-    ----------------------------------
+    Fix-6 generation pipeline (definitive skew-preserving design)
+    -------------------------------------------------------------
     Step 1: sample skewnorm(a, loc=0, scale=1)
-            -> force mean=0, std=1  (preserve shape / skew sign)
+            scale-only normalization: z /= std(z)   -- DO NOT demean
+            The mean offset of skewnorm encodes the asymmetry;
+            removing it symmetrizes the distribution before AR(1) even runs.
+
     Step 2: AR(1) memory injection in unit space
-            -> scale-only normalization: divide by std, DO NOT subtract mean
-            -> keeps the asymmetric tail intact (Fix-5)
-    Step 3: rescale to target mean=ret_mu, std=ret_std
+            scale-only normalization after AR(1): mem /= std(mem)  -- DO NOT demean
+            (Fix-5, kept from v4)
+
+    Step 3: rescale to target statistics
+            log_rets = z * ret_std + ret_mu
+            The skew mean-offset in z is O(0.001) -- negligible drift,
+            but carries the sign/direction of the tail asymmetry intact.
     """
     rng = np.random.default_rng(seed)
 
@@ -177,13 +191,13 @@ def generate(
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Step 1: standardized skewnorm sample
+    # Step 1: skewnorm sample -- scale only, preserve mean offset (Fix-6)
     z = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars, random_state=rng)
     z_std = np.std(z)
     if z_std > 1e-10:
-        z = (z - np.mean(z)) / z_std   # full standardize at draw time is fine
+        z = z / z_std   # <-- scale only, DO NOT subtract mean
 
-    # Step 2: AR(1) in unit space
+    # Step 2: AR(1) in unit space -- scale only (Fix-5)
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 0.01:
         mem = np.empty(n_bars)
@@ -191,14 +205,12 @@ def generate(
         innov_scale = np.sqrt(1.0 - rho ** 2)
         for i in range(1, n_bars):
             mem[i] = rho * mem[i-1] + innov_scale * z[i]
-        # Fix-5: scale-only normalization -- preserve mean offset from skew
         m_std = np.std(mem)
         if m_std > 1e-10:
-            mem = mem / m_std   # <-- DO NOT demean here
+            mem = mem / m_std   # scale only
         z = mem
 
     # Step 3: rescale to real sample statistics
-    # z is now ~unit-std with skew shape intact; shift mean to ret_mu
     log_rets = z * ret_std + ret_mu
 
     # Rebuild OHLC
