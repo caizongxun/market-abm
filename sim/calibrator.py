@@ -1,13 +1,14 @@
 """
-calibrator.py  v2
+calibrator.py  v3
 =================
 AdaptiveCalibrator：replay buffer + XGBoost 校正模型。
 
+v3 fix：
+  - load() 加 try/except，捕捉 EOFError / UnpicklingError（崩潰時產生的損壞 pkl），
+    自動刪檔並以全新 calibrator 繼續執行。
 v2 fix：
   - Ridge fallback 改用 RidgeModel 類別，取代 lambda 閉包，
     解決 pickle.dump 時 "Can't pickle local function" 的問題。
-  - save() 在 XGBoost 不可用時改儲存 buffer 權重向量，
-    load() 時呼叫 _fit_models() 重建模型。
 
 架構
 ----
@@ -30,7 +31,7 @@ Reward（純量，越高越好）
 
 持久化
   calibrator.save(path)   # pickle
-  calibrator.load(path)   # 就地恢復
+  calibrator.load(path)   # 就地恢復（損壞檔自動刪除從頭來過）
 """
 from __future__ import annotations
 
@@ -42,7 +43,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-# XGBoost 為可選依賴；若不存在則退化到 Ridge
 try:
     from xgboost import XGBRegressor
     _HAS_XGB = True
@@ -92,7 +92,6 @@ PARAM_SAFE: Dict[str, tuple] = {
 
 @dataclass
 class CalibAction:
-    """校正向量，每個分量為相對 delta（d_x 表示乘以 (1+d_x)）。"""
     d_ret_std:         float = 0.0
     d_hurst:           float = 0.0
     d_target_ek:       float = 0.0
@@ -136,8 +135,6 @@ class CalibAction:
 # ---------------------------------------------------------------------------
 
 class ReplayBuffer:
-    """固定容量的環形 buffer。"""
-
     def __init__(self, capacity: int = 5000):
         self.capacity = capacity
         self._ctx:    List[np.ndarray] = []
@@ -173,12 +170,10 @@ class ReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
-# RidgeModel — 可 pickle 的 Ridge fallback（取代 lambda 閉包）
+# RidgeModel — 可 pickle 的 Ridge fallback
 # ---------------------------------------------------------------------------
 
 class RidgeModel:
-    """Closed-form Ridge，可安全 pickle。"""
-
     def __init__(self, alpha: float = 1.0):
         self.alpha = alpha
         self.w_: Optional[np.ndarray] = None
@@ -194,7 +189,7 @@ class RidgeModel:
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self.w_ is None:
-            return np.zeros(len(X))
+            return np.zeros(len(np.atleast_2d(X)))
         return np.atleast_2d(X) @ self.w_
 
 
@@ -205,14 +200,7 @@ class RidgeModel:
 class AdaptiveCalibrator:
     """
     跨 trial 持久化的校正器。
-
-    工作流程
-    --------
-    1. predict(ctx)  → CalibAction
-    2. action.apply(params) 修正 StatParams
-    3. 產生模擬、計算誤差指標
-    4. record(ctx, action, **err_metrics) 存入 buffer
-    5. 每 update_interval 筆自動重新訓練模型
+    崩潰時產生的損壞 pkl 會被 load() 自動刪除，不影響下次執行。
     """
 
     def __init__(
@@ -236,15 +224,10 @@ class AdaptiveCalibrator:
             colsample_bytree = 0.8,
             verbosity        = 0,
         )
-
         self._buffer    = ReplayBuffer(capacity)
         self._models: Optional[List[Any]] = None
         self._n_since_fit: int = 0
         self.n_experiences:  int = 0
-
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def build_context(params: Dict[str, Any]) -> np.ndarray:
@@ -263,27 +246,19 @@ class AdaptiveCalibrator:
               - 0.1 * dir_hit)
         return float(np.clip(r, -5.0, 1.0))
 
-    # ------------------------------------------------------------------
-    # Model training
-    # ------------------------------------------------------------------
-
     def _fit_models(self) -> None:
         if len(self._buffer) < self.min_train:
             return
-
-        X = self._buffer.contexts   # (N, 9)
-        A = self._buffer.actions    # (N, 4)
-        R = self._buffer.rewards    # (N,)
-
+        X = self._buffer.contexts
+        A = self._buffer.actions
+        R = self._buffer.rewards
         R_shifted = R - R.min() + 1e-6
         w = R_shifted / R_shifted.sum()
-
         self._models = []
         for i in range(len(ACTION_KEYS)):
             y        = A[:, i]
             y_target = np.full_like(y, float(np.sum(w * y)))
             y_blend  = (1 - w) * y + w * y_target
-
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 if _HAS_XGB:
@@ -292,12 +267,7 @@ class AdaptiveCalibrator:
                 else:
                     m = RidgeModel(alpha=1.0).fit(X, y_blend)
             self._models.append(m)
-
         self._n_since_fit = 0
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def predict(self, ctx: np.ndarray) -> CalibAction:
         if self._models is None or len(self._buffer) < self.min_train:
@@ -312,7 +282,6 @@ class AdaptiveCalibrator:
                 lo, hi = ACTION_CLIP[ACTION_KEYS[i]]
                 deltas.append(float(np.clip(val, lo, hi)))
             action = CalibAction.from_array(np.array(deltas))
-
         if self.explore_std > 0:
             noise = np.random.normal(0, self.explore_std, size=len(ACTION_KEYS))
             a_arr = action.to_array() + noise
@@ -320,7 +289,6 @@ class AdaptiveCalibrator:
                 lo, hi = ACTION_CLIP[key]
                 a_arr[i] = float(np.clip(a_arr[i], lo, hi))
             action = CalibAction.from_array(a_arr)
-
         return action
 
     def record(
@@ -336,13 +304,12 @@ class AdaptiveCalibrator:
         self._buffer.push(context, action.to_array(), reward)
         self.n_experiences += 1
         self._n_since_fit  += 1
-
         if (self._n_since_fit >= self.update_interval
                 and len(self._buffer) >= self.min_train):
             self._fit_models()
 
     # ------------------------------------------------------------------
-    # Persistence — pickle-safe（不存 lambda）
+    # Persistence
     # ------------------------------------------------------------------
 
     def save(self, path: str) -> None:
@@ -350,7 +317,7 @@ class AdaptiveCalibrator:
         with open(path, "wb") as f:
             pickle.dump({
                 "buffer":          self._buffer,
-                "models":          self._models,   # XGBRegressor 或 RidgeModel，均可 pickle
+                "models":          self._models,
                 "n_experiences":   self.n_experiences,
                 "explore_std":     self.explore_std,
                 "min_train":       self.min_train,
@@ -359,8 +326,21 @@ class AdaptiveCalibrator:
             }, f)
 
     def load(self, path: str) -> None:
-        with open(path, "rb") as f:
-            state = pickle.load(f)
+        """
+        載入 pkl。若檔案損壞（EOFError 或 UnpicklingError），
+        自動刪除并以空 calibrator 繼續，不會中斷執行。
+        """
+        try:
+            with open(path, "rb") as f:
+                state = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, Exception) as exc:
+            print(f"[calib] WARNING: corrupt pkl ({exc}), deleting and starting fresh.")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return   # 保持目前空狀態
+
         self._buffer          = state["buffer"]
         self._models          = state.get("models")
         self.n_experiences    = state.get("n_experiences", len(self._buffer))
