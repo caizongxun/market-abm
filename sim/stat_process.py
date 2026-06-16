@@ -1,20 +1,22 @@
 """
-stat_process.py  v31
+stat_process.py  v32
 ====================
 純統計過程模型，完全不使用 agent。
 
-v31 fix（v30 骨架不動）：
+v32 fix（v31 骨架不動）：
 ------------------------------------------------------
-Fix-D v31：jump 注入後加 final global std 收斂，並移除 jump 後的 body rescale
-  問題根源：v30 的 Fix-A2 在 z_scaled 上做全局 std 收斂，但 jump 注入後
-  在 log_rets 上還有一段 body rescale（條件 body_std > ret_std * 1.1）。
-  這導致：Fix-A2 的 global_scale 被後續 jump body rescale 部分覆蓋，
-  整體 std 仍偏高 +13%（0.01810 vs 0.01603）。
-  修法：移除 jump 後的 body rescale（兩次 rescale 疊加干擾），
-  改為在 jump 注入後、OHLC 重建前做一次 final global std 收斂。
-  等比縮放不改變 skew/kurtosis 形狀，只讓 std 精確落回 ret_std。
+Fix-E v32：chi2 clip 上限 5.0 → 3.0，final_scale clip (0.6,1.4) → (0.5,1.0)
+  問題根源：v31 結果 kurtosis 13.03 > 目標 10.60，代表 chi2 tail booster
+  的 clip(0.5, 5.0) 上限過寬，允許個別尾部點被放大到 5x，
+  final global rescale 雖然等比縮小整體，但無法消除 chi2 的非線性尾部效果，
+  導致 kurtosis 過衝而 std 仍偏高 +11%。
+  修法 1：chi2_scale clip 上限 5.0 → 3.0，抑制極端尾部放大。
+  修法 2：final_scale clip (0.6, 1.4) → (0.5, 1.0)，
+  只允許縮不允許放大。jump 注入通常讓 std 膨脹，
+  final_scale 應 < 1.0；若 > 1.0 代表 jump 反而縮小了 std，
+  這種邊緣情況允許放大會讓 std 偏高。
 
-v1-v31 修正歷程
+v1-v32 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -51,7 +53,11 @@ v1-v31 修正歷程
              => kurtosis 8.82✅↑ skew +0.466✅ hurst 0.678✅ std 1.810 仍偏高
              方向命中率 0.539✅
   Fix-31  : 移除 jump 後 body rescale，改為 jump 後 final global std 收斂
-             => 預期 std 收斂至 ret_std，kurtosis/skew 形狀保留
+             => kurtosis 13.03 過衝 skew +0.188✅ hurst 0.681✅ std 1.785 仍偏高
+             方向命中率 0.539✅
+  Fix-32  : chi2 clip 5.0→3.0 抑制 kurtosis 過衝
+             final_scale clip (0.6,1.4)→(0.5,1.0) 只允許縮
+             => 預期 kurtosis 回落至接近 10.6，std 更精確收斂
 """
 
 from __future__ import annotations
@@ -236,7 +242,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v31: final global std rescale after jump, remove jump body rescale)
+# 2. GENERATE  (v32: chi2 clip 5.0->3.0, final_scale clip (0.5,1.0))
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -323,8 +329,8 @@ def generate(
         z_scaled = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
-    # Fix-B v30: variance-mixture tail booster（更激進）
-    # nu_boost 更小 → chi2 右尾更肥 → scale 期望更大 → kurtosis ↑
+    # Fix-B v30: variance-mixture tail booster
+    # Fix-E v32: chi2_scale clip 上限 5.0 → 3.0（抑制 kurtosis 過衝）
     # ------------------------------------------------------------------
     tail_threshold  = 1.5 * ret_std
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
@@ -333,7 +339,7 @@ def generate(
         nu_boost   = float(np.clip(df_t * 0.15, 1.5, 4.0))
         chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
-        chi2_scale = np.clip(chi2_scale, 0.5, 5.0)
+        chi2_scale = np.clip(chi2_scale, 0.5, 3.0)  # v32: 5.0 → 3.0
 
         z_boosted = z_scaled.copy()
         tail_vals = z_scaled[tail_mask_boost]
@@ -395,16 +401,16 @@ def generate(
         jump_mask  = rng.uniform(size=n_bars) < jump_freq
         jump_sizes = rng.normal(0.0, jump_std, size=n_bars)
         log_rets   = log_rets + np.where(jump_mask, jump_sizes, 0.0)
-    # v30 的 jump 後 body rescale 已移除，由下方 Fix-D 統一處理
 
     # ------------------------------------------------------------------
-    # Fix-D v31: jump 後 final global std 收斂（等比縮放，保留 kurtosis/skew 形狀）
-    # 這是最後一道 std 收斂，確保 jump 不會膨脹整體 std
+    # Fix-D v31 / Fix-E v32: jump 後 final global std 收斂
+    # v32: clip 改為 (0.5, 1.0)，只允許縮不允許放大
+    # jump 注入通常讓 std 膨脹，final_scale 應 <= 1.0
     # ------------------------------------------------------------------
     final_std = float(np.std(log_rets - ret_mu))
     if final_std > 1e-8:
         final_scale = ret_std / final_std
-        final_scale = float(np.clip(final_scale, 0.6, 1.4))
+        final_scale = float(np.clip(final_scale, 0.5, 1.0))  # v32: (0.6,1.4) → (0.5,1.0)
         log_rets = ret_mu + (log_rets - ret_mu) * final_scale
 
     opens  = np.empty(n_bars)
