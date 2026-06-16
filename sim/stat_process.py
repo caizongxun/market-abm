@@ -1,27 +1,31 @@
 """
-stat_process.py  v45
+stat_process.py  v46
 ====================
 純統計過程模型，完全不使用 agent。
 
-v45: 三項修正，解決 v44 的 std+50%、skew 反轉、kurtosis+67% 問題
-  1. final exact rescale
-     - hard-clip 之後強制 (z - mean) / std * ret_std + ret_mu
-     - 直接保證輸出 std == ret_std、mean == ret_mu，不受任何前層影響
-  2. skew-aware chi2 amp
-     - 正尾 amp factor = base * (1 + clamp(skew_a/10, -0.5, 0.5))
-     - 負尾 amp factor = base * (1 - clamp(skew_a/10, -0.5, 0.5))
-     - skew_a > 0 → 正尾放大 > 負尾，恢復右偏
-  3. jump ↔ chi2 互斥
-     - target_ek < 5：完全跳過 chi2 amp
-     - target_ek >= 5 且做 chi2 amp：jump_freq_eff *= 0.25
+v46: 兩大問題的根本原因找到，重寫 generate()
 
-v44: 修復 body-only renorm tail explosion + ±8σ hard-clip
-v43: body-only renorm（有 mean_shift bug，已修正於 v44）
+  問題 1: GJR-GARCH 的非對稱 alpha_d/alpha_u 是 skew 反轉的根本原因
+    負向衝擊讓 h_t 更大 → 負尾被放大更多 → 結果永遠左偏
+    → 改為標準對稱 GARCH(1,1)，「skew」由採樣分佈負責
+
+  問題 2: body-only renorm + chi2 amp + jump 三層疊加 → std/kurt 失控
+    → 拜除所有中間層，改為最後一步做平均一次 exact rescale
+
+  新的 generate() 管線：
+    1. 採樣：skewnorm + t 混合（由 skew_a 和 df_t 控制，nig for high ek）
+    2. AR1 Hurst 过濾
+    3. ACF lag1 微調
+    4. 對稱 GARCH(1,1)（不再非對稱）— 只做 vol 谷峰聚集，不改變 skew
+    5. jump 疊加
+    6. 一次 exact rescale 到 (ret_mu, ret_std)
+    7. 價格序列 + OHLC wick
+
+v45: skew-aware chi2 amp + jump/chi2 互斥（但 GJR 仍導致 skew 反轉）
+v44: body-only renorm tail explosion 修復
+v43: body-only renorm
 v42: hard renorm patch
-v41b: 修復 OnlineRidgePredictor._ridge_predict 括號 typo
-v41 patch: target_ek clip / HIGH_EK_THRESH / chi2 amp 上限
-v40: AdaptiveCalibrator 整合
-v1-v39: 見舊 docstring
+v1-v41: 見舊 docstring
 """
 
 from __future__ import annotations
@@ -250,22 +254,22 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v45)
+# 2. GENERATE  (v46 重寫)
 #
-# 修正摘要：
-#   Fix-1  final exact rescale
-#          hard-clip 後一次 (z-mean)/std*ret_std+ret_mu，保證 std==ret_std
-#   Fix-2  skew-aware chi2 amp
-#          正尾/負尾用不同的 amp factor，skew_a > 0 → 正尾 > 負尾 → 右偏
-#   Fix-3  jump ↔ chi2 互斥
-#          target_ek < 5: 不做 chi2 amp
-#          target_ek >= 5 且做 chi2: jump_freq_eff *= 0.25
+# 管線：
+#   Step 1  採樣基礎分佈（skewnorm+t 混合 or NIG）
+#           「skew」完全由分佈層負責，後續不再加入任何非對稱視武器
+#   Step 2  AR1 Hurst 过濾
+#   Step 3  ACF lag1 微調
+#   Step 4  對稱 GARCH(1,1) — 只做 vol 谷峰聚集，不改變 skew
+#           重要：不再使用 GJR，避免非對稱链對尾部的影響
+#   Step 5  jump 疊加
+#   Step 6  single exact rescale 到 (ret_mu, ret_std)
+#           不管前面層疊加多少，最後一步保證結果精確
+#   Step 7  OHLC wick
 # ---------------------------------------------------------------------------
 
-_AR1_WARMUP     = 50
-_HIGH_EK_THRESH = 12.0
-_CHI2_AMP_MAX   = 2.5
-_TAIL_HARD_CLIP = 8.0
+_AR1_WARMUP = 50
 
 
 def generate(
@@ -292,27 +296,13 @@ def generate(
 
     total = n_bars + _AR1_WARMUP
 
-    # Fix-3: jump ↔ chi2 互斥 — 決定 chi2 是否啟用，並相應縮減 jump_freq
-    use_chi2_amp   = target_ek >= 5.0
-    jump_freq_eff  = jump_freq * 0.25 if use_chi2_amp else jump_freq
-
-    HIGH_EK_THRESH = _HIGH_EK_THRESH
-
-    # --- 基礎分佈採樣 ---
-    if target_ek > HIGH_EK_THRESH:
-        df_t_eff   = float(np.clip(df_t, 2.5, 8.0))
-        t_ek_eff   = 6.0 / max(df_t_eff - 4.0, 0.1)
-        p_t        = float(np.clip(target_ek / (t_ek_eff + 1e-8), 0.10, 0.98))
-        mask       = rng.uniform(size=total) < p_t
-        sn_samples = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
-                                        size=total, random_state=rng)
-        t_samples  = stats.t.rvs(df=df_t_eff, loc=0, scale=1,
-                                  size=total, random_state=rng)
-        z_raw = np.where(mask, t_samples, sn_samples)
-    elif target_ek > 6.0:
+    # ------------------------------------------------------------------
+    # Step 1: 採樣基礎分佈（分佈層負責 skew 和 fat tail）
+    # ------------------------------------------------------------------
+    if target_ek > 10.0:
+        # NIG: 能同時控制 skew 和 kurtosis
         nig_ab = _nig_params_from_moments(ret_std, skew_a, target_ek)
-        use_nig = nig_ab is not None
-        if use_nig:
+        if nig_ab is not None:
             a_nig, b_nig = nig_ab
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -322,30 +312,38 @@ def generate(
                         size=total, random_state=int(rng.integers(0, 2**31))
                     )
                 except Exception:
-                    use_nig = False
-        if not use_nig:
-            t_ek = 6.0 / max(df_t - 4.0, 0.1)
-            p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.92))
-            mask       = rng.uniform(size=total) < p_t
-            sn_samples = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
-                                            size=total, random_state=rng)
-            t_samples  = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
-                                      size=total, random_state=rng)
-            z_raw = np.where(mask, t_samples, sn_samples)
-    else:
-        t_ek = 6.0 / max(df_t - 4.0, 0.1)
-        p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.92))
-        mask       = rng.uniform(size=total) < p_t
-        sn_samples = stats.skewnorm.rvs(a=skew_a, loc=0, scale=1,
-                                        size=total, random_state=rng)
-        t_samples  = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
-                                  size=total, random_state=rng)
-        z_raw = np.where(mask, t_samples, sn_samples)
+                    z_raw = None
+        else:
+            z_raw = None
 
-    # --- AR1 Hurst ---
+        if z_raw is None:
+            # fallback: skewnorm + heavy-t 混合
+            df_t_eff = float(np.clip(df_t, 2.5, 6.0))
+            p_t      = float(np.clip(target_ek / 15.0, 0.30, 0.90))
+            mask     = rng.uniform(size=total) < p_t
+            z_raw    = np.where(
+                mask,
+                stats.t.rvs(df=df_t_eff, loc=0, scale=1, size=total, random_state=rng),
+                stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total, random_state=rng),
+            )
+    else:
+        # skewnorm + t 混合，比例由 target_ek 决定
+        df_t_eff = float(np.clip(df_t, 2.5, 20.0))
+        t_ek     = 6.0 / max(df_t_eff - 4.0, 0.1) if df_t_eff > 4.0 else 3.0
+        p_t      = float(np.clip(target_ek / max(t_ek, 0.5), 0.05, 0.85))
+        mask     = rng.uniform(size=total) < p_t
+        z_raw    = np.where(
+            mask,
+            stats.t.rvs(df=df_t_eff, loc=0, scale=1, size=total, random_state=rng),
+            stats.skewnorm.rvs(a=skew_a, loc=0, scale=1, size=total, random_state=rng),
+        )
+
+    # ------------------------------------------------------------------
+    # Step 2: AR1 Hurst
+    # ------------------------------------------------------------------
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 1e-6:
-        innov_sc    = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
+        innov_sc = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
         z_ar_ext    = np.empty(total)
         z_ar_ext[0] = z_raw[0]
         for i in range(1, total):
@@ -354,136 +352,70 @@ def generate(
     else:
         z_ar = z_raw[_AR1_WARMUP:].copy()
 
-    # --- ACF lag1 ---
-    z_final = z_ar
+    # ------------------------------------------------------------------
+    # Step 3: ACF lag1 微調
+    # ------------------------------------------------------------------
     if abs(acf_lag1) > 0.05 and n_bars > 1:
-        z_adj = z_final.copy()
+        z_acf = z_ar.copy()
         for i in range(1, n_bars):
-            z_adj[i] = z_final[i] + acf_lag1 * z_final[i - 1] * 0.3
-        z_std = float(np.std(z_adj))
-        if z_std > 1e-10:
-            z_adj = z_adj / z_std
-    else:
-        z_adj = z_final
+            z_acf[i] = z_ar[i] + acf_lag1 * z_ar[i - 1] * 0.3
+        z_s = float(np.std(z_acf))
+        z_ar = z_acf / z_s if z_s > 1e-10 else z_acf
 
-    # --- GJR-GARCH ---
+    # ------------------------------------------------------------------
+    # Step 4: 對稱 GARCH(1,1) — 不再使用 GJR 非對稱項
+    # 目的：vol 谷峰聚集、不改變分佈對稱性
+    # vol_scale clip (0.5, 1.5)，防止過度放大造成 std 失控
+    # ------------------------------------------------------------------
     alpha = vol_persistence
-    if alpha > 0.01 and n_bars > 1:
-        gamma    = float(np.clip(alpha * 0.6, 0.0, 0.4))
-        beta     = float(np.clip(alpha * 0.7, 0.0, 0.89))
-        alpha_u  = alpha * (1.0 - gamma)
-        alpha_d  = alpha * (1.0 + gamma)
-        base_var = ret_std ** 2
-        omega    = base_var * max(1.0 - beta - 0.5*(alpha_u + alpha_d), 0.01)
+    if alpha > 0.02 and n_bars > 1:
+        beta     = float(np.clip(alpha * 0.8, 0.0, 0.89))
+        alpha_s  = float(np.clip(alpha * 0.15, 0.01, 0.20))   # 對稱 ARCH 項
+        base_var = 1.0   # z_ar 已標準化，base var = 1
+        omega    = base_var * max(1.0 - beta - alpha_s, 0.01)
 
-        h_t        = np.empty(n_bars)
-        z_gjr      = np.empty(n_bars)
-        h_t[0]     = base_var
-        z_gjr[0]   = z_adj[0]
+        h_t      = np.empty(n_bars)
+        z_garch  = np.empty(n_bars)
+        h_t[0]   = base_var
+        z_garch[0] = z_ar[0]
 
         for i in range(1, n_bars):
-            prev_ret = z_gjr[i - 1] * ret_std
-            if prev_ret < 0:
-                resid_term = alpha_d * prev_ret ** 2
-            else:
-                resid_term = alpha_u * prev_ret ** 2
-            h_t[i]   = omega + beta * h_t[i - 1] + resid_term
+            h_t[i]   = omega + beta * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
             h_t[i]   = max(h_t[i], base_var * 0.01)
-            vol_scale = float(np.clip(
-                np.sqrt(h_t[i]) / (ret_std + 1e-10), 0.3, 2.5
-            ))
-            z_gjr[i] = z_adj[i] * vol_scale
+            # clip vol_scale 在 (0.5, 1.5)，保留谷峰但不按照平方放大
+            vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.5, 1.5))
+            z_garch[i] = z_ar[i] * vol_scale
     else:
-        z_gjr = z_adj
+        z_garch = z_ar
 
-    # --- body-only renorm（v44 修正版） ---
-    z_mean = float(np.mean(z_gjr))
-    z_std  = float(np.std(z_gjr))
-    if z_std > 1e-10:
-        body_mask = np.abs(z_gjr - z_mean) < 2.0 * z_std
-        z_scaled  = z_gjr.copy()
-
-        if np.any(body_mask):
-            body_mean = float(np.mean(z_gjr[body_mask]))
-            body_std  = float(np.std(z_gjr[body_mask]))
-            if body_std > 1e-10:
-                z_scaled[body_mask] = (
-                    (z_gjr[body_mask] - body_mean) / body_std * ret_std + ret_mu
-                )
-            else:
-                z_scaled[body_mask] = ret_mu
-
-        if np.any(~body_mask):
-            tail_scale = ret_std / z_std
-            z_scaled[~body_mask] = (
-                (z_gjr[~body_mask] - z_mean) * tail_scale + ret_mu
-            )
-
-        cur_mean = float(np.mean(z_scaled))
-        z_scaled += (ret_mu - cur_mean)
-    else:
-        z_scaled = np.full(n_bars, ret_mu)
-
-    # --- Fix-2: skew-aware chi2 tail amp ---
-    # Fix-3: target_ek < 5 時完全跳過 chi2 amp
-    if use_chi2_amp and target_ek <= HIGH_EK_THRESH:
-        tail_threshold = 1.2 * ret_std
-        tail_mask      = np.abs(z_scaled - ret_mu) > tail_threshold
-
-        nu_raw   = 3.0 / max(df_t - 4.0, 0.1)
-        nu_boost = float(np.clip(nu_raw, 0.5, 3.0))
-
-        # skew_a 決定正尾/負尾的放大比例
-        # skew_a > 0 → 正尾 factor 大 → 右偏；反之左偏
-        skew_factor = float(np.clip(skew_a / 10.0, -0.5, 0.5))
-        pos_tail_boost = 1.0 + skew_factor   # skew_a=+5 → 1.5x base
-        neg_tail_boost = 1.0 - skew_factor   # skew_a=+5 → 0.5x base
-
-        if np.any(tail_mask):
-            chi2_raw  = rng.chisquare(df=max(df_t, 3.0), size=int(np.sum(tail_mask)))
-            chi2_norm = chi2_raw / max(df_t, 3.0)
-            extreme_mask_local = chi2_norm > 2.5
-            chi2_norm = np.where(
-                extreme_mask_local,
-                np.clip(chi2_norm, 0.5, 5.0),
-                np.clip(chi2_norm, 0.5, 3.5),
-            )
-            base_amp   = np.clip(1.0 + nu_boost * (chi2_norm - 1.0), 0.5, _CHI2_AMP_MAX)
-            sign_mask  = np.sign(z_scaled[tail_mask] - ret_mu)
-
-            # 正尾/負尾分別套用不同 boost
-            directional_boost = np.where(sign_mask > 0, pos_tail_boost, neg_tail_boost)
-            amp = np.clip(1.0 + (base_amp - 1.0) * directional_boost, 0.5, _CHI2_AMP_MAX)
-
-            z_scaled[tail_mask] = (
-                ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
-            )
-
-    # --- jump（Fix-3: 使用縮減後的 jump_freq_eff）---
-    if jump_freq_eff > 0 and n_bars > 0:
-        n_jumps = int(rng.binomial(n_bars, jump_freq_eff))
+    # ------------------------------------------------------------------
+    # Step 5: jump
+    # ------------------------------------------------------------------
+    z_work = z_garch.copy()
+    if jump_freq > 0 and n_bars > 0:
+        n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
             jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
-            jump_sizes = rng.normal(0.0, jump_std, size=n_jumps)
-            z_scaled[jump_idx] += jump_sizes
+            jump_sizes = rng.normal(0.0, 1.0, size=n_jumps)   # unit-std jumps
+            z_work[jump_idx] += jump_sizes
 
-    # --- tail hard-clip ±8σ ---
-    clip_lo  = ret_mu - _TAIL_HARD_CLIP * ret_std
-    clip_hi  = ret_mu + _TAIL_HARD_CLIP * ret_std
-    z_clipped = np.clip(z_scaled, clip_lo, clip_hi)
-
-    # --- Fix-1: final exact rescale — 保證 std == ret_std、mean == ret_mu ---
-    z_cur_std = float(np.std(z_clipped))
-    if z_cur_std > 1e-10:
-        z_final_out = (z_clipped - float(np.mean(z_clipped))) / z_cur_std * ret_std + ret_mu
+    # ------------------------------------------------------------------
+    # Step 6: single exact rescale 到 (ret_mu, ret_std)
+    # 不管之前層疊加多少，最後一步保證
+    # ------------------------------------------------------------------
+    z_std = float(np.std(z_work))
+    if z_std > 1e-10:
+        z_final = (z_work - float(np.mean(z_work))) / z_std * ret_std + ret_mu
     else:
-        z_final_out = np.full(n_bars, ret_mu)
+        z_final = np.full(n_bars, ret_mu)
 
-    # --- 價格序列 ---
+    # ------------------------------------------------------------------
+    # Step 7: OHLC 價格序列 + wick
+    # ------------------------------------------------------------------
     prices    = np.empty(n_bars + 1)
     prices[0] = start_price
     for i in range(n_bars):
-        prices[i + 1] = prices[i] * np.exp(z_final_out[i])
+        prices[i + 1] = prices[i] * np.exp(z_final[i])
 
     opens  = prices[:-1].copy()
     closes = prices[1:].copy()
