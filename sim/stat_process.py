@@ -1,19 +1,24 @@
 """
-stat_process.py  v25
+stat_process.py  v26
 ====================
 純統計過程模型，完全不使用 agent。
 
-v25 新增（v24 骨架不動）：
+v26 新增（v25 骨架不動）：
 ------------------------------------------------------
-在 rolling_fit_generate() 裡插入 OnlineRidgePredictor。
-  - fit() / generate() 邏輯完全不改
-  - 每個 window 跑完 fit() 後，predictor 先 observe() 記錄訓練樣本
-  - 前 min_train(=10) 個 window 純觀察，第 11 個起開始混合預測
-  - blend_w 從 0 線性增長到 0.5，最大只信一半 predictor
-  - 若 sklearn 未安裝，自動退化為純 fit() 模式
-  - 新增 --no-adapt flag 可停用（run_sim.py 傳入 use_adaptive=False）
+方向 A — variance-mixture tail booster（generate()）
+  在 z_scaled 完成後、jump 之前插入：
+  - 對 |z - ret_mu| > 1.5*ret_std 的尾部樣本乘 chi2 scaling factor
+  - chi2_scale = sqrt(nu_boost / chi2(nu_boost)), nu_boost = max(ret_df*0.5, 3.0)
+  - clip chi2_scale 到 (0.5, 2.5)
+  - 事後 body-only rescale：確保非跳躍 bar 的 std 回到 ret_std，不膨脹
+  目標：kurtosis 從 2.9 拉高，同時 std 不受影響
 
-v1-v25 修正歷程
+方向 B — target_ek 加入 predictor（adaptive_params.py）
+  TARGET_NAMES 新增 target_ek 為第 4 個預測目標
+  Ridge 學習何時市場尾部特別肥，自適應調整 p_t 的上游參數
+  predict_and_blend() blend target_ek，clip 到 (1.0, 25.0)
+
+v1-v26 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -33,8 +38,10 @@ v1-v25 修正歷程
              => kurtosis 3.97✅↑ hurst 0.74 偏高 skew -0.24
   Fix-24  : AR(1) warmup + global ek floor + hurst clip 0.69
              => skew -0.068✅ hurst 0.720✅ kurtosis 2.62 偏低
-  Fix-25  : OnlineRidgePredictor（adaptive_params.py）
-             => 從歷史 K 棒特徵自適應預測 ret_std/skew_a/hurst
+  Fix-25  : OnlineRidgePredictor => skew +0.023✅ hurst 0.717✅ 方向命中率 0.516✅
+             kurtosis 2.90 退步
+  Fix-26  : variance-mixture tail booster + target_ek in predictor
+             => 目標 kurtosis 7+ 同時 std 不膨脹
 """
 
 from __future__ import annotations
@@ -219,7 +226,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v24，不改動)
+# 2. GENERATE  (v26: + variance-mixture tail booster)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -305,6 +312,40 @@ def generate(
     else:
         z_scaled = np.full(n_bars, ret_mu)
 
+    # ------------------------------------------------------------------
+    # v26: variance-mixture tail booster
+    # 只作用在尾部 (|z - mu| > 1.5*std)，中心段不動
+    # chi2_scale ~ sqrt(nu/chi2(nu))，等價於 Student-t 的 variance mixing
+    # 事後 body-only rescale 確保 std 不膨脹
+    # ------------------------------------------------------------------
+    tail_threshold = 1.5 * ret_std
+    tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
+
+    if tail_mask_boost.sum() >= 2:
+        nu_boost = float(np.clip(df_t * 0.5, 3.0, 15.0))
+        chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
+        chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
+        chi2_scale = np.clip(chi2_scale, 0.5, 2.5)
+
+        z_boosted = z_scaled.copy()
+        # 圍繞 ret_mu 做尾部放大，保留方向
+        tail_vals = z_scaled[tail_mask_boost]
+        z_boosted[tail_mask_boost] = ret_mu + (tail_vals - ret_mu) * chi2_scale
+
+        # body-only rescale：讓非尾部 bar 的 std 回到 ret_std
+        body_mask = ~tail_mask_boost
+        if body_mask.sum() > 5:
+            body_vals = z_boosted[body_mask]
+            body_std  = float(np.std(body_vals - ret_mu))
+            if body_std > 1e-10:
+                target_body_std = ret_std * float(np.sqrt(1.0 - p_t * 0.3))
+                body_scale = target_body_std / body_std
+                body_scale = float(np.clip(body_scale, 0.5, 2.0))
+                z_boosted[body_mask] = ret_mu + (body_vals - ret_mu) * body_scale
+
+        z_scaled = z_boosted
+    # ------------------------------------------------------------------
+
     log_rets = z_scaled.copy()
 
     jump_mask = np.zeros(n_bars, dtype=bool)
@@ -347,7 +388,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. ROLLING FIT -> GENERATE  (v25: + OnlineRidgePredictor)
+# 3. ROLLING FIT -> GENERATE  (v25 邏輯不動，v26 只新增 use_adaptive 路徑)
 # ---------------------------------------------------------------------------
 
 def rolling_fit_generate(
@@ -358,7 +399,7 @@ def rolling_fit_generate(
     seed:                int = 42,
     real_anchor_weight:  float = 0.3,
     verbose:             bool = True,
-    use_adaptive:        bool = True,   # v25: 可停用 predictor
+    use_adaptive:        bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
     if n_forward is None:
         n_forward = step
@@ -369,7 +410,6 @@ def rolling_fit_generate(
         global_ek = float(stats.kurtosis(full_rets))
     ek_floor = float(np.clip(global_ek, 3.0, 20.0))
 
-    # v25: 初始化 predictor
     predictor = None
     if use_adaptive:
         try:
@@ -385,7 +425,7 @@ def rolling_fit_generate(
     n_total    = len(df_real)
     sim_chunks: list[pd.DataFrame] = []
     param_log:  list[dict]         = []
-    past_params: list[StatParams]  = []   # v25: 歷史 params 供 feature extractor
+    past_params: list[StatParams]  = []
     window_idx = 0
     pos        = lookback
     sim_last_close: float | None = None
@@ -401,7 +441,6 @@ def rolling_fit_generate(
         df_window = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         params    = fit(df_window, apply_trend_bias=True, ek_global_floor=ek_floor)
 
-        # v25: adaptive blending
         if predictor is not None:
             past_params.append(params)
             feats = extract_features(df_real, fit_end, past_params)
@@ -409,7 +448,6 @@ def rolling_fit_generate(
             if predictor.ready:
                 params = predictor.predict_and_blend(feats, params)
 
-        # soft anchor
         real_close = float(df_real["Close"].iloc[fit_end - 1])
         if sim_last_close is None or real_anchor_weight >= 1.0:
             start_px = real_close

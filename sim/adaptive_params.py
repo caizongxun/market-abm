@@ -1,10 +1,12 @@
 """
-adaptive_params.py  v25
+adaptive_params.py  v26
 =======================
 Feature Extractor + OnlineRidgePredictor
 
-從歷史 K 棒提取 market-specific features，用 Ridge 迴歸預測
-下一個 window 的 generate 參數（ret_std, ret_skew_a, hurst_target）。
+v26 變更：
+  TARGET_NAMES 新增 target_ek 為第 4 個預測目標
+  Ridge 學習市場何時尾部特別肥，自適應調整 p_t 的上游參數
+  predict_and_blend() blend target_ek，clip 到 (1.0, 25.0)
 
 設計原則：
 - 完全獨立，不改動 stat_process.py 的 fit() 和 generate()
@@ -21,8 +23,8 @@ Features（7個）：
   skew_sign_streak  連續幾個 window skew_a 同號（正=持續正skew，負=持續負skew）
   consec_direction  fit_end 前連續上漲(+)或下跌(-)的 bar 數
 
-Targets（3個）：
-  ret_std, ret_skew_a, hurst_target
+Targets（4個）：
+  ret_std, ret_skew_a, hurst_target, target_ek
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ FEATURE_NAMES = [
     "consec_direction",
 ]
 
-TARGET_NAMES = ["ret_std", "ret_skew_a", "hurst_target"]
+TARGET_NAMES = ["ret_std", "ret_skew_a", "hurst_target", "target_ek"]  # v26: +target_ek
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +79,8 @@ def extract_features(
     end_idx = min(fit_end, len(closes))
 
     # --- std_rank ----------------------------------------------------------
-    # 當前 window 的 ret_std 相對歷史最大值（需要至少 2 個 window）
     if len(past_params) >= 2:
-        hist_stds = [p["ret_std"] for p in past_params[:-1]]  # 不含當前
+        hist_stds = [p["ret_std"] for p in past_params[:-1]]
         max_std   = max(hist_stds) if hist_stds else past_params[-1]["ret_std"]
         std_rank  = float(past_params[-1]["ret_std"] / max(max_std, 1e-10))
     else:
@@ -87,7 +88,6 @@ def extract_features(
     std_rank = float(np.clip(std_rank, 0.1, 3.0))
 
     # --- vol_trend ---------------------------------------------------------
-    # 後半 30 bar std / 前半 30 bar std（使用 fit window 前 60 bar）
     lookback = 60
     start_idx = max(0, end_idx - lookback)
     window_closes = closes[start_idx:end_idx]
@@ -114,15 +114,12 @@ def extract_features(
         price_vs_low20  = 1.0
 
     # --- hurst_lag ---------------------------------------------------------
-    # 前一個 window 的 hurst_target（沒有就用 0.5）
     if len(past_params) >= 2:
         hurst_lag = float(past_params[-2]["hurst_target"])
     else:
         hurst_lag = 0.5
 
     # --- skew_sign_streak --------------------------------------------------
-    # 計算連續幾個 window skew_a 同號
-    # 正值 = 連續正 skew，負值 = 連續負 skew
     if len(past_params) >= 2:
         streak = 1
         sign0  = np.sign(past_params[-1]["ret_skew_a"])
@@ -137,7 +134,6 @@ def extract_features(
     skew_sign_streak = float(np.clip(skew_sign_streak, -10.0, 10.0))
 
     # --- consec_direction --------------------------------------------------
-    # fit window 最後若干根 K 棒的連續方向
     consec = 0
     if end_idx >= 2:
         direction = np.sign(closes[end_idx - 1] - closes[end_idx - 2])
@@ -169,8 +165,10 @@ class OnlineRidgePredictor:
     """
     Online Ridge Regression predictor。
 
-    - observe()        : 每個 window 跑完後記錄 (features, targets)
-    - predict_and_blend(): 用 Ridge 預測，與 fit() 結果加權混合
+    v26: targets 從 3 個擴充到 4 個，新增 target_ek
+
+    - observe()             : 每個 window 跑完後記錄 (features, targets)
+    - predict_and_blend()  : 用 Ridge 預測，與 fit() 結果加權混合
     - blend_w 從 0 線性增長到 max_blend（預設 0.5），越跑越信任 predictor
 
     Parameters
@@ -195,7 +193,7 @@ class OnlineRidgePredictor:
 
         self._X: list[np.ndarray] = []
         self._y: list[np.ndarray] = []
-        self._models: dict        = {}   # target_name -> fitted Ridge
+        self._models: dict        = {}
 
     # ------------------------------------------------------------------
     @property
@@ -217,6 +215,7 @@ class OnlineRidgePredictor:
             params["ret_std"],
             params["ret_skew_a"],
             params["hurst_target"],
+            params["target_ek"],      # v26: 新增
         ], dtype=float)
         self._X.append(features.copy())
         self._y.append(targets.copy())
@@ -234,7 +233,7 @@ class OnlineRidgePredictor:
             return
 
         X = np.array(self._X)   # (n, 7)
-        y = np.array(self._y)   # (n, 3)
+        y = np.array(self._y)   # (n, 4)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -253,7 +252,7 @@ class OnlineRidgePredictor:
         params:   "StatParams",
     ) -> "StatParams":
         """
-        用 Ridge 預測三個目標參數，與 fit() 結果加權混合後回傳新的 StatParams。
+        用 Ridge 預測四個目標參數，與 fit() 結果加權混合後回傳新的 StatParams。
 
         blend_w 隨樣本數線性增長：
           blend_w = max_blend * (n_samples - min_train) / max(min_train, 1)
@@ -262,7 +261,6 @@ class OnlineRidgePredictor:
         if not self.ready or "ridge" not in self._models:
             return params
 
-        # blend weight：線性從 0 增長到 max_blend
         blend_w = float(np.clip(
             self.max_blend * (self.n_samples - self.min_train) / max(self.min_train, 1),
             0.0,
@@ -271,23 +269,26 @@ class OnlineRidgePredictor:
 
         try:
             X_sc   = self._models["scaler"].transform(features.reshape(1, -1))
-            pred   = self._models["ridge"].predict(X_sc)[0]   # shape (3,)
+            pred   = self._models["ridge"].predict(X_sc)[0]   # shape (4,)
         except Exception:
             return params
 
         pred_std   = float(pred[0])
         pred_skew  = float(pred[1])
         pred_hurst = float(pred[2])
+        pred_ek    = float(pred[3])   # v26: 新增
 
         # 安全 clip
         pred_std   = float(np.clip(pred_std,   1e-4, 0.15))
         pred_skew  = float(np.clip(pred_skew, -10.0, 10.0))
         pred_hurst = float(np.clip(pred_hurst,  0.3,  0.69))
+        pred_ek    = float(np.clip(pred_ek,     1.0,  25.0))  # v26
 
         # 加權混合
         new_std   = (1 - blend_w) * params["ret_std"]      + blend_w * pred_std
         new_skew  = (1 - blend_w) * params["ret_skew_a"]   + blend_w * pred_skew
         new_hurst = (1 - blend_w) * params["hurst_target"] + blend_w * pred_hurst
+        new_ek    = (1 - blend_w) * params["target_ek"]    + blend_w * pred_ek  # v26
 
         if self.verbose:
             print(
@@ -295,12 +296,13 @@ class OnlineRidgePredictor:
                 f"std {params['ret_std']:.4f}->{new_std:.4f}  "
                 f"skew {params['ret_skew_a']:+.3f}->{new_skew:+.3f}  "
                 f"hurst {params['hurst_target']:.3f}->{new_hurst:.3f}  "
+                f"tgt_ek {params['target_ek']:.2f}->{new_ek:.2f}  "
                 f"(n={self.n_samples})"
             )
 
-        # 建新的 StatParams（其餘欄位沿用 fit() 結果）
         new_params: StatParams = dict(params)  # type: ignore[assignment]
         new_params["ret_std"]      = new_std
         new_params["ret_skew_a"]   = new_skew
         new_params["hurst_target"] = new_hurst
+        new_params["target_ek"]    = new_ek    # v26
         return new_params  # type: ignore[return-value]
