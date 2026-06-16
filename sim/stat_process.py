@@ -1,24 +1,21 @@
 """
-stat_process.py  v28
+stat_process.py  v29
 ====================
 純統計過程模型，完全不使用 agent。
 
-v28 單項 fix（v27 骨架不動）：
+v29 單項 fix（v28 骨架不動）：
 ------------------------------------------------------
-Fix-A 改版：body-only rescale，不碰尾部
-  問題根源：v27 Fix-A 對全局 z_scaled 做 std 正規化，
-  把 chi2 boost 拉大的尾部一起縮回來，
-  導致 kurtosis 從 5.43(v26) 反退到 4.85(v27)。
+Fix-A v29：移除 chi2 boost 段內的第一次 body rescale
+  問題根源：v28 有兩次 body rescale
+    第一次：chi2 boost 段末尾的 target_body_std / body_scale（v27 遺留）
+    第二次：Fix-A 段的 scale_a = ret_std * 0.85 / body_std_a（v28 新增）
+  兩次疊加導致 body 被過度壓縮，kurtosis 從 5.43(v26) 退步到 4.07(v28)。
 
-  新做法：
-    1. 定義 body_mask_a = |z - ret_mu| <= tail_threshold (1.5*ret_std)
-    2. 只縮放 body 段，使 body_std = ret_std * 0.85
-       （讓 body 略低於 ret_std，給尾部騰出 std 配額）
-    3. 尾部完全不動，保留 chi2 boost 後的幅度
-  body 占 ~80% bar，整體 std 仍會收斂到 ret_std ± 5%，
-  但不再壓掉尾部的 kurtosis 貢獻。
+  修正：移除第一次（chi2 boost 段內的 body_mask / target_body_std），
+  只保留 Fix-A 段的 body-only rescale（scale = 0.85）。
+  chi2 boost 後尾部完全不動，body 只被縮一次，kurtosis 貢獻得以保留。
 
-v1-v28 修正歷程
+v1-v29 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -47,7 +44,9 @@ v1-v28 修正歷程
              => kurtosis 4.85 退步（Fix-A 把尾部壓回去了）
              skew +0.741✅ hurst 0.690✅ std 1.763
   Fix-28  : Fix-A 改為 body-only rescale（scale_a=0.85），不碰尾部
-             預期 kurtosis↑ std 收斂 skew 維持正號
+             => kurtosis 4.07 退步（兩次 body rescale 疊加）
+  Fix-29  : 移除 chi2 boost 內的舊 body rescale，只留 Fix-A 的單次縮放
+             預期 kurtosis 回升至 6+，std 收斂，skew 正號維持
 """
 
 from __future__ import annotations
@@ -232,7 +231,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v28: Fix-A body-only rescale)
+# 2. GENERATE  (v29: 移除 chi2 boost 段的舊 body rescale)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -320,8 +319,7 @@ def generate(
 
     # ------------------------------------------------------------------
     # variance-mixture tail booster (Fix-B: aggressive nu_boost)
-    # nu_boost = clip(df_t * 0.3, 2.5, 8.0)  —— 比 v26 更激進
-    # chi2_scale clip 放寬到 (0.5, 3.5)
+    # v29: 移除 boost 段末尾的舊 body rescale，避免與 Fix-A 疊加
     # ------------------------------------------------------------------
     tail_threshold  = 1.5 * ret_std
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
@@ -332,33 +330,22 @@ def generate(
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
         chi2_scale = np.clip(chi2_scale, 0.5, 3.5)
 
-        z_boosted  = z_scaled.copy()
-        tail_vals  = z_scaled[tail_mask_boost]
+        z_boosted = z_scaled.copy()
+        tail_vals = z_scaled[tail_mask_boost]
         z_boosted[tail_mask_boost] = ret_mu + (tail_vals - ret_mu) * chi2_scale
-
-        # body-only rescale（v27 邏輯，保留）
-        body_mask = ~tail_mask_boost
-        if body_mask.sum() > 5:
-            body_vals = z_boosted[body_mask]
-            body_std  = float(np.std(body_vals - ret_mu))
-            if body_std > 1e-10:
-                target_body_std = ret_std * float(np.sqrt(1.0 - p_t * 0.3))
-                body_scale = float(np.clip(target_body_std / body_std, 0.5, 2.0))
-                z_boosted[body_mask] = ret_mu + (body_vals - ret_mu) * body_scale
+        # v29: 不再有 body_mask / target_body_std 段，交給下方 Fix-A 統一處理
 
         z_scaled = z_boosted
 
     # ------------------------------------------------------------------
-    # Fix-A v28: body-only rescale，不碰尾部
-    # 問題：v27 對全局 z_scaled rescale，把 chi2 boost 的尾部也縮回來
-    # 新做法：只縮放 body (|z-mu| <= 1.5*std)，讓 body_std = ret_std * 0.85
-    #   body 占 ~80%，整體 std 收斂；尾部完全不動，kurtosis 貢獻保留
+    # Fix-A v29: body-only rescale（單次），不碰尾部
+    # body_std 縮至 ret_std * 0.85，給尾部讓出 std 配額
+    # body 占 ~80% bar，整體 std 仍會收斂；尾部 kurtosis 貢獻保留
     # ------------------------------------------------------------------
     body_mask_a = np.abs(z_scaled - ret_mu) <= tail_threshold
     if body_mask_a.sum() > 5:
         body_std_a = float(np.std(z_scaled[body_mask_a] - ret_mu))
         if body_std_a > 1e-8:
-            # 目標：body std = 85% of ret_std，給尾部騰出 std 配額
             scale_a = ret_std * 0.85 / body_std_a
             scale_a = float(np.clip(scale_a, 0.5, 2.0))
             z_scaled[body_mask_a] = ret_mu + (z_scaled[body_mask_a] - ret_mu) * scale_a
