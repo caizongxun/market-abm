@@ -404,7 +404,7 @@ def rolling_fit_generate(
         param_log.append({
             "window":   window_idx + 1,
             "fit_bars": [fit_start, fit_end],
-            "fwd_bars\": [pos, fwd_end],
+            "fwd_bars": [pos, fwd_end],
             **{k: params[k] for k in params},
             "drift_corr": round(drift_corr, 6),
             "loss":     round(loss, 4),
