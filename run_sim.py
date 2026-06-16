@@ -5,22 +5,28 @@ run_sim.py
 
 基本用法
 --------
+  # ABM 模式（原有）
   python run_sim.py --symbol AAPL --bars 200 --plot
   python run_sim.py --symbol AAPL --start 2023-01-01 --rolling --plot
+
+  # 統計過程模型（新）
+  python run_sim.py --symbol AAPL --start 2023-01-01 --stat --plot
+  python run_sim.py --symbol AAPL --start 2023-01-01 --stat --lookback 60 --step 20 --plot
 
 完整參數
 --------
   --symbol          股票代碼（預設 AAPL）
   --bars            非 rolling 模式的模擬根數（預設 200）
-  --start           歷史起始日期（rolling 模式必填，例 2023-01-01）
+  --start           歷史起始日期（rolling/stat 模式必填，例 2023-01-01）
   --seed            亂數種子（預設 42）
   --plot            產生比對圖
-  --rolling         開啟 rolling calibration 模式
+  --rolling         開啟 ABM rolling calibration 模式
+  --stat            開啟統計過程模型 rolling 模式（Student-t + FBM + wick）
   --lookback        Rolling 模式的回看窗口（預設 60）
   --step            Rolling 模式的步進大小（預設 20）
-  --ema-alpha       Rolling 模式的 EMA 平滑係數（預設 0.4）
-  --rolling-sims    Rolling 模式每組參數路徑數（預設 10）
-  --w-vol           Rolling loss 中 vol_err 的權重（預設 1.5）
+  --ema-alpha       ABM rolling EMA 平滑係數（預設 0.4）
+  --rolling-sims    ABM rolling 模式每組參數路徑數（預設 10）
+  --w-vol           ABM rolling loss 中 vol_err 的權重（預設 1.5）
 """
 from __future__ import annotations
 
@@ -40,30 +46,32 @@ from sim.metrics import compare
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Market ABM simulator")
+    p = argparse.ArgumentParser(description="Market simulator (ABM + StatProcess)")
     p.add_argument("--symbol",       type=str,   default="AAPL")
     p.add_argument("--bars",         type=int,   default=200,
                    help="Bars to simulate (non-rolling mode)")
     p.add_argument("--start",        type=str,   default=None,
-                   help="History start date (YYYY-MM-DD), required for rolling")
+                   help="History start date (YYYY-MM-DD)")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--plot",         action="store_true")
+    # ABM rolling
     p.add_argument("--rolling",      action="store_true",
-                   help="Enable rolling-window calibration mode")
+                   help="Enable ABM rolling-window calibration mode")
     p.add_argument("--lookback",     type=int,   default=60)
     p.add_argument("--step",         type=int,   default=20)
     p.add_argument("--ema-alpha",    type=float, default=0.4)
     p.add_argument("--rolling-sims", type=int,   default=10)
-    p.add_argument("--w-vol",        type=float, default=1.5,
-                   help="Weight for vol_err in rolling loss (default 1.5)")
+    p.add_argument("--w-vol",        type=float, default=1.5)
+    # StatProcess
+    p.add_argument("--stat",         action="store_true",
+                   help="Enable StatProcess rolling mode (Student-t + FBM + wick)")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Static mode helpers
+# Static ABM mode
 # ---------------------------------------------------------------------------
 def run_static(args, df_real):
-    """Non-rolling single simulation."""
     print(f"[sim] {args.symbol}  bars={args.bars}  seed={args.seed}")
     _, df_sim = run_simulation(
         df_real=df_real,
@@ -84,7 +92,7 @@ def save_results_static(symbol, df_sim):
 def plot_static(symbol, df_real, df_sim):
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle(f"{symbol} — ABM Simulation vs Real", fontsize=13)
+    fig.suptitle(f"{symbol} \u2014 ABM Simulation vs Real", fontsize=13)
 
     axes[0, 0].plot(df_real["Close"].values[-len(df_sim):], label="Real", alpha=0.7)
     axes[0, 0].plot(df_sim["Close"].values,                 label="Sim",  alpha=0.7)
@@ -117,7 +125,7 @@ def plot_static(symbol, df_real, df_sim):
 
 
 # ---------------------------------------------------------------------------
-# Rolling mode helpers
+# ABM Rolling mode
 # ---------------------------------------------------------------------------
 def run_rolling(args, df_real):
     from sim.regime import RegimeCalibrator
@@ -166,7 +174,7 @@ def plot_rolling(symbol, df_real, df_result, param_log):
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle(f"{symbol} — Rolling Calibration ABM", fontsize=13)
+    fig.suptitle(f"{symbol} \u2014 Rolling Calibration ABM", fontsize=13)
 
     n = len(df_result)
     axes[0, 0].plot(df_real["Close"].values[-n:], label="Real",  alpha=0.7)
@@ -203,17 +211,133 @@ def plot_rolling(symbol, df_real, df_result, param_log):
 
 
 # ---------------------------------------------------------------------------
+# StatProcess rolling mode
+# ---------------------------------------------------------------------------
+def run_stat(args, df_real):
+    from sim.stat_process import rolling_fit_generate
+
+    n_total = len(df_real)
+    est_windows = (n_total - args.lookback) // args.step
+    print(
+        f"[stat] {args.symbol}  total={n_total}  "
+        f"lookback={args.lookback}  step={args.step}  seed={args.seed}"
+    )
+    print(f"[stat] estimated windows: {est_windows}")
+
+    df_result, param_log = rolling_fit_generate(
+        df_real  = df_real,
+        lookback = args.lookback,
+        step     = args.step,
+        seed     = args.seed,
+        verbose  = True,
+    )
+    return df_result, param_log
+
+
+def save_results_stat(symbol, df_result, param_log):
+    os.makedirs("results", exist_ok=True)
+
+    out_csv = f"results/{symbol}_stat_sim.csv"
+    df_result.to_csv(out_csv, index=False)
+    print(f"[out] -> {out_csv}")
+
+    out_json = f"results/{symbol}_stat_params.json"
+    with open(out_json, "w") as f:
+        json.dump(param_log, f, indent=2, default=float)
+    print(f"[out] -> {out_json}  ({len(param_log)} windows)")
+
+    return out_csv, out_json
+
+
+def plot_stat(symbol, df_real, df_result, param_log):
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+    fig.suptitle(f"{symbol} \u2014 StatProcess Rolling vs Real", fontsize=13)
+
+    n = len(df_result)
+    real_tail = df_real.iloc[-n:].copy().reset_index(drop=True)
+
+    # (0,0) Close 價格對比
+    axes[0, 0].plot(real_tail["Close"].values, label="Real", alpha=0.7)
+    axes[0, 0].plot(df_result["Close"].values,  label="Sim",  alpha=0.7)
+    axes[0, 0].set_title("Close Price")
+    axes[0, 0].legend()
+
+    # (0,1) 報酬分佈
+    r_real = np.diff(np.log(real_tail["Close"].values + 1e-10))
+    r_sim  = np.diff(np.log(df_result["Close"].values + 1e-10))
+    axes[0, 1].hist(r_real, bins=60, alpha=0.5, label="Real")
+    axes[0, 1].hist(r_sim,  bins=60, alpha=0.5, label="Sim")
+    axes[0, 1].set_title("Return Distribution")
+    axes[0, 1].legend()
+
+    # (0,2) Rolling Vol
+    rv = pd.Series(r_real).rolling(10).std()
+    sv = pd.Series(r_sim).rolling(10).std()
+    axes[0, 2].plot(rv.values, label="Real Vol",  alpha=0.7)
+    axes[0, 2].plot(sv.values, label="Sim Vol",   alpha=0.7)
+    axes[0, 2].set_title("Rolling Volatility")
+    axes[0, 2].legend()
+
+    # (1,0) Student-t df 隨時間演變
+    windows  = [p["window"]       for p in param_log]
+    df_vals  = [p["ret_df"]       for p in param_log]
+    hurst_v  = [p["hurst_target"] for p in param_log]
+    sigma_v  = [p["ret_sigma"]    for p in param_log]
+    wick_v   = [p["wick_lambda"]  for p in param_log]
+
+    axes[1, 0].plot(windows, df_vals, marker="o", ms=3, color="tab:red")
+    axes[1, 0].set_title("Student-t df  (\u5c0f=肥尾大)")
+    axes[1, 0].axhline(y=10, linestyle="--", alpha=0.4)
+
+    # (1,1) Hurst
+    axes[1, 1].plot(windows, hurst_v, marker="o", ms=3, color="tab:blue")
+    axes[1, 1].axhline(y=0.5, linestyle="--", alpha=0.4)
+    axes[1, 1].set_title("Hurst Target")
+    axes[1, 1].set_ylim(0.3, 0.8)
+
+    # (1,2) sigma + wick
+    ax = axes[1, 2]
+    ax.plot(windows, sigma_v, marker="o", ms=3, label="ret_sigma", color="tab:orange")
+    ax.set_ylabel("ret_sigma", color="tab:orange")
+    axr = ax.twinx()
+    axr.plot(windows, wick_v, marker="s", ms=3, label="wick_lambda", color="tab:green", alpha=0.7)
+    axr.set_ylabel("wick_lambda", color="tab:green")
+    ax.set_title("sigma / wick_lambda")
+
+    plt.tight_layout()
+    out_png = f"results/{symbol}_stat.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+    print(f"[plot] saved -> {out_png}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
     os.makedirs("results", exist_ok=True)
 
-    # --- fetch data ---
     df_real = get_ohlcv(args.symbol, start=args.start)
 
-    if args.rolling:
-        # --- rolling calibration mode ---
+    # -----------------------------------------------------------------------
+    if args.stat:
+        # 統計過程模型 rolling 模式
+        df_result, param_log = run_stat(args, df_real)
+        save_results_stat(args.symbol, df_result, param_log)
+
+        n_sim = len(df_result)
+        df_real_tail = df_real.iloc[-n_sim:].copy().reset_index(drop=True)
+        print(f"\n[metrics] stat rolling sim vs. real ({n_sim} bars)")
+        compare(df_real_tail, df_result, print_report=True)
+
+        if args.plot:
+            plot_stat(args.symbol, df_real, df_result, param_log)
+
+    elif args.rolling:
+        # ABM rolling calibration 模式
         df_result, param_log = run_rolling(args, df_real)
         save_results_rolling(args.symbol, df_result, param_log)
 
@@ -226,7 +350,7 @@ def main():
             plot_rolling(args.symbol, df_real, df_result, param_log)
 
     else:
-        # --- static single simulation mode ---
+        # ABM 單次模擬模式
         df_sim = run_static(args, df_real)
         save_results_static(args.symbol, df_sim)
 
