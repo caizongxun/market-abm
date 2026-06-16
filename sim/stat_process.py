@@ -1,7 +1,13 @@
 """
-stat_process.py  v41b
+stat_process.py  v42
 ====================
 純統計過程模型，完全不使用 agent。
+
+v42: hard renorm patch — 修正 std_err_pct 12.5x overshoot
+  - jump 移至 final renorm 之前（不再繞過 std 控制）
+  - final_scale clip 放寬 (0.4, scale_max) → (0.3, 3.0)
+  - 加入 hard renorm：強制 std == ret_std、mean == ret_mu，
+    確保 chi2 tail amp + GJR-GARCH + jump 三層累積放大後精確回收
 
 v41b: 修復 OnlineRidgePredictor._ridge_predict 中的括號 typo
       self._y_ek] → np.array(self._y_ek)  （導致 module import 失敗，100/100 error）
@@ -241,7 +247,13 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Patch-2: HIGH_EK_THRESH 20→12, chi2 amp 上限 4.0→2.5)
+# 2. GENERATE  (v42: hard renorm patch)
+#    変更点:
+#      A) jump を final renorm の前に移動
+#      B) final_scale clip を (0.4, scale_max) → (0.3, 3.0) に緩和
+#      C) final_scale 適用後に hard renorm を追加:
+#         z = (z - mean(z)) / std(z) * ret_std + ret_mu
+#         → chi2 amp + GJR-GARCH + jump の三層放大を精確に回収
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -407,6 +419,7 @@ def generate(
                 ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
             )
 
+    # --- v42 變更 A: jump 移至 final renorm 之前 ---
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
@@ -414,12 +427,20 @@ def generate(
             jump_sizes = rng.normal(0.0, jump_std, size=n_jumps)
             z_scaled[jump_idx] += jump_sizes
 
+    # --- v42 變更 B+C: 放寬 clip 並加入 hard renorm ---
+    # 先做一次 soft scale（讓結構保留），再 hard renorm 強制對齊 ret_std/ret_mu
     scale_max   = float(np.clip(1.0 + (target_ek - 3.0) * 0.015, 1.0, 1.2))
     final_mean  = float(np.mean(z_scaled))
     final_std   = float(np.std(z_scaled))
     if final_std > 1e-10:
-        final_scale = float(np.clip(ret_std / final_std, 0.4, scale_max))
+        # clip 放寬至 (0.3, 3.0)，讓大 std overshoot 也能被壓下來
+        final_scale = float(np.clip(ret_std / final_std, 0.3, 3.0))
         z_scaled    = (z_scaled - final_mean) * final_scale + ret_mu
+
+    # hard renorm: 無論上面結果如何，強制 std == ret_std、mean == ret_mu
+    hard_std = float(np.std(z_scaled))
+    if hard_std > 1e-10:
+        z_scaled = (z_scaled - float(np.mean(z_scaled))) / hard_std * ret_std + ret_mu
 
     prices    = np.empty(n_bars + 1)
     prices[0] = start_price
