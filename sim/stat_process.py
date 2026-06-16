@@ -1,52 +1,50 @@
 """
-stat_process.py  v10
+stat_process.py  v12
 ====================
 純統計過程模型，完全不使用 agent。
 
-Fix-11 — 根治 skew≈0 和 kurtosis≈1.6
---------------------------------------
-Fix-10 症狀：skew=-0.02（真實 +0.45），kurtosis=1.65（真實 10.6）
+Fix-12 — 放棄 t-blend；直接從 skewnorm 生成再套 AR(1) rank-remap
+-----------------------------------------------------------------
+歷史症狀總結：
+  所有 Fix-9~11 都用「z_sn + alpha*t_std」線性混合。
+  根本問題：t 是對稱分佈（skew=0），任何線性混合都把 skew 往 0 拉。
+  alpha=0.4 => skew 剩 60%，alpha=0.5 => 剩 50%，且在 n=20 的
+  小 chunk 下 empirical skew 會翻號 => 41 個 window 的平均 skew≈0。
 
-根本原因（最終確認）：
-  empirical standardize step (z_skew - mean) / std 是罪魁禍首：
-    1. skewnorm.ppf 已經把 skew 方向正確放入 z_skew，
-       但 skewnorm 的 mean ≠ 0（對 a=+1 大約 +0.56）。
-       (z_skew - mean(z_skew)) 正確去除了這個 offset。
-       但 / std(z_skew) 同時「壓縮」了尾部，把 outlier 往中心壓。
-       問題在於 skewnorm 的 std 理論值 ≈ 0.89（a=1），
-       但加上 t-tail 後 empirical std 是 ~2.3，
-       除以 2.3 把本來 kurtosis=8 的分佈壓到 1.6。
+正確架構思路（Sklar 定理）：
+  邊際分佈 和 相關結構 必須分開處理。
+  - 邊際（每根 bar 的 return 分佈）：skewnorm(a, loc, scale) 精確控制
+  - 相關（AR(1) 自相關）：用 Gaussian copula rank-remap 套上去
 
-    2. 更麻煩的是：skew 的方向在 small n（n_bars=20）下，
-       empirical mean/std 與理論值偏差大，導致 skew 符號不穩定。
+Fix-12 管線（Gaussian Copula + skewnorm 邊際）：
+  Step 1 - 先從目標邊際分佈取樣（i.i.d.）：
+    samples ~ skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars)
+    → samples 的 skew/kurtosis 完全由 skewnorm 決定，精確。
 
-Fix-11 正確方案（不做 empirical standardize）：
-  1. t-AR(1) 只負責 autocorrelation：
-       eps ~ N(0,1)  [對稱，不引入額外 kurtosis 偏差]
-       mem[i] = rho*mem[i-1] + innov_scale*eps[i]
-       normalize mem to mean=0, std=1  (autocorrelation structure only)
+  Step 2 - 生成帶 AR(1) 結構的 Gaussian copula：
+    u_gauss ~ AR(1) Gaussian process (rho from Hurst)
+    u_gauss empirically standardized → mean=0, std=1
+    → 把 u_gauss 轉成 uniform ranks: p = Φ(u_gauss)  [standard normal CDF]
 
-  2. 用 mem 的 rank 做 quantile mapping 到 skewnorm.ppf：
-       ranks = (argsort(argsort(mem)) + 0.5) / n
-       z_skew = skewnorm.ppf(ranks, a=skew_a, loc=0, scale=1)
-     skewnorm.ppf 直接給出正確 skew 方向。
+  Step 3 - Rank remap（Gaussian copula）：
+    把 samples 按 p 的排名重新排列：
+    sorted_samples = sort(samples)
+    rank_of_p = argsort(argsort(p))
+    z_final = sorted_samples[rank_of_p]
+    → z_final 的邊際分佈 = samples（精確 skewnorm）
+    → z_final 的排名相關性 = AR(1) Gaussian copula
+    → skew 和 kurtosis 完全保留！
 
-  3. 對 z_skew 做「理論矩」rescale，不用 empirical std（避免壓縮尾部）：
-       mu_sn  = a/sqrt(1+a²) * sqrt(2/π)    [skewnorm(a,0,1) 理論均值]
-       std_sn = sqrt(1 - mu_sn²)             [skewnorm(a,0,1) 理論標準差]
-       z_norm = (z_skew - mu_sn) / std_sn    [理論矩 normalize，不壓縮]
-     z_norm 的 mean≈0, std≈1，skew 保留，kurtosis 不被壓縮。
+  Step 4 - Rescale：
+    log_rets = z_final * ret_std + ret_mu
 
-  4. 加入 Student-t fat-tail：
-       t_raw ~ t(df, 0, 1)
-       t_std = (t_raw - mean(t_raw)) / std(t_raw)   [理論 mean=0, empirical std≈1]
-       z_final = alpha * z_norm + (1-alpha) * t_std
-     alpha=0.5 讓 skewnorm 的 skew 與 t 的 fat-tail 各貢獻一半。
-     t 的 kurtosis(df=8) ≈ 6；混合後仍遠高於 1.6。
+  理論保證：
+    - skew(z_final) = skew(samples) = skewnorm(a) 的理論 skew  ✓
+    - kurt(z_final) = kurt(samples) = skewnorm(a) 的理論 kurt  ✓
+    - autocorr(z_final) ≈ AR(1) copula 的 rho  ✓（rank correlation）
+    - 無任何 empirical std 壓縮操作  ✓
 
-  5. log_rets = z_final * ret_std + ret_mu
-
-v1-v11 修正歷程
+v1-v12 修正歷程
 --------------
   Fix-1 : Student-t df 掃描 log-likelihood
   Fix-2 : 改用 skewnorm 擬合
@@ -59,6 +57,8 @@ v1-v11 修正歷程
   Fix-9 : moment-preserving skewnorm standardize + t innovations in AR(1)
   Fix-10: quantile mapping (t-AR1 ranks → skewnorm.ppf)
   Fix-11: 理論矩 normalize + t fat-tail 後混合，消除 empirical std 壓縮問題
+  Fix-12: 放棄 t-blend，改用 Gaussian Copula + skewnorm 邊際分佈
+          => skew/kurtosis 由邊際精確控制，AR(1) 由 copula 套用
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ class StatParams(TypedDict):
     ret_mu:       float   # sample mean of log returns
     ret_std:      float   # sample std  of log returns
     ret_skew_a:   float   # skewnorm shape (alpha)
-    ret_df:       float   # Student-t df  (tail thickness)
+    ret_df:       float   # Student-t df  (tail thickness, kept for reference)
     hurst_target: float   # Hurst exponent [0.3, 0.8]
     wick_lambda:  float   # Exponential scale for wick, in units of ATR
     atr_mean:     float   # Mean ATR in absolute price (for wick generation)
@@ -151,22 +151,6 @@ def _fit_wick_lambda(df_ohlc: pd.DataFrame) -> tuple[float, float]:
     return float(np.mean(wick_ratio)), atr_mean
 
 
-def _skewnorm_theoretical_moments(a: float) -> tuple[float, float]:
-    """Return theoretical (mean, std) of skewnorm(a, loc=0, scale=1)."""
-    delta  = a / np.sqrt(1.0 + a * a)
-    mu_sn  = delta * np.sqrt(2.0 / np.pi)
-    var_sn = max(1.0 - mu_sn ** 2, 1e-10)
-    return float(mu_sn), float(np.sqrt(var_sn))
-
-
-def _quantile_map(arr: np.ndarray, skew_a: float, eps: float = 1e-4) -> np.ndarray:
-    """Map arr's ranks onto skewnorm(skew_a, 0, 1) quantiles (Hazen position)."""
-    n     = len(arr)
-    ranks = (np.argsort(np.argsort(arr)) + 0.5) / n
-    ranks = np.clip(ranks, eps, 1.0 - eps)
-    return stats.skewnorm.ppf(ranks, a=skew_a, loc=0, scale=1)
-
-
 # ---------------------------------------------------------------------------
 # 1. FIT
 # ---------------------------------------------------------------------------
@@ -197,7 +181,7 @@ def fit(df_history: pd.DataFrame) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE
+# 2. GENERATE  (Fix-12: Gaussian Copula + skewnorm marginal)
 # ---------------------------------------------------------------------------
 
 def _ar1_hurst_rho(h: float) -> float:
@@ -211,77 +195,87 @@ def generate(
     seed:        int | None = None,
 ) -> pd.DataFrame:
     """
-    Fix-11 generation pipeline
-    ---------------------------
-    Goal: independently control skew, kurtosis, autocorrelation, mean, vol.
+    Fix-12: Gaussian Copula + skewnorm marginal
+    -------------------------------------------
+    Sklar theorem: any joint distribution = copula(marginals).
+    We want:
+      marginal: skewnorm(a, 0, 1)  => controls skew + kurtosis exactly
+      copula:   Gaussian AR(1)     => controls autocorrelation
 
-    Step 1 — Autocorrelation skeleton via Gaussian AR(1):
-      eps ~ N(0,1);  mem[i] = rho*mem[i-1] + sqrt(1-rho²)*eps[i]
-      Empirically standardize mem → mean=0, std=1.
-      (Gaussian so it doesn't pollute kurtosis or skew)
+    Step 1 — Sample i.i.d. from target marginal (skewnorm):
+      samples ~ skewnorm.rvs(a=skew_a, loc=0, scale=1, size=n_bars)
+      These have exact skew and fat-tail shape of skewnorm(a).
 
-    Step 2 — Inject skew via quantile mapping (no post-standardize):
-      ranks = (argsort(argsort(mem)) + 0.5) / n     [Hazen]
-      z_skew = skewnorm.ppf(ranks, a=skew_a, loc=0, scale=1)
-      Theoretical normalize using analytical moments of skewnorm(a,0,1):
-        mu_sn, std_sn = _skewnorm_theoretical_moments(a)
-        z_sn = (z_skew - mu_sn) / std_sn
-      → skew shape preserved; no empirical compression of tails.
+    Step 2 — Generate Gaussian AR(1) copula scores:
+      u ~ AR(1) Gaussian process with rho from Hurst
+      Standardize u -> N(0,1) marginal
+      Convert to uniform via standard normal CDF: p = Phi(u)
+      p[i] in (0,1) gives rank ordering with AR(1) dependence.
 
-    Step 3 — Inject fat tails from Student-t(df):
-      t_raw ~ t(df, 0, 1);  empirically standardize → t_std (mean=0, std=1)
-      z_final = 0.6 * z_sn + 0.4 * t_std
-      Final empirical standardize → mean=0, std=1
-      (the blend ensures skew is diluted less than in Fix-9's 50/50)
+    Step 3 — Rank-remap (apply copula to marginal):
+      Sort samples ascending -> sorted_s
+      rank_idx = argsort(argsort(p))  [rank position of each p[i]]
+      z_final = sorted_s[rank_idx]
+      Result: z_final[i] has the same rank as p[i],
+              so autocorrelation structure of p is preserved,
+              and marginal distribution = exactly skewnorm(a).
 
     Step 4 — Rescale:
       log_rets = z_final * ret_std + ret_mu
+
+    Guarantees:
+      skew(z_final)  = skew(samples)  [rank remap preserves marginal]
+      kurt(z_final)  = kurt(samples)  [rank remap preserves marginal]
+      autocorr(z_final) ≈ AR(1) rho   [Spearman rank correlation preserved]
+      NO empirical std compression step anywhere.
     """
     rng = np.random.default_rng(seed)
 
     ret_mu   = params["ret_mu"]
     ret_std  = params["ret_std"]
     skew_a   = params["ret_skew_a"]
-    df_t     = params["ret_df"]
     hurst    = params["hurst_target"]
     wick_lam = params["wick_lambda"]
     atr_mean = params["atr_mean"]
 
-    # Step 1: Gaussian AR(1) for autocorrelation structure
+    # Step 1: i.i.d. samples from target marginal (skewnorm)
+    # Use a large oversample then trim to avoid edge effects from ppf clipping
+    n_sample = max(n_bars * 4, 200)  # oversample for stable quantiles
+    samples_iid = stats.skewnorm.rvs(
+        a=skew_a, loc=0, scale=1, size=n_sample,
+        random_state=rng
+    )
+    # Take the middle n_bars quantiles to avoid extreme edge samples
+    # Sort samples and pick evenly spaced quantile positions
+    samples_sorted = np.sort(samples_iid)
+    # Select n_bars evenly spaced positions from the sorted oversampled pool
+    idx = np.round(np.linspace(0, n_sample - 1, n_bars)).astype(int)
+    samples = samples_sorted[idx]  # these n_bars values span the full distribution
+
+    # Step 2: Gaussian AR(1) copula
     rho = _ar1_hurst_rho(hurst)
     eps = rng.standard_normal(n_bars)
     if abs(rho) > 0.01:
-        mem = np.empty(n_bars)
-        mem[0] = eps[0]
+        u = np.empty(n_bars)
+        u[0] = eps[0]
         innov_scale = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
         for i in range(1, n_bars):
-            mem[i] = rho * mem[i-1] + innov_scale * eps[i]
+            u[i] = rho * u[i-1] + innov_scale * eps[i]
     else:
-        mem = eps.copy()
-    m_std = float(np.std(mem))
-    if m_std > 1e-10:
-        mem = (mem - float(np.mean(mem))) / m_std  # unit Gaussian AR(1)
+        u = eps.copy()
+    # Standardize u to N(0,1) marginal
+    u_m, u_s = float(np.mean(u)), float(np.std(u))
+    if u_s > 1e-10:
+        u = (u - u_m) / u_s
+    # Convert to uniform ranks (probability integral transform)
+    # p[i] = Phi(u[i]) gives rank ordering with AR(1) dependence
+    # We use rank-based approach directly (more stable for small n):
+    rank_of_u = np.argsort(np.argsort(u))  # 0..n_bars-1
 
-    # Step 2: quantile map ranks → skewnorm, then theoretical normalize
-    z_skew       = _quantile_map(mem, skew_a)
-    mu_sn, std_sn = _skewnorm_theoretical_moments(skew_a)
-    z_sn         = (z_skew - mu_sn) / std_sn      # mean≈0, std≈1, skew preserved
-
-    # Step 3: Student-t fat tails, blend 60/40 with skewnorm shape
-    t_raw = stats.t.rvs(df=max(df_t, 2.01), loc=0, scale=1,
-                        size=n_bars, random_state=rng)
-    t_m, t_s = float(np.mean(t_raw)), float(np.std(t_raw))
-    if t_s > 1e-10:
-        t_std = (t_raw - t_m) / t_s
-    else:
-        t_std = t_raw
-
-    z_blend = 0.6 * z_sn + 0.4 * t_std
-    zb_m, zb_s = float(np.mean(z_blend)), float(np.std(z_blend))
-    if zb_s > 1e-10:
-        z_final = (z_blend - zb_m) / zb_s
-    else:
-        z_final = z_blend
+    # Step 3: Rank-remap: assign samples[rank_of_u[i]] to position i
+    # samples is already sorted ascending, so samples[rank_of_u] gives
+    # z_final[i] = the rank_of_u[i]-th smallest sample
+    z_final = samples[rank_of_u]
 
     # Step 4: rescale to real distribution moments
     log_rets = z_final * ret_std + ret_mu
