@@ -1,39 +1,16 @@
 """
-stat_process.py  v16
-====================
+stat_process.py  v16-debug
+==========================
 純統計過程模型，完全不使用 agent。
 
-Fix-16 — 三項修正
+Fix-16-debug — 在 generate() 三個關鍵節點加診斷輸出
 ---------------------------------------
-Fix-15 遺留問題：
-  std      = 0.02170 ❌ (真實 0.01603，偏高 35%)
-  skew     = -0.302  ❌ (真實 +0.449，符號仍錯)
-  kurtosis =  9.737  ✅ (from 3.8, 幾乎到位)
-  hurst    =  0.776  ❌ (真實 0.693，仍偏高)
+診斷點：
+  [dbg] A: rank-remap 之後、chi2_scale 之前      -> 確認 amp+copula 是否已翻轉 skew
+  [dbg] B: chi2_scale 乘完之後                   -> 確認 chi2 本身是否翻轉 skew
+  [dbg] C: post-rescale (最終 log_rets)           -> 確認 rescale 是否改變 skew
 
-[1] std 偏高修正
-    原因：chi2_scale = sqrt(nu/chi2(nu))，由於 Jensen 不等式，
-           E[sqrt(nu/X)] > sqrt(nu/E[X]) = 1
-           => 平均傀向 > 1，導致 std 被放大。
-    修正：在乘完 chi2_scale 後重新 rescale：
-           log_rets = (log_rets - log_rets.mean()) / log_rets.std() * ret_std + ret_mu
-           線性變換，保留 skew 符號和 kurtosis 相對大小。
-
-[2] skew 符號修正
-    原因：clip(0.5, 3.0) 是非對稱的——
-           chi2_scale 可能小至 0.5（下界切）也可能大至 3.0（上界切）。
-           對稱性破壞後，乘法把 skewnorm 兩個尾巴放大或縮小的倍率不同，
-           skew 符號因此被扭曲。
-    修正：改為對稱 clip(1/c, c)， c=2.5
-           正負方向的截斷倍率相同，不破壞乘法對稱性。
-    同時把 nu_boost 從 max(df*0.5, 3.0) 提高到 max(df*0.8, 4.0)：
-           clip 範圍收窄後對 kurtosis 的貢猫少一點，稍大的 nu_boost 補側。
-
-[3] hurst clip 0.72 → 0.65
-    原因：v15 hurst=0.776 vs 真實 0.693，仍偏高。
-           chi2_scale 乘法放大了波動群聺性，間接提高 hurst。
-    修正：clip(0.3, 0.65)。
-           h=0.65 => AR(1) rho = 2^(2*0.65-1)-1 = 0.21
+只對第一個 window (debug=True) 輸出，其餘 window 靜默。
 
 v1-v16 修正歷程
 --------------
@@ -46,6 +23,8 @@ v1-v16 修正歷程
   Fix-15  : center-masked amp + variance-mixture booster + hurst clip 0.72
              => kurtosis 9.74 ✅ 但 std 偏高 35%、skew -0.30、hurst 仍偏
   Fix-16  : symmetric clip + std rescale + nu_boost 0.8x + hurst clip 0.65
+             => std ✅  hurst ✅  skew 仍 -0.307 ❌  kurtosis 4.54 ❌
+  Fix-16-debug: 加診斷，定位 skew 翻轉的確切位置
 """
 
 from __future__ import annotations
@@ -189,8 +168,6 @@ def fit(df_history: pd.DataFrame) -> StatParams:
         ret_std      = ret_std,
         ret_skew_a   = skew_a,
         ret_df       = df_t,
-        # Fix-16: hurst clip upper bound 0.72 -> 0.65
-        # h=0.65 => AR(1) rho = 2^(2*0.65-1)-1 = 0.21
         hurst_target = float(np.clip(h, 0.3, 0.65)),
         wick_lambda  = wick_lam,
         atr_mean     = atr_mean,
@@ -198,7 +175,7 @@ def fit(df_history: pd.DataFrame) -> StatParams:
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (Fix-16)
+# 2. GENERATE  (Fix-16-debug)
 # ---------------------------------------------------------------------------
 
 def _ar1_hurst_rho(h: float) -> float:
@@ -210,28 +187,13 @@ def generate(
     n_bars:      int,
     start_price: float = 100.0,
     seed:        int | None = None,
+    debug:       bool = False,
 ) -> pd.DataFrame:
     """
-    Fix-16 changes vs Fix-15:
-
-    (A) Symmetric chi2_scale clip: clip(1/2.5, 2.5) instead of clip(0.5, 3.0)
-        Reason: asymmetric clip in Fix-15 broke the multiplicative symmetry
-        of chi2_scale, causing the skewnorm's skew to be distorted toward negative.
-        A symmetric clip preserves the relative magnitude of both tails equally.
-
-    (B) nu_boost = max(df * 0.8, 4.0)  (was max(df * 0.5, 3.0))
-        Reason: symmetric clip has a narrower effective range than the old
-        asymmetric clip (max ratio 2.5 vs 3.0), slightly reducing kurtosis.
-        Compensate by using a slightly larger nu_boost (closer to original df)
-        so chi2 samples are still heavy-tailed enough.
-
-    (C) Post-booster std rescale
-        Reason: E[sqrt(nu/chi2(nu))] > 1 by Jensen's inequality, so multiplying
-        by chi2_scale inflates std. Re-standardise after the multiplication:
-          log_rets = (log_rets - mean) / std * ret_std + ret_mu
-        This is a linear transform, so skew sign and kurtosis ratio are preserved.
-
-    (D) hurst_target clipped to [0.3, 0.65] => max AR(1) rho = 0.21
+    Fix-16-debug: add 3 diagnostic print points.
+    [A] after rank-remap, before chi2_scale  -> skew of z_norm
+    [B] after chi2_scale multiply            -> skew of log_rets (pre-rescale)
+    [C] after std rescale                    -> skew of final log_rets
     """
     rng = np.random.default_rng(seed)
 
@@ -278,21 +240,56 @@ def generate(
         z_norm = z_final - z_mean
     log_rets = z_norm * ret_std + ret_mu
 
+    # -----------------------------------------------------------------------
+    # [dbg] Point A: after rank-remap + rescale, BEFORE chi2_scale
+    # -----------------------------------------------------------------------
+    if debug:
+        _skew_A  = float(stats.skew(log_rets))
+        _kurt_A  = float(stats.kurtosis(log_rets))
+        _skew_sn = float(stats.skew(samples))   # pure skewnorm samples (no AR)
+        print(
+            f"  [dbg-A] param skew_a={skew_a:+.4f} | "
+            f"skewnorm samples skew={_skew_sn:+.4f} | "
+            f"after rank-remap+rescale: skew={_skew_A:+.4f}  kurt={_kurt_A:.4f}"
+        )
+
     # Fix-16A+B: Variance-mixture kurtosis booster with SYMMETRIC clip
-    # nu_boost = max(df * 0.8, 4.0) — larger than Fix-15's 0.5x to compensate
-    # for narrower clip range; still produces heavier tails than raw t(df)
     nu_boost = float(max(df_t * 0.8, 4.0))
     chi2_samples = rng.chisquare(nu_boost, size=n_bars)
     chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_samples, 1e-8))
-    # Fix-16A: symmetric clip — same ratio in both directions preserves skew
     _c = 2.5
     chi2_scale = np.clip(chi2_scale, 1.0 / _c, _c)
     log_rets = log_rets * chi2_scale
+
+    # -----------------------------------------------------------------------
+    # [dbg] Point B: after chi2_scale multiply, BEFORE std rescale
+    # -----------------------------------------------------------------------
+    if debug:
+        _skew_B  = float(stats.skew(log_rets))
+        _kurt_B  = float(stats.kurtosis(log_rets))
+        _chi2_mean = float(np.mean(chi2_scale))
+        _chi2_std  = float(np.std(chi2_scale))
+        print(
+            f"  [dbg-B] chi2_scale: mean={_chi2_mean:.4f}  std={_chi2_std:.4f}  "
+            f"clipped_frac={float(np.mean((chi2_scale <= 1/_c) | (chi2_scale >= _c))):.3f} | "
+            f"after chi2*: skew={_skew_B:+.4f}  kurt={_kurt_B:.4f}"
+        )
 
     # Fix-16C: rescale std back to ret_std (linear => preserves skew sign & kurtosis ratio)
     lr_std = float(np.std(log_rets))
     if lr_std > 1e-10:
         log_rets = (log_rets - float(np.mean(log_rets))) / lr_std * ret_std + ret_mu
+
+    # -----------------------------------------------------------------------
+    # [dbg] Point C: final log_rets after rescale
+    # -----------------------------------------------------------------------
+    if debug:
+        _skew_C = float(stats.skew(log_rets))
+        _kurt_C = float(stats.kurtosis(log_rets))
+        print(
+            f"  [dbg-C] after rescale:  skew={_skew_C:+.4f}  kurt={_kurt_C:.4f}  "
+            f"std={float(np.std(log_rets)):.6f}  (target ret_std={ret_std:.6f})"
+        )
 
     # Rebuild OHLC
     opens  = np.empty(n_bars)
@@ -365,9 +362,11 @@ def rolling_fit_generate(
                 + w * np.log(max(real_close, 1e-10))
             ))
 
+        # debug=True only for the first window
         df_chunk = generate(
             params=params, n_bars=actual_fwd,
             start_price=start_px, seed=seed + window_idx,
+            debug=(window_idx == 0),
         )
         sim_chunks.append(df_chunk)
         sim_last_close = float(df_chunk["Close"].iloc[-1])
