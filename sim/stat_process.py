@@ -1,7 +1,13 @@
 """
-stat_process.py  v42
+stat_process.py  v43
 ====================
 純統計過程模型，完全不使用 agent。
+
+v43: body-only renorm — 修正 v42 hard renorm 破壞 chi2 tail amp 的副作用
+  - hard renorm 改為只對 body (|z - mu| < 2σ) 做 std 對齊
+  - 尾部 (|z - mu| >= 2σ) 只做 mean shift，保留 chi2 amp 建立的厚尾
+  - _TARGET_EK_MAX 15 → 30，讓 fit() 不再截斷真實高 kurtosis
+  - OnlineRidgePredictor 的 target_ek clip 上限同步更新至 30
 
 v42: hard renorm patch — 修正 std_err_pct 12.5x overshoot
   - jump 移至 final renorm 之前（不再繞過 std 控制）
@@ -192,10 +198,10 @@ def _path_corr(real_closes, sim_closes):
 
 
 # ---------------------------------------------------------------------------
-# 1. FIT  (Patch-1: target_ek clip 上限 30 → 15)
+# 1. FIT  (v43: _TARGET_EK_MAX 15 → 30)
 # ---------------------------------------------------------------------------
 
-_TARGET_EK_MAX = 15.0   # v40: 30.0 → v41: 15.0
+_TARGET_EK_MAX = 30.0   # v41: 15.0 → v43: 30.0
 
 
 def fit(
@@ -247,19 +253,20 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v42: hard renorm patch)
-#    変更点:
-#      A) jump を final renorm の前に移動
-#      B) final_scale clip を (0.4, scale_max) → (0.3, 3.0) に緩和
-#      C) final_scale 適用後に hard renorm を追加:
-#         z = (z - mean(z)) / std(z) * ret_std + ret_mu
-#         → chi2 amp + GJR-GARCH + jump の三層放大を精確に回収
+# 2. GENERATE  (v43: body-only renorm — 保留 chi2 tail amp 的尾部)
+#    v42 的問題：hard renorm 對全部資料做 std 對齊，把 chi2 amp 辛苦放大的
+#    尾部等比壓縮回去，導致 kurt_err 無法改善。
+#
+#    v43 的修正：
+#      - body (|z - mu| < 2σ) 做 std 精確對齊
+#      - tail (|z - mu| >= 2σ) 只做 mean shift，保留尾部幅度
+#      - 移除 v42 的 hard renorm（已被 body-only renorm 取代）
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
 
-_HIGH_EK_THRESH = 12.0   # v40: 20.0 → v41: 12.0
-_CHI2_AMP_MAX   = 2.5    # v40: 4.0  → v41: 2.5
+_HIGH_EK_THRESH = 12.0   # v41: 12.0（不變）
+_CHI2_AMP_MAX   = 2.5    # v41: 2.5（不變）
 
 
 def generate(
@@ -384,19 +391,26 @@ def generate(
     else:
         z_gjr = z_adj
 
+    # --- v43: body-only renorm ---
+    # body (|z - mu| < 2σ) 做精確 std 對齊；tail 只做 mean shift
     z_mean = float(np.mean(z_gjr))
     z_std  = float(np.std(z_gjr))
     if z_std > 1e-10:
-        z_body   = z_gjr.copy()
-        body_idx = np.abs(z_gjr - z_mean) < 2.0 * z_std
-        z_body[body_idx] = (
-            (z_gjr[body_idx] - z_mean) / z_std * ret_std + ret_mu
-        )
-        z_body[~body_idx] = z_gjr[~body_idx] - z_mean + ret_mu
-        z_scaled = z_body
+        body_mask = np.abs(z_gjr - z_mean) < 2.0 * z_std
+        z_scaled  = z_gjr.copy()
+        body_mean = float(np.mean(z_gjr[body_mask])) if np.any(body_mask) else z_mean
+        body_std  = float(np.std(z_gjr[body_mask]))  if np.any(body_mask) else z_std
+        if body_std > 1e-10:
+            z_scaled[body_mask] = (
+                (z_gjr[body_mask] - body_mean) / body_std * ret_std + ret_mu
+            )
+        # 尾部：只平移 mean，保留幅度（chi2 amp 的成果）
+        mean_shift = ret_mu - float(np.mean(z_gjr))
+        z_scaled[~body_mask] = z_gjr[~body_mask] + mean_shift
     else:
         z_scaled = np.full(n_bars, ret_mu)
 
+    # --- chi2 tail amp（對 body-only renorm 後的尾部再放大）---
     tail_threshold = 1.2 * ret_std
     tail_mask      = np.abs(z_scaled - ret_mu) > tail_threshold
 
@@ -419,28 +433,13 @@ def generate(
                 ret_mu + sign_mask * np.abs(z_scaled[tail_mask] - ret_mu) * amp
             )
 
-    # --- v42 變更 A: jump 移至 final renorm 之前 ---
+    # --- jump（在 body-only renorm 之後加入，不再被壓縮）---
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
             jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
             jump_sizes = rng.normal(0.0, jump_std, size=n_jumps)
             z_scaled[jump_idx] += jump_sizes
-
-    # --- v42 變更 B+C: 放寬 clip 並加入 hard renorm ---
-    # 先做一次 soft scale（讓結構保留），再 hard renorm 強制對齊 ret_std/ret_mu
-    scale_max   = float(np.clip(1.0 + (target_ek - 3.0) * 0.015, 1.0, 1.2))
-    final_mean  = float(np.mean(z_scaled))
-    final_std   = float(np.std(z_scaled))
-    if final_std > 1e-10:
-        # clip 放寬至 (0.3, 3.0)，讓大 std overshoot 也能被壓下來
-        final_scale = float(np.clip(ret_std / final_std, 0.3, 3.0))
-        z_scaled    = (z_scaled - final_mean) * final_scale + ret_mu
-
-    # hard renorm: 無論上面結果如何，強制 std == ret_std、mean == ret_mu
-    hard_std = float(np.std(z_scaled))
-    if hard_std > 1e-10:
-        z_scaled = (z_scaled - float(np.mean(z_scaled))) / hard_std * ret_std + ret_mu
 
     prices    = np.empty(n_bars + 1)
     prices[0] = start_price
@@ -459,7 +458,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 3. OnlineRidgePredictor  (v41b: 修復括號 typo)
+# 3. OnlineRidgePredictor  (v43: target_ek clip 上限同步至 30)
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
