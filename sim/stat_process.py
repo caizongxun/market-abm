@@ -1,31 +1,30 @@
 """
-stat_process.py  v34
+stat_process.py  v35
 ====================
 純統計過程模型，完全不使用 agent。
 
-v34 fix（v33 骨架不動）：
+v35 fix（v34 骨架不動）：
 ------------------------------------------------------
-Fix-I v34-1：tail_threshold 1.5σ → 1.2σ，chi2 clip 4.0 → 3.5
-  1.5σ 覆蓋率 ~13%，1.2σ 覆蓋率 ~23%，讓更多 bar 進入 chi2 boost
-  同時把 clip 上限從 4.0 降回 3.5 避免再次過衝
-  預期 kurtosis 進一步提升（8-9 區間）而不爆衝
+Fix-L v35-1：nu_boost 改用更激進的反比公式
+  原公式 6/(df_t-2) clip(1.5,5.0)，df_t=6.6~30 時全部 clip 到下界 1.5，
+  完全沒有差異化效果。
+  新公式：nu_boost = clip(3.0 / max(df_t-4.0, 0.1), 0.5, 3.0)
+  df_t=7  → 3/3=1.0   → 1.0（輕推，本身已肥）
+  df_t=10 → 3/6=0.5   → clip → 0.5（更肥）
+  df_t=20 → 3/16=0.19 → clip → 0.5
+  df_t=30 → 3/26=0.12 → clip → 0.5（最肥，接近 Normal 需要強推）
 
-Fix-J v34-2：global_scale 改為 skew-aware 等比縮放
-  原始 global_scale 做等比縮放時連正尾一起壓，削弱 skew 幅度。
-  新規則：skew_a > 0.2 的 window，正尾側（z_scaled > ret_mu）
-  的 global_scale 允許最高 1.05（可微幅放大），
-  負尾側照常 clip(0.7, 1.3)，整體 std 仍收斂。
+Fix-M v35-2：chi2 clip 加入 quantile-based 極端尾部放大
+  普通 tail bar 仍 clip(0.5, 3.5) 避免過衝，
+  但 |z - ret_mu| > 2.5σ 的極端 bar 允許 clip(0.5, 5.0)
+  這樣只有真正極端的事件才會被強放大，不影響主體分佈。
 
-Fix-K v34-3：nu_boost 改為與 df_t 反比
-  原本 nu_boost = df_t * 0.15，df_t 大時 nu_boost 大（矛盾）。
-  新公式：nu_boost = clip(6.0 / max(df_t - 2.0, 0.5), 1.5, 5.0)
-  df_t=7  → nu_boost = 6/5 = 1.2 → clip → 1.5  （本來就肥，輕推）
-  df_t=10 → nu_boost = 6/8 = 0.75 → clip → 1.5
-  df_t=20 → nu_boost = 6/18= 0.33 → clip → 1.5
-  df_t=30 → nu_boost = 6/28= 0.21 → clip → 1.5  （接近 Normal，需要強推）
-  實際效果：對 df_t 小的 window 不過度放大，對 df_t 大的 window 保持強尾部注入
+Fix-N v35-3：p_t clip 上限 0.85 → 0.92
+  t-path bar 比例從最高 85% 提升到 92%，
+  配合 Fix-L 的更小 nu_boost（更肥的 chi2），
+  讓 chi2 尾部放大有更多機會作用在 t-path 的 tail bars。
 
-v1-v34 修正歷程
+v1-v35 修正歷程
 --------------
   Fix-1~3 : df 掃描、skewnorm、rolling ATR wick
   Fix-4~8 : AR(1) 正規化、mean offset、rolling anchor
@@ -76,6 +75,12 @@ v1-v34 修正歷程
   Fix-34  : Fix-I tail_threshold 1.5σ→1.2σ + chi2 clip 4.0→3.5
              Fix-J global_scale skew-aware（正尾允許微幅放大至 1.05）
              Fix-K nu_boost 改為與 df_t 反比：6/(df_t-2) clip(1.5,5.0)
+             => kurtosis 4.08 skew +0.607✅ hurst 0.694✅ std 1.650✅
+             方向命中率 0.519✅
+             (Fix-K 實際上 clip 全在 1.5 下界，差異化失效)
+  Fix-35  : Fix-L nu_boost = 3/(df_t-4) clip(0.5,3.0) 真正差異化
+             Fix-M chi2 極端尾部（>2.5σ）允許 clip(0.5,5.0)，普通尾部仍 3.5
+             Fix-N p_t clip 上限 0.85 → 0.92
 """
 
 from __future__ import annotations
@@ -212,10 +217,6 @@ def _ar1_hurst_rho(h: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
-    """
-    計算兩段 cumulative return path 的 DTW 距離（正規化到每 bar）。
-    使用 O(n*m) 動態規劃，序列長度通常 <= 20，可接受。
-    """
     n, m = len(s), len(t)
     if n == 0 or m == 0:
         return float("nan")
@@ -230,10 +231,6 @@ def _dtw_distance(s: np.ndarray, t: np.ndarray) -> float:
 
 
 def _path_corr(real_closes: np.ndarray, sim_closes: np.ndarray) -> float:
-    """
-    計算真實與模擬的累積報酬路徑相關係數。
-    兩段從各自第一個 close 正規化，長度取較短者。
-    """
     n = min(len(real_closes), len(sim_closes))
     if n < 3:
         return float("nan")
@@ -298,7 +295,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v34: Fix-I/J/K)
+# 2. GENERATE  (v35: Fix-L/M/N)
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -327,7 +324,8 @@ def generate(
     target_ek       = params["target_ek"]
 
     t_ek = 6.0 / max(df_t - 4.0, 0.1)
-    p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.85))
+    # Fix-N v35: p_t clip 上限 0.85 → 0.92
+    p_t  = float(np.clip(target_ek / (t_ek + 1e-8), 0.10, 0.92))
 
     total = n_bars + _AR1_WARMUP
     mask       = rng.uniform(size=total) < p_t
@@ -385,30 +383,38 @@ def generate(
         z_scaled = np.full(n_bars, ret_mu)
 
     # ------------------------------------------------------------------
-    # Fix-I v34: tail_threshold 1.5σ → 1.2σ（更多 bar 進入 chi2 boost）
-    #            chi2_scale clip 上限 4.0 → 3.5（避免過衝）
-    # Fix-K v34: nu_boost 改為與 df_t 反比
-    #            nu_boost = clip(6.0 / max(df_t - 2.0, 0.5), 1.5, 5.0)
+    # Fix-I v34: tail_threshold 1.2σ
+    # Fix-L v35: nu_boost = clip(3.0/max(df_t-4.0,0.1), 0.5, 3.0) — 真正差異化
+    #   df_t=7  → 3/3=1.0  （本身已肥，輕推）
+    #   df_t=10 → 3/6=0.5  → clip → 0.5（更肥的 chi2）
+    #   df_t=20 → 0.19     → clip → 0.5
+    #   df_t=30 → 0.12     → clip → 0.5（接近 Normal，最需要強尾）
+    # Fix-M v35: 普通 tail bar clip(0.5,3.5)，極端尾部(>2.5σ)允許 clip(0.5,5.0)
     # ------------------------------------------------------------------
-    tail_threshold  = 1.2 * ret_std          # v34 Fix-I: 1.5 → 1.2
+    tail_threshold  = 1.2 * ret_std
     tail_mask_boost = np.abs(z_scaled - ret_mu) > tail_threshold
 
     if tail_mask_boost.sum() >= 2:
-        # Fix-K: df_t 越大（越接近 Normal）→ nu_boost 越小 → chi2 越肥
-        nu_boost   = float(np.clip(6.0 / max(df_t - 2.0, 0.5), 1.5, 5.0))  # v34 Fix-K
+        # Fix-L: 反比公式，df_t 越大 nu 越小 → chi2 越肥
+        nu_boost   = float(np.clip(3.0 / max(df_t - 4.0, 0.1), 0.5, 3.0))
         chi2_draws = rng.chisquare(nu_boost, size=int(tail_mask_boost.sum()))
         chi2_scale = np.sqrt(nu_boost / np.maximum(chi2_draws, 1e-8))
-        chi2_scale = np.clip(chi2_scale, 0.5, 3.5)  # v34 Fix-I: 4.0 → 3.5
+
+        # Fix-M: 分兩段 clip
+        # 普通尾部 clip(0.5, 3.5)
+        chi2_scale = np.clip(chi2_scale, 0.5, 3.5)
+        # 極端尾部 (>2.5σ) 允許到 5.0
+        tail_vals_for_mask = z_scaled[tail_mask_boost]
+        extreme_mask = np.abs(tail_vals_for_mask - ret_mu) > 2.5 * ret_std
+        chi2_scale[extreme_mask] = np.clip(chi2_scale[extreme_mask], 0.5, 5.0)
 
         z_boosted = z_scaled.copy()
-        tail_vals = z_scaled[tail_mask_boost]
-        z_boosted[tail_mask_boost] = ret_mu + (tail_vals - ret_mu) * chi2_scale
+        z_boosted[tail_mask_boost] = ret_mu + (tail_vals_for_mask - ret_mu) * chi2_scale
 
         z_scaled = z_boosted
 
     # ------------------------------------------------------------------
     # Fix-A v29: body-only rescale（單次），不碰尾部
-    # body_std 縮至 ret_std * 0.85，給尾部讓出 std 配額
     # ------------------------------------------------------------------
     body_mask_a = np.abs(z_scaled - ret_mu) <= tail_threshold
     if body_mask_a.sum() > 5:
@@ -419,19 +425,15 @@ def generate(
             z_scaled[body_mask_a] = ret_mu + (z_scaled[body_mask_a] - ret_mu) * scale_a
 
     # ------------------------------------------------------------------
-    # Fix-J v34: global_scale 改為 skew-aware 等比縮放
-    #   skew_a > 0.2（右偏）: 正尾側 global_scale 允許最高 1.05（微幅放大）
-    #                         負尾側照常 clip(0.7, 1.3)
-    #   其餘: 全局等比 clip(0.7, 1.3) 不變
+    # Fix-J v34: global_scale skew-aware 等比縮放
     # ------------------------------------------------------------------
     cur_std = float(np.std(z_scaled - ret_mu))
     if cur_std > 1e-8:
         global_scale = ret_std / cur_std
         if skew_a > 0.2:
-            # 正尾側允許微幅放大，不壓縮右偏
             pos_tail_mask = z_scaled > ret_mu
             neg_tail_mask = ~pos_tail_mask
-            global_scale_pos = float(np.clip(global_scale, 0.7, 1.05))  # 允許到 1.05
+            global_scale_pos = float(np.clip(global_scale, 0.7, 1.05))
             global_scale_neg = float(np.clip(global_scale, 0.7, 1.3))
             z_scaled_new = z_scaled.copy()
             z_scaled_new[pos_tail_mask] = (
@@ -442,7 +444,6 @@ def generate(
             )
             z_scaled = z_scaled_new
         elif skew_a < -0.2:
-            # 左偏：負尾側允許微幅放大
             neg_tail_mask = z_scaled < ret_mu
             pos_tail_mask = ~neg_tail_mask
             global_scale_neg = float(np.clip(global_scale, 0.7, 1.05))
@@ -496,13 +497,11 @@ def generate(
     # ------------------------------------------------------------------
     # Fix-D v31: jump 後 final global std 收斂
     # Fix-G v33: skew-adaptive 上限
-    #   skew_a > 0.3 的 window（右偏）允許 final_scale 最高 1.15
-    #   其餘保持 1.0，避免右偏尾部被一刀切縮掉
     # ------------------------------------------------------------------
     final_std = float(np.std(log_rets - ret_mu))
     if final_std > 1e-8:
         final_scale = ret_std / final_std
-        scale_max = 1.15 if skew_a > 0.3 else 1.0   # v33: skew-adaptive
+        scale_max = 1.15 if skew_a > 0.3 else 1.0
         final_scale = float(np.clip(final_scale, 0.5, scale_max))
         log_rets = ret_mu + (log_rets - ret_mu) * final_scale
 
@@ -623,7 +622,6 @@ def rolling_fit_generate(
         real_rets = np.diff(np.log(np.maximum(real_fwd["Close"].values, 1e-10)))
         sim_rets  = np.diff(np.log(np.maximum(df_chunk["Close"].values, 1e-10)))
 
-        # 現有 loss（不含走勢相似性，避免過擬合）
         if len(real_rets) > 1 and len(sim_rets) > 1:
             vol_err  = abs(np.std(sim_rets) - np.std(real_rets)) / max(np.std(real_rets), 1e-8)
             kurt_err = abs(float(stats.kurtosis(sim_rets)) - float(stats.kurtosis(real_rets)))
@@ -632,11 +630,6 @@ def rolling_fit_generate(
         else:
             loss = 0.0
 
-        # ------------------------------------------------------------------
-        # Fix-H v33: 走勢相似性指標（只記錄，不進 loss）
-        # dtw_dist  : DTW 距離（正規化到每 bar），越小越好
-        # path_corr : 累積報酬路徑 Pearson 相關，越接近 1 越好
-        # ------------------------------------------------------------------
         real_closes_fwd = real_fwd["Close"].values
         sim_closes_fwd  = df_chunk["Close"].values
         if len(real_closes_fwd) >= 3 and len(sim_closes_fwd) >= 3:
@@ -665,7 +658,7 @@ def rolling_fit_generate(
         param_log.append({
             "window":   window_idx + 1,
             "fit_bars": [fit_start, fit_end],
-            "fwd_bars": [pos, fwd_end],
+            "fwd_bars\": [pos, fwd_end],
             **{k: params[k] for k in params},
             "drift_corr":  round(drift_corr, 6),
             "loss":        round(loss, 4),
@@ -713,9 +706,6 @@ def rolling_fit_generate(
     if not sim_chunks:
         raise RuntimeError("No chunks generated -- check lookback/step settings.")
 
-    # ------------------------------------------------------------------
-    # 全局走勢相似性彙總（印在 metrics 後面）
-    # ------------------------------------------------------------------
     dtw_vals   = [e["dtw_dist"]  for e in param_log if isinstance(e.get("dtw_dist"), float)
                   and not np.isnan(e["dtw_dist"])]
     pcorr_vals = [e["path_corr"] for e in param_log if isinstance(e.get("path_corr"), float)
