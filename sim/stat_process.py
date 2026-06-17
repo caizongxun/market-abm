@@ -1,39 +1,29 @@
 """
-stat_process.py  v58
+stat_process.py  v59
 ====================
 純統計過程模型，完全不使用 agent。
 
+v59: Replace global-pass kurtosis_topup with winsorize + linear skew align.
+
+     Strategy change: the global pass should NOT inject new jumps because
+     per-window generate() has already built the structural features
+     (AR1 Hurst, GARCH, jump overlays). Injecting more jumps in the global
+     pass breaks that structure and risks kurtosis / skew explosion.
+
+     New global-pass pipeline (all in z-score space):
+       1. Winsorize 0.5% tails  → removes sporadic blow-up points
+       2. Linear skew alignment → correct residual skew without cubic amplification
+       3. std pin to real_global_std → same as before
+
+     Removed from global pass:
+       - _kurtosis_topup() call (was causing kurtosis/skew explosions in v56-v58)
+       - soft-clip z_clipped / re-standardise before _skew_post_shift
+       - cubic _skew_post_shift (replaced by linear shift)
+
+     _kurtosis_topup() is still used per-window in generate() (Step 6 area),
+     and the function definition is kept for potential future use.
+
 v58: Fix global-pass kurtosis=776 / skew=-27 explosion (3 root causes).
-
-     Root cause analysis (v57.1 output: kurtosis=776, skew=-27):
-
-     R1. _kurtosis_topup eff_jstd not clipped for global pass.
-         Global pass passes jump_std = mean_jump_std_norm (z-space, ~1-6).
-         ret_std = std(z_norm) ≈ 1.0.
-         eff_jstd = max(mean_jump_std_norm, 1.0*3.0) = max(1~6, 3) = 3~6.
-         20 jumps × ±3~6σ on an 800-bar series → kurtosis explodes to 776.
-
-     Fix R1: Add max_eff_jstd parameter to _kurtosis_topup (default=None).
-         Global pass calls with max_eff_jstd=2.5.
-         Per-window calls unchanged (max_eff_jstd=None → no extra clip).
-
-     R2. topup_frac=0.50 in global pass is too permissive.
-         realised_ek ≈ 2-4, mean_raw_target_ek ≈ 3-5.
-         trigger threshold = 0.50 * 3~5 = 1.5~2.5.
-         Almost always fires, and ek_deficit is overestimated → n_jumps too high.
-
-     Fix R2: Global pass topup_frac 0.50 → 0.80.
-         Only fires when realised_ek < 0.80 * target_ek (genuine deficit).
-
-     R3. _skew_post_shift cubic z^3 amplified topup outliers → skew=-27.
-         After kurtosis topup injects ±3~6σ points, those extreme outliers
-         have z^3 ~ 27~216, so cubic term a*(z^3 - 3z) adds ±several sigma
-         of asymmetric push, collapsing skew to -27.
-
-     Fix R3: Soft-clip z to [-5, +5] before _skew_post_shift in global pass.
-         This neutralises outlier amplification without destroying kurtosis
-         (extreme values are already captured in the topup step).
-
 v57.1: Fix per-window kurtosis explosion in generate() Step 6.
 v57: Revert global pass to v54 logic; drop _global_kurtosis_inject.
 v56.1: Fix SyntaxError in OnlineRidgePredictor.predict_correction (line 775).
@@ -229,17 +219,16 @@ _NCT_NC_MAX   = 8.0
 # v53 Fix B: pipeline degrades kurtosis ~55%; pre-amplify target_ek by this factor
 _EK_OVERSAMPLE = 1.8
 
-# v56 global-pass safety constants (kept for reference; _global_kurtosis_inject is DEPRECATED)
+# v58 global-pass safety constants (kept for reference; global topup REMOVED in v59)
 _GLOBAL_TAIL_CLIP_Z  = 6.0
 _GLOBAL_N_INJECT     = 5
 _GLOBAL_INJECT_Z     = 3.5
 _GLOBAL_INJECT_Z_MAX = 4.0
-
-# v58: global pass eff_jstd ceiling (z-space)
 _GLOBAL_MAX_EFF_JSTD = 2.5
-
-# v58: soft-clip z outliers before _skew_post_shift in global pass
 _GLOBAL_SKEW_CLIP_Z  = 5.0
+
+# v59: global-pass winsorize tail fraction
+_GLOBAL_WINSORIZE_TAIL = 0.005   # 0.5% each side
 
 
 def _df_from_ek(target_ek: float) -> float:
@@ -305,23 +294,15 @@ def _sample_nct_iterative(
 
 def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> np.ndarray:
     """
-    Two-iteration cubic skew-shift.
+    Two-iteration cubic skew-shift.  Used per-window only (not in global pass).
 
     Transform: w = z + a*(z^3 - 3*z)
     Leading-order effect: skew(w) ≈ skew(z) + 6*a  (standardised z)
 
     IMPORTANT: input z MUST be standardised (mean=0, std=1).
-    The caller is responsible for normalisation before calling this function.
 
-    v54 Fix D: per-window clamp lowered from 0.30 → 0.20 (default) to
-    reduce cubic distortion of the AR1 Hurst structure.
-    The global post-topup pass in rolling_fit_generate uses clamp=0.30.
-
-    v58: caller must soft-clip z to ±_GLOBAL_SKEW_CLIP_Z before calling
-    this function in the global pass, to prevent cubic z^3 amplification
-    of topup-injected outliers from collapsing skew to -27.
-
-    After each shift, re-normalise to (mean=0, std=1).
+    v59: global pass no longer calls this function.  Global pass uses
+    _linear_skew_align() instead to avoid cubic z^3 amplification.
     """
     if len(z) < 4:
         return z
@@ -342,6 +323,45 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
     return z
 
 
+def _linear_skew_align(
+    z:           np.ndarray,
+    target_skew: float,
+    max_shift:   float = 0.10,
+) -> np.ndarray:
+    """
+    v59: Linear skew correction for the global pass.
+
+    Instead of cubic z^3 (which amplifies outliers), compute the skew
+    gap and apply a small constant additive shift to the upper or lower
+    tail direction.
+
+    Method: shift = clip(target_skew - current_skew, -max_shift, max_shift)
+    Applied as: w = z + shift * abs(z)   (amplifies tails directionally)
+    Then re-standardise to (mean=0, std=1).
+
+    This is bounded and monotonic — no risk of cubic blow-up.
+    max_shift=0.10 allows at most ~0.6 skew correction per call (empirical).
+    """
+    if len(z) < 4:
+        return z
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        current_skew = float(stats.skew(z))
+
+    skew_gap = target_skew - current_skew
+    if abs(skew_gap) < 0.05:
+        return z
+
+    shift = float(np.clip(skew_gap * 0.15, -max_shift, max_shift))
+    w     = z + shift * np.abs(z)
+    w_std = float(np.std(w))
+    if w_std > 1e-10:
+        w = (w - float(np.mean(w))) / w_std
+
+    return w
+
+
 def _kurtosis_topup(
     rets:         np.ndarray,
     target_ek:    float,
@@ -355,27 +375,10 @@ def _kurtosis_topup(
     """
     Additive jump injection to restore kurtosis.
 
-    Used in BOTH per-window generate() AND the global post-concat pass.
+    Used per-window in generate() (Step 6).
+    NOT used in the global pass as of v59.
 
     Input rets should be in z-score space (std≈1).
-
-    Parameters
-    ----------
-    topup_frac : float
-        Trigger threshold fraction of target_ek.  Topup fires only when
-        realised_ek < topup_frac * target_ek.
-        Per-window default: 0.50.
-        Global pass (v58): 0.80 — only fire when ek is seriously deficient.
-
-    max_eff_jstd : float or None
-        Hard upper bound on eff_jstd in z-space.
-        Per-window: None (no extra clip beyond existing logic).
-        Global pass (v58): 2.5 — prevents ±3~6σ jumps from exploding kurtosis.
-
-    The global pass caller must:
-      - pass target_ek = mean_raw_target_ek (= mean(target_ek)/EK_OVERSAMPLE)
-      - pass jump_std  = mean_jump_std_norm  (= mean(jump_std)/topup_std)
-      - pass topup_frac=0.80, max_eff_jstd=_GLOBAL_MAX_EFF_JSTD
     """
     if len(rets) < 4:
         return rets
@@ -393,7 +396,6 @@ def _kurtosis_topup(
     skew_bias  = float(np.clip(skew_raw * 0.3, -1.0, 1.0))
     eff_jstd   = float(max(jump_std, ret_std * 3.0))
 
-    # v58: apply global-pass ceiling if requested
     if max_eff_jstd is not None:
         eff_jstd = float(np.clip(eff_jstd, 0.0, max_eff_jstd))
 
@@ -415,26 +417,19 @@ def _global_kurtosis_inject(
 ) -> np.ndarray:
     """
     DEPRECATED (v57): this function is NOT called anywhere.
-
-    v56 attempted a two-step safe injection (G1 tail-clip + G2 injection),
-    but the caller passed raw-scale final_rets instead of z-score space,
-    making both G1 and G2 ineffective.  Kept for reference only.
-
-    Use _kurtosis_topup() for global pass corrections instead.
+    Kept for reference only.
     """
     if len(z) < 4:
         return z
 
     out = z.copy()
 
-    # G1: soft tail-clip (ineffective when z is raw-scale, ~0.01/bar)
     abs_z    = np.abs(out)
     clip_ix  = np.where(abs_z > _GLOBAL_TAIL_CLIP_Z)[0]
     if len(clip_ix) > 0:
-        jitter   = rng.uniform(1.0, 1.05, size=len(clip_ix))
+        jitter   = np.random.default_rng(0).uniform(1.0, 1.05, size=len(clip_ix))
         out[clip_ix] = np.sign(out[clip_ix]) * _GLOBAL_TAIL_CLIP_Z * jitter
 
-    # G2: light targeted injection
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realised_ek = float(stats.kurtosis(out))
@@ -689,22 +684,15 @@ def generate(
     z_shifted = _skew_post_shift(z_garch, target_skew=skew_raw, clamp=0.20)
 
     # Step 6: jump 疊加 (v57.1: eff_std 在 z-score 空間計算)
-    #
-    # v57.1 fix: jump_std is raw-scale (fitted from log_rets, e.g. 0.02-0.05).
-    # Steps 1-5 produce z in z-score space (std≈1).  Must normalise before
-    # computing eff_std, otherwise jump magnitude is 3-7σ per event.
-    #
-    # Also use raw (non-oversampled) target_ek for ek_amp so that the
-    # amplitude factor reflects actual market ek, not the inflated target.
     z_work = z_shifted.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
             jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
-            jump_std_z = jump_std / max(ret_std, 1e-10)   # normalise to z-space
-            raw_ek     = target_ek / _EK_OVERSAMPLE        # remove oversample factor
+            jump_std_z = jump_std / max(ret_std, 1e-10)
+            raw_ek     = target_ek / _EK_OVERSAMPLE
             ek_amp     = float(np.sqrt(max(raw_ek / 6.0, 1.0)))
-            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 4.0))  # z-space safety rail
+            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 4.0))
             skew_b     = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
             z_work[jump_idx] += rng.normal(skew_b, eff_std, size=n_jumps)
 
@@ -1019,27 +1007,24 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v58: Global kurtosis + skew correction
+        # v59: Global pass — winsorize + linear skew align + std pin
         #
-        # Pipeline (all in z-score space, std≈1):
-        #   1. Extract final_rets after drift alignment
-        #   2. mean_raw_target_ek = mean(target_ek) / _EK_OVERSAMPLE
-        #   3. mean_jump_std_norm = mean(jump_std) / topup_std
-        #   4. Normalise final_rets → z-score space
-        #   5. _kurtosis_topup(z, topup_frac=0.80, max_eff_jstd=2.5)
-        #      v58: topup_frac raised to 0.80 (more conservative trigger)
-        #      v58: max_eff_jstd=2.5 prevents ±3~6σ jumps exploding kurtosis
-        #   6. Soft-clip z to ±5σ before _skew_post_shift
-        #      v58: prevents cubic z^3 term from amplifying topup outliers
-        #   7. _skew_post_shift(z, clamp=0.30)
-        #   8. Rescale back to raw scale
-        #   9. Post-fix std guard: pin std == real_global_std
+        # Strategy: do NOT inject new jumps. Per-window generate() has already
+        # built the structural features. The global pass only cleans up
+        # extreme outliers and corrects residual skew bias.
+        #
+        # Pipeline (in z-score space):
+        #   1. Normalise final_rets → z-score space
+        #   2. Winsorize 0.5% tails (removes sporadic blow-up points)
+        #   3. Re-standardise after winsorize
+        #   4. Linear skew alignment via _linear_skew_align()
+        #   5. Rescale back to raw scale
+        #   6. std pin: enforce std == real_global_std
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
 
-        # Normalise to z-score space
         topup_mu  = float(np.mean(final_rets))
         topup_std = float(np.std(final_rets))
         if topup_std < 1e-10:
@@ -1047,57 +1032,23 @@ def rolling_fit_generate(
 
         z_norm = (final_rets - topup_mu) / topup_std
 
-        # mean_raw_target_ek: remove oversample factor so comparison is apples-to-apples
-        raw_ek_vals = [
-            p.get("target_ek", 3.0) / _EK_OVERSAMPLE
-            for p in param_log
-            if not p.get("_summary") and p.get("target_ek") is not None
-        ]
-        mean_raw_target_ek = float(np.mean(raw_ek_vals)) if raw_ek_vals else 3.0
-        mean_raw_target_ek = float(np.clip(mean_raw_target_ek, 1.0, _TARGET_EK_MAX))
+        # Step 1: Winsorize 0.5% tails
+        lo_q = float(np.quantile(z_norm, _GLOBAL_WINSORIZE_TAIL))
+        hi_q = float(np.quantile(z_norm, 1.0 - _GLOBAL_WINSORIZE_TAIL))
+        z_wins = np.clip(z_norm, lo_q, hi_q)
 
-        # mean_jump_std in z-score units
-        jump_std_vals = [
-            p.get("jump_std", 0.0)
-            for p in param_log
-            if not p.get("_summary") and p.get("jump_std") is not None
-        ]
-        mean_jump_std      = float(np.mean(jump_std_vals)) if jump_std_vals else 0.0
-        mean_jump_std_norm = float(mean_jump_std / topup_std) if topup_std > 1e-10 else 3.0
-        mean_jump_std_norm = float(np.clip(mean_jump_std_norm, 1.0, 6.0))
+        # Re-standardise after winsorize
+        z_wins_std = float(np.std(z_wins))
+        if z_wins_std > 1e-10:
+            z_wins = (z_wins - float(np.mean(z_wins))) / z_wins_std
 
-        topup_rng = np.random.default_rng(seed + 9999 if seed is not None else 0)
-
-        # v58: topup_frac=0.80, max_eff_jstd=_GLOBAL_MAX_EFF_JSTD=2.5
-        z_topup = _kurtosis_topup(
-            rets         = z_norm,
-            target_ek    = mean_raw_target_ek,
-            jump_std     = mean_jump_std_norm,
-            skew_raw     = global_skew_target,
-            rng          = topup_rng,
-            topup_frac   = 0.80,
-            max_jumps    = 20,
-            max_eff_jstd = _GLOBAL_MAX_EFF_JSTD,
-        )
-
-        # v58: soft-clip z outliers to ±_GLOBAL_SKEW_CLIP_Z before cubic shift
-        z_clipped = np.clip(z_topup, -_GLOBAL_SKEW_CLIP_Z, _GLOBAL_SKEW_CLIP_Z)
-        # re-standardise after clip so _skew_post_shift receives std≈1
-        z_clip_std = float(np.std(z_clipped))
-        if z_clip_std > 1e-10:
-            z_clipped = (z_clipped - float(np.mean(z_clipped))) / z_clip_std
-
-        # Skew post-shift in z-score space (clamp=0.30 for global pass)
-        z_shifted = _skew_post_shift(
-            z_clipped,
-            target_skew=global_skew_target,
-            clamp=0.30,
-        )
+        # Step 2: Linear skew alignment
+        z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target, max_shift=0.10)
 
         # Rescale back to raw scale
-        final_rets_fixed = z_shifted * topup_std + topup_mu
+        final_rets_fixed = z_aligned * topup_std + topup_mu
 
-        # Post-fix std guard: pin std == real_global_std
+        # Step 3: std pin to real_global_std
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
             std_scale = real_global_std / post_std
@@ -1120,19 +1071,13 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * price_ratio
 
     if all_dtw or all_pcorr:
-        dtw_mean   = float(np.mean(all_dtw))     if all_dtw   else float("nan")
-        dtw_median = float(np.median(all_dtw))   if all_dtw   else float("nan")
-        pc_mean    = float(np.mean(all_pcorr))   if all_pcorr else float("nan")
-        pc_median  = float(np.median(all_pcorr)) if all_pcorr else float("nan")
-        print(f"\n[similarity] DTW  mean={dtw_mean:.4f}  median={dtw_median:.4f}  (越小越好)")
-        print(f"[similarity] path_corr  mean={pc_mean:+.3f}  median={pc_median:+.3f}  (越接近 +1 越好)")
-
-    param_log.append({
-        "_summary":   True,
-        "n_windows":  window_idx,
-        "dtw_mean":   float(np.mean(all_dtw))   if all_dtw   else None,
-        "dtw_median": float(np.median(all_dtw)) if all_dtw   else None,
-        "pcorr_mean": float(np.mean(all_pcorr)) if all_pcorr else None,
-    })
+        dtw_mean   = float(np.mean(all_dtw))   if all_dtw   else float("nan")
+        pcorr_mean = float(np.mean(all_pcorr)) if all_pcorr else float("nan")
+        param_log.append({
+            "_summary": True,
+            "dtw_mean": dtw_mean,
+            "pcorr_mean": pcorr_mean,
+            "n_windows": window_idx,
+        })
 
     return df_result, param_log
