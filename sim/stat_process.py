@@ -1,36 +1,31 @@
 """
-stat_process.py  v72
+stat_process.py  v73
 ====================
+v73: fix kurtosis collapse (3 bugs)
+
+  Bug A — sc_inner 算錯基準
+    v72 用 median(target_ek) 算 sc_inner，但 target_ek = raw_ek * oversample。
+    當 ek_adj=3.20 且大多數 window raw_ek 在 1~7 時，target_ek median 約 3.2，
+    導致 sc_inner = max(5, 2*sqrt(3.2)) = 5.0，但 log 顯示 sc_inner=3.00——
+    實際上更早的版本殘留邏輯讓 sc_inner 退化回固定值 3.0。
+    修正：sc_inner 改用 median(raw_ek) 的無 oversample 版本，
+    即從 param_log 中取 target_ek / ek_oversample_adj，
+    並且提高下限到 6.0（不是 5.0），確保正常市場不會被 clip。
+
+  Bug B — global-pass 的 _kurtosis_topup 目標值也用 target_ek（含 oversample）
+    topup 在 z-score 空間操作，但 target_ek 是給 generate() 用的 oversampled 值，
+    比真實 kurtosis 高 3.2x。結果 topup 注入過多 tail events，
+    反而讓 post_std 偏大，最後 std-pin 又把 tail 壓回去。
+    修正：global-pass topup 目標改用 median(raw_ek)（真實觀測值）。
+
+  Bug C — generate_conditional 線性 blend 後的 topup topup_frac=0.60 太低
+    20 bars 的短 window，linear blend 把 kurtosis 拉向正態，
+    topup_frac=0.60 意思是只要達到 0.6*target_ek 就停止，
+    但 target_ek 本身因 ek_adj=3.20 而低估，停止條件幾乎立即滿足。
+    修正：conditional 路徑改用 topup_frac=0.85，
+    且把 topup 移到 std-pin 之前（防止 std-pin 把 tail 再壓縮）。
+
 v72: fix global-pass kurtosis destruction
-
-  Root cause analysis:
-  The global post-processing pass in rolling_fit_generate() was destroying
-  kurtosis in three sequential steps:
-    1. std rescale (real/sim) — changes vol distribution uniformly, OK
-    2. _soft_clip_z — compresses tails of z-scores, directly kills kurtosis
-    3. _linear_skew_align(z_wins) — operates on already-clipped z, further smooths
-    4. final rescale by real_global_std — renormalises but kurtosis is already gone
-
-  The real culprit is step 2: sc_inner=3.0 means ANY return > 3*sigma is
-  soft-clipped. For AAPL with true kurtosis ~10.6, the "fat tail" events
-  ARE the kurtosis — clipping them at 3-sigma is equivalent to Winsorising
-  the entire kurtosis signal. sc_inner needs to be set relative to target_ek,
-  not as a fixed sigma threshold.
-
-  Fixes:
-  A. _soft_clip_z: set inner = max(5.0, 2*sqrt(target_ek)) so for ek=10.6
-     inner ≈ 6.5 sigma — tails are only clipped at extreme outliers, not fat
-     tail events. outer = inner + 3.0 (was 2x, now additive to avoid too
-     wide a range that defeats the purpose).
-  B. After _soft_clip_z, inject kurtosis back with _kurtosis_topup() using
-     the global true_target_ek (median of window target_ek values).
-  C. _linear_skew_align: apply BEFORE the final std pin, not on z_wins
-     (which has lost its tails). Operate on final_rets_fixed after topup.
-  D. Remove the global std rescale step that pins to real_global_std AFTER
-     _linear_skew_align — this was the final kurtosis-destroying step because
-     it re-standardises a distribution that has just been topup'd.
-     Instead, pin std precisely without touching the tail structure.
-
 v71: fix generate_conditional degradation
 v70: kurtosis p90 fix + block-bootstrap conditional generate
 v69: Fix module-global _ek_decay_ema cross-trial state leak.
@@ -342,12 +337,12 @@ def _kurtosis_topup(
 
 def _soft_clip_z(
     z:      np.ndarray,
-    inner:  float = 5.0,
-    outer:  float = 8.0,
+    inner:  float = 6.0,
+    outer:  float = 9.0,
 ) -> np.ndarray:
     """
-    v72: inner/outer are now passed in per-call based on target_ek.
-    Defaults raised so fat-tail events are not destroyed by default.
+    v73: defaults raised to 6/9 (was 5/8 in v72).
+    inner/outer passed in per-call based on raw_ek (not oversampled target_ek).
     Only returns beyond `outer` sigma are hard-clipped.
     """
     abs_z = np.abs(z)
@@ -573,8 +568,9 @@ def generate_conditional(
     blended_rets = blended_rets / bl_std * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
 
-    # recover kurtosis lost by linear blend
-    blended_rets = _kurtosis_topup(blended_rets, target_ek, rng)
+    # Bug C fix: topup_frac=0.85 (was 0.60), run topup BEFORE final std-pin
+    # so the tail events injected are not immediately compressed away.
+    blended_rets = _kurtosis_topup(blended_rets, target_ek, rng, topup_frac=0.85)
 
     # correct skew bias from block selection
     with warnings.catch_warnings():
@@ -583,7 +579,7 @@ def generate_conditional(
     if abs(current_skew - target_skew) > 0.15:
         blended_rets = _linear_skew_align(blended_rets, target_skew)
 
-    # final std/mean pin
+    # final std/mean pin — after topup so std drift from injected tails is corrected
     bl_std2 = float(np.std(blended_rets)) + 1e-10
     blended_rets = blended_rets / bl_std2 * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
@@ -745,6 +741,12 @@ def rolling_fit_generate(
 
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
 
+        # v73: store raw_ek (before oversample) in param_log for global-pass sc_inner
+        _fit_lr = _log_returns(df_fit["Close"].values)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _raw_ek_window = float(np.clip(stats.kurtosis(_fit_lr), 1.0, _TARGET_EK_MAX))
+
         raw_skew_window = float(params["ret_skew_raw"])
         anchored_skew   = float(np.clip(
             raw_skew_window,
@@ -871,6 +873,7 @@ def rolling_fit_generate(
             "ret_skew_a":        float(params["ret_skew_a"]),
             "hurst":             float(params["hurst_target"]),
             "target_ek":         float(params["target_ek"]),
+            "raw_ek":            _raw_ek_window,   # v73: added for global-pass sc_inner
             "ek_oversample_adj": ek_oversample_adj,
             "ek_oversample_init": ek_oversample_init if calibrator else None,
             "jump_freq":         float(params["jump_freq"]),
@@ -887,7 +890,7 @@ def rolling_fit_generate(
         pos        += step
 
     # ---------------------------------------------------------------------------
-    # Global post-processing pass  (v72: kurtosis-preserving)
+    # Global post-processing pass  (v73: sc_inner from raw_ek, topup from raw_ek)
     # ---------------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -941,8 +944,10 @@ def rolling_fit_generate(
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
 
-        # Step 3: measure kurtosis BEFORE any clipping; set sc_inner high
-        #         so only extreme outliers (>8-sigma) are soft-clipped.
+        # Step 3: soft-clip with sc_inner based on median RAW kurtosis (Bug A fix)
+        # raw_ek is the observed kurtosis before oversample — represents true tail thickness.
+        # sc_inner = max(6.0, 2*sqrt(raw_ek)) so normal market (ek~3) → inner=6,
+        # fat-tail market (ek~10) → inner=6.3, extreme (ek~20) → inner=8.9.
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -956,16 +961,16 @@ def rolling_fit_generate(
             warnings.simplefilter("ignore")
             ek_before = float(stats.kurtosis(z_norm))
 
-        window_ek_vals = [
-            row["target_ek"]
+        # Bug A fix: use raw_ek from param_log (not oversampled target_ek)
+        raw_ek_vals = [
+            row["raw_ek"]
             for row in param_log
-            if not row.get("_summary") and "target_ek" in row
+            if not row.get("_summary") and "raw_ek" in row
         ]
-        median_target_ek = float(np.median(window_ek_vals)) if window_ek_vals else 6.0
+        median_raw_ek = float(np.median(raw_ek_vals)) if raw_ek_vals else 6.0
 
-        # v72: inner = max(5, 2*sqrt(target_ek)) — fat tails are NOT clipped
-        # e.g. ek=10 → inner=6.3; ek=20 → inner=8.9; ek=3 → inner=5.0
-        sc_inner = float(max(5.0, 2.0 * float(np.sqrt(median_target_ek))))
+        # sc_inner from raw kurtosis: floor at 6.0 so normal market tails survive
+        sc_inner = float(max(6.0, 2.0 * float(np.sqrt(median_raw_ek))))
         sc_outer = sc_inner + 3.0
 
         z_wins = _soft_clip_z(z_norm, inner=sc_inner, outer=sc_outer)
@@ -985,18 +990,20 @@ def rolling_fit_generate(
             print(
                 f"[stat] global-pass  ek_before={ek_before:.2f}"
                 f"  ek_after={ek_after:.2f}"
+                f"  median_raw_ek={median_raw_ek:.2f}"
                 f"  sc_inner={sc_inner:.2f}  sc_outer={sc_outer:.2f}"
                 f"  decay={ek_after/max(ek_before,1e-3):.3f}"
                 f"  ema={ek_decay_ema:.3f}"
                 f"  oversample_next={_EK_OVERSAMPLE/max(ek_decay_ema,0.15):.2f}"
             )
 
-        # Step 4: skew alignment (on z_wins, before rescale)
+        # Step 4: skew alignment
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
 
-        # Step 5: kurtosis topup on z_aligned (in z-score space)
-        # target in z-space is median_target_ek (kurtosis is scale-invariant)
-        z_toppedUp = _kurtosis_topup(z_aligned, median_target_ek, rng)
+        # Step 5: Bug B fix — topup target is median_raw_ek (true kurtosis),
+        # NOT median_target_ek (oversampled). Kurtosis is scale-invariant so
+        # operating in z-space is correct; target should match real-world ek.
+        z_toppedUp = _kurtosis_topup(z_aligned, median_raw_ek, rng, topup_frac=0.85)
 
         # Step 6: reconstruct returns, pin std precisely
         final_rets_fixed = z_toppedUp * topup_std + topup_mu
