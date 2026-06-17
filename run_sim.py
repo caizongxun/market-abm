@@ -228,7 +228,8 @@ def run_stat(args, df_real):
     )
     print(f"[stat] estimated windows: {est_windows}")
 
-    df_result, param_log = rolling_fit_generate(
+    # v74: rolling_fit_generate now returns (df_result, param_log, ek_decay_ema)
+    df_result, param_log, ek_decay_ema = rolling_fit_generate(
         df_real          = df_real,
         lookback         = args.lookback,
         step             = args.step,
@@ -236,6 +237,7 @@ def run_stat(args, df_real):
         verbose          = True,
         use_conditional  = args.conditional,
     )
+    print(f"[stat] final ek_decay_ema={ek_decay_ema:.4f}")
     return df_result, param_log
 
 
