@@ -264,7 +264,8 @@ def main():
     calibrator = None
     if not args.no_calib:
         from sim.calibrator import AdaptiveCalibrator
-        calibrator = AdaptiveCalibrator(min_train=50, update_interval=20, explore_std=0.03)
+        # explore_std 是由 ESPolicy 動態計算的 property，不接受 __init__ 參數
+        calibrator = AdaptiveCalibrator(min_train=50, update_interval=20)
         if os.path.exists(args.calib_path):
             calibrator.load(args.calib_path)
             print(f"[calib] loaded {args.calib_path}  ({calibrator.n_experiences} experiences)")
@@ -303,7 +304,7 @@ def main():
             for fut in as_completed(futs):
                 res = fut.result()
                 results.append(res)
-                icon = "✓" if res.status == "ok" else "✗"
+                icon = "ok" if res.status == "ok" else "!!"
                 print(f"  [{res.run_id:3d}/{args.runs}] {icon} {res.symbol:<6} {res.start}"
                       f"  kurt_err={res.kurt_err:.2f}  status={res.status}")
     else:
@@ -313,7 +314,7 @@ def main():
                                         args.lookback, args.step, seed,
                                         calibrator)
             results.append(res)
-            icon = "✓" if res.status == "ok" else "✗"
+            icon = "ok" if res.status == "ok" else "!!"
             calib_str = f"  calib_n={calibrator.n_experiences}" if calibrator else ""
             print(
                 f"  [{run_id:3d}/{args.runs}] {icon} {sym:<6} {start}"
@@ -325,7 +326,7 @@ def main():
 
     # ---- 儲存 calibrator ----
     if calibrator is not None:
-        calibrator.explore_std = 0.0   # inference 時關閉 exploration
+        # explore_std 是唯讀 property（由 ESPolicy decay 計算），不可直接賦值
         calibrator.save(args.calib_path)
         print(f"[calib] saved {args.calib_path}  ({calibrator.n_experiences} experiences)")
 
