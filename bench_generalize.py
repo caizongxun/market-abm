@@ -1,8 +1,15 @@
 """
-bench_generalize.py  v2
-=======================
+bench_generalize.py  v2.1
+=========================
 泛化壓測腳本：隨機品種 × 隨機時段，跑 N 次 StatProcess rolling sim，
 彙總統計矩誤差、DTW、path_corr，評估模型跨品種/跨時期泛化能力。
+
+v2.1 fix:
+  calibrator.load() 回傳值未賦回的 bug。
+  AdaptiveCalibrator.load() 是 @staticmethod，回傳新物件；
+  舊寫法 `calibrator.load(path)` 把回傳值丟掉，每次都從空 calibrator 學起，
+  pkl 累積的 experience 完全沒有跨 session 生效。
+  修正：改為 `calibrator = AdaptiveCalibrator.load(path)`。
 
 v2 新增：
   - 跨 trial 共享 AdaptiveCalibrator 實例
@@ -264,12 +271,13 @@ def main():
     calibrator = None
     if not args.no_calib:
         from sim.calibrator import AdaptiveCalibrator
-        # explore_std 是由 ESPolicy 動態計算的 property，不接受 __init__ 參數
-        calibrator = AdaptiveCalibrator(min_train=50, update_interval=20)
         if os.path.exists(args.calib_path):
-            calibrator.load(args.calib_path)
+            # v2.1 fix: load() is a @staticmethod returning a new object;
+            # must reassign, not call on existing instance.
+            calibrator = AdaptiveCalibrator.load(args.calib_path)
             print(f"[calib] loaded {args.calib_path}  ({calibrator.n_experiences} experiences)")
         else:
+            calibrator = AdaptiveCalibrator(min_train=50, update_interval=20)
             print(f"[calib] new calibrator (will save to {args.calib_path})")
     else:
         print("[calib] disabled")
@@ -326,7 +334,6 @@ def main():
 
     # ---- 儲存 calibrator ----
     if calibrator is not None:
-        # explore_std 是唯讀 property（由 ESPolicy decay 計算），不可直接賦值
         calibrator.save(args.calib_path)
         print(f"[calib] saved {args.calib_path}  ({calibrator.n_experiences} experiences)")
 
