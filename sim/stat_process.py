@@ -1,37 +1,24 @@
 """
-stat_process.py  v68
+stat_process.py  v69
 ====================
-v68: Pass fwd_bars to calibrator.record() for kurt sample-size discount (方案B).
-
-  calibrator.record() now receives n_bars=fwd_bars so that the kurt_err
-  signal is down-weighted by min(fwd_bars, 120) / 120.
-  For the default step=20 this gives a 0.167x discount, preventing the
-  calibrator from over-fitting d_target_ek to noisy short-window kurtosis
-  estimates (root cause of UNH kurt_err=18 and similar outliers).
-
-v67: Per-symbol dynamic soft_clip inner/outer based on median target_ek.
+v69: Fix module-global _ek_decay_ema cross-trial state leak.
 
   Problem:
-    Global-pass _soft_clip_z uses fixed inner=3.0, outer=6.0.
-    For high-kurtosis symbols (e.g. UNH with target_ek ~25),
-    this compresses too aggressively at z=3, destroying the fat tails
-    that the calibrator worked hard to produce, and causing the
-    _ek_decay_ema to see a large decay_ratio -> ek_oversample spirals up.
+    _ek_decay_ema was a module-level variable, mutated by every call to
+    rolling_fit_generate(). In bench_generalize with 100 sequential trials,
+    each trial inherited the ema left by the previous one, making
+    ek_oversample_adj non-deterministic per symbol and inflating kurt_err
+    variance (especially for high-kurtosis symbols like UNH).
 
   Fix:
-    After all windows are done, compute median_target_ek from param_log,
-    then set:
-      inner = max(3.0, sqrt(median_target_ek))   # UNH: sqrt(25)=5.0
-      outer = inner * 2.0                         # UNH: 10.0
-    Pass these into _soft_clip_z instead of the fixed module constants.
-    _SOFT_CLIP_INNER / _SOFT_CLIP_OUTER kept as defaults for any other
-    callers that don't have a param_log.
+    _ek_decay_ema is now a local variable inside rolling_fit_generate(),
+    initialized to ek_decay_ema_init (default 1.0, caller-supplied).
+    The module-level constant is removed.
 
+v68: Pass fwd_bars to calibrator.record() for kurt sample-size discount.
+v67: Per-symbol dynamic soft_clip inner/outer based on median target_ek.
 v66 (P1b): Per-window realised-kurtosis feedback into calibrator context.
 v65 (P1): _TARGET_EK_MAX 30->60, ek_oversample_adj clip upper 6->10.
-v64: Wire ek_oversample_adj into build_context (10-dim context).
-v63: Fix two bugs causing kurtosis to not converge across windows.
-v62: Fix kurtosis 10.6->3.14 collapse after v61.
 """
 from __future__ import annotations
 
@@ -511,7 +498,6 @@ class OnlineRidgePredictor:
 # 4. ROLLING FIT + GENERATE
 # ---------------------------------------------------------------------------
 
-_ek_decay_ema: float = 1.0
 _EK_DECAY_EMA_ALPHA = 0.20
 
 _SOFT_CLIP_INNER = 3.0   # default fallback for callers without param_log
@@ -549,8 +535,11 @@ def rolling_fit_generate(
     verbose:    bool  = True,
     calibrator          = None,
     predictor           = None,
+    ek_decay_ema_init:  float = 1.0,   # v69: caller-supplied initial ema (default clean)
 ) -> Tuple[pd.DataFrame, List[Dict]]:
-    global _ek_decay_ema
+    # v69: ek_decay_ema is now a LOCAL variable — no module-level state leak
+    # between sequential bench_generalize trials.
+    ek_decay_ema: float = float(ek_decay_ema_init)
 
     rng = np.random.default_rng(seed)
 
@@ -583,8 +572,8 @@ def rolling_fit_generate(
         df_fwd = df_real.iloc[fwd_start:fwd_end].copy().reset_index(drop=True)
 
         ek_oversample_adj = float(np.clip(
-            _EK_OVERSAMPLE / max(_ek_decay_ema, 0.15),
-            1.5, 12.0,   # v66: upper bound raised from 10.0 to 12.0
+            _EK_OVERSAMPLE / max(ek_decay_ema, 0.15),
+            1.5, 12.0,
         ))
 
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
@@ -599,11 +588,10 @@ def rolling_fit_generate(
             params = StatParams(**{**dict(params), "ret_skew_raw": anchored_skew})
 
         calib_action = None
-        ek_oversample_init = ek_oversample_adj  # default if no calibrator
+        ek_oversample_init = ek_oversample_adj
         if calibrator is not None:
             from sim.calibrator import AdaptiveCalibrator
 
-            # v66 (P1b): compute per-window realised kurtosis from df_fit
             _fit_log_rets = _log_returns(df_fit["Close"].values)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -667,7 +655,7 @@ def rolling_fit_generate(
                     kurt_err    = kurt_err,
                     hurst_err   = hurst_err,
                     dir_hit     = dir_hit,
-                    n_bars      = fwd_bars,   # v68: sample-size discount
+                    n_bars      = fwd_bars,
                 )
 
         if predictor is not None and len(real_rets) > 3:
@@ -707,7 +695,7 @@ def rolling_fit_generate(
             "hurst":             float(params["hurst_target"]),
             "target_ek":         float(params["target_ek"]),
             "ek_oversample_adj": ek_oversample_adj,
-            "ek_oversample_init": ek_oversample_init if calibrator else None,  # v66
+            "ek_oversample_init": ek_oversample_init if calibrator else None,
             "jump_freq":         float(params["jump_freq"]),
             "vol_persistence":   float(params["vol_persistence"]),
             "std_err_pct":       std_err_pct,
@@ -786,7 +774,6 @@ def rolling_fit_generate(
             warnings.simplefilter("ignore")
             ek_before = float(stats.kurtosis(z_norm))
 
-        # v67: dynamic soft_clip thresholds based on median target_ek across windows
         window_ek_vals = [
             row["target_ek"]
             for row in param_log
@@ -807,10 +794,10 @@ def rolling_fit_generate(
             ek_after = float(stats.kurtosis(z_wins))
 
         if ek_before > 0.5:
-            decay_ratio  = float(np.clip(ek_after / ek_before, 0.10, 1.0))
-            _ek_decay_ema = (
+            decay_ratio = float(np.clip(ek_after / ek_before, 0.10, 1.0))
+            ek_decay_ema = (
                 _EK_DECAY_EMA_ALPHA * decay_ratio
-                + (1.0 - _EK_DECAY_EMA_ALPHA) * _ek_decay_ema
+                + (1.0 - _EK_DECAY_EMA_ALPHA) * ek_decay_ema
             )
 
         if verbose:
@@ -819,8 +806,8 @@ def rolling_fit_generate(
                 f"  ek_after={ek_after:.2f}"
                 f"  sc_inner={sc_inner:.2f}  sc_outer={sc_outer:.2f}"
                 f"  decay={ek_after/max(ek_before,1e-3):.3f}"
-                f"  ema={_ek_decay_ema:.3f}"
-                f"  oversample_next={_EK_OVERSAMPLE/max(_ek_decay_ema,0.15):.2f}"
+                f"  ema={ek_decay_ema:.3f}"
+                f"  oversample_next={_EK_OVERSAMPLE/max(ek_decay_ema,0.15):.2f}"
             )
 
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)

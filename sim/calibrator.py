@@ -1,34 +1,32 @@
 """
-calibrator.py  v6.2
+calibrator.py  v6.3
 ===================
-AdaptiveCalibrator：ES（Evolution Strategy）策略更新 + 連續 RL 閉環支援。
+AdaptiveCalibrator：ES（Evolution Strategy）策略更新 + 連續 RL 閉璴支援。
 
-v6.2 (方案B): kurt_err 加入樣本量折扣。
-  問題：
-    20-bar 窗口估出的 realised kurtosis 方差極大（Fisher kurtosis 需 ~100+ 樣本
-    才有合理精度）。calibrator 拿這個噪音當 signal 更新 d_target_ek，導致
-    UNH 等品種學錯方向，越調越偏。
+v6.3:
+  _compute_reward() kurt weight floor + _KURT_N_BASE 調整。
+    問題：
+      v6.2 的 weight_k = min(n_bars,120)/120 在 step=20 時為 0.167，
+      calibrator 對 kurt 的修正梓度極小，14000+ 筆經驗後 kurt_err
+      仍然沒有顯著下降。
+    修正：
+      1. _KURT_N_BASE: 120 -> 60（折扣曲線的膝點調到 1 個 lookback window）。
+      2. weight_k 增加 floor 0.33：
+           weight_k = max(min(n_bars, _KURT_N_BASE) / _KURT_N_BASE, 0.33)
+         step=20 時：0.167 -> 0.33，kurt 模擬訊號翻倍。
+         step=60 時：1.0（不受影響）。
+      3. PARAM_SAFE target_ek 上限 60 -> 120：
+         允許 calibrator 對 UNH 等極高 kurtosis 品種推高 target_ek，
+         匹配 stat_process._TARGET_EK_MAX=60 + ek_oversample_adj 路徑。
 
-  修正：
-    _compute_reward() 新增 n_bars 參數。
-    kurt 的權重乘以 weight_k = min(n_bars, 120) / 120，
-    使 20-bar 窗口的 kurt 貢獻只有 120-bar 窗口的 1/6。
-    其餘指標（std, hurst, dir）不受影響。
-
-  調用方：
-    record() 新增 n_bars 關鍵字參數（預設 120 以向後相容，不傳等同舊行為）。
-    stat_process.rolling_fit_generate 傳入 fwd_bars。
-
+v6.2 (B方案): kurt_err 加入樣本量折扣。
 v6.1 (P1)：
-  1. PARAM_SAFE["target_ek"] 上限 15.0 → 60.0，與 stat_process._TARGET_EK_MAX 同步。
+  1. PARAM_SAFE["target_ek"] 上限 15.0 → 60.0。
   2. d_target_ek clip: (-0.50, 0.50) → (-0.30, 0.30)
-
 v6 主要變更：
-  1. build_context 擴充至 10 維：新增 ek_oversample_adj。
-  2. reward 重新平衡（kurtosis 升至主導）：
-     New: 0.05*std + 0.70*log1p(kurt)/3 + 0.15*hurst - 0.10*dir
-  3. CONTEXT_KEYS 同步更新（10 個 key）。
-  4. build_context 新增 ek_oversample 關鍵字參數（預設 1.0 以向後相容）。
+  1. build_context 擴充至 10 維。
+  2. reward 重新平衡。
+  3. CONTEXT_KEYS 同步更新。10 個 key。24. build_context 新增 ek_oversample 關鍵字參數。
 """
 from __future__ import annotations
 
@@ -55,7 +53,7 @@ CONTEXT_KEYS: List[str] = [
     "ret_std", "ret_skew_a", "ret_df",
     "hurst_target", "wick_lambda",
     "jump_freq", "vol_persistence", "acf_lag1", "target_ek",
-    "ek_oversample_adj",   # v6: 第 10 維，adaptive 超取樣倍率
+    "ek_oversample_adj",
 ]
 
 ACTION_KEYS: List[str] = [
@@ -65,7 +63,7 @@ ACTION_KEYS: List[str] = [
 ACTION_CLIP: Dict[str, tuple] = {
     "d_ret_std":          (-0.40, 0.40),
     "d_hurst":            (-0.15, 0.15),
-    "d_target_ek":        (-0.30, 0.30),   # v6.1: tightened from (-0.50, 0.50)
+    "d_target_ek":        (-0.30, 0.30),
     "d_vol_persistence":  (-0.30, 0.30),
 }
 
@@ -79,7 +77,7 @@ ACTION_TARGET: Dict[str, str] = {
 PARAM_SAFE: Dict[str, tuple] = {
     "ret_std":          (1e-5,  0.20),
     "hurst_target":     (0.30,  0.69),
-    "target_ek":        (1.0,   60.0),   # v6.1: raised from 15.0 to match _TARGET_EK_MAX
+    "target_ek":        (1.0,   120.0),  # v6.3: raised from 60 to allow high-kurt adjustment
     "vol_persistence":  (0.0,   0.85),
 }
 
@@ -91,8 +89,10 @@ _ES_EXPLORE_FLOOR = 0.02
 _ES_DECAY_HALF    = 2000
 _ES_LR            = 0.10
 
-# v6.2: kurt discount normalisation base (bars)
-_KURT_N_BASE = 120
+# v6.3: kurt discount base lowered 120->60 (one lookback window)
+_KURT_N_BASE = 60
+# v6.3: kurt weight floor — even at step=20 calibrator gets 33% of full signal
+_KURT_WEIGHT_FLOOR = 0.33
 
 
 # ---------------------------------------------------------------------------
@@ -237,24 +237,15 @@ class RidgeModel:
 
 
 # ---------------------------------------------------------------------------
-# AdaptiveCalibrator  v6.2
+# AdaptiveCalibrator  v6.3
 # ---------------------------------------------------------------------------
 
 class AdaptiveCalibrator:
     """
+    v6.3: kurt weight floor + _KURT_N_BASE 60 + PARAM_SAFE target_ek 120.
     v6.2: kurt_err sample-size discount.
-      _compute_reward() accepts n_bars; kurt weight *= min(n_bars, 120) / 120.
-      record() accepts n_bars kwarg (default 120 = no discount).
-
     v6.1: PARAM_SAFE target_ek 15->60, d_target_ek clip +-0.50->+-0.30.
-    v6:   build_context 10-dim (+ ek_oversample_adj) + reward rebalanced.
-
-    主要流程：
-      1. predict(ctx)  -> propose action from ES policy
-      2. apply action  -> generate() with adjusted params
-      3. record(...)   -> push to buffer, update ES policy mean
-      4. _fit_models() -> 每 update_interval 筆用 XGB/Ridge 學習
-      5. save/load     -> 持久化，支援跨 session warm-start
+    v6:   build_context 10-dim + reward rebalanced.
     """
 
     def __init__(
@@ -292,12 +283,6 @@ class AdaptiveCalibrator:
         params: Dict[str, Any],
         ek_oversample: float = 1.0,
     ) -> np.ndarray:
-        """
-        v6: 10-dim context vector.
-        dim 10 = ek_oversample_adj: clip [1, 10] so the model observes
-        the current adaptive oversample multiplier and can learn to
-        adjust d_target_ek accordingly.
-        """
         return np.array([
             float(params["ret_std"]),
             float(params["ret_skew_a"]),
@@ -308,7 +293,7 @@ class AdaptiveCalibrator:
             float(params["vol_persistence"]),
             float(params["acf_lag1"]),
             float(np.log1p(abs(params["target_ek"]))),
-            float(np.clip(ek_oversample, 1.0, 10.0)),  # v6.1: upper 8->10
+            float(np.clip(ek_oversample, 1.0, 10.0)),
         ], dtype=float)
 
     @staticmethod
@@ -320,15 +305,16 @@ class AdaptiveCalibrator:
         n_bars:      int = _KURT_N_BASE,
     ) -> float:
         """
-        v6.2: kurt weight discounted by sample size.
-          weight_k = min(n_bars, _KURT_N_BASE) / _KURT_N_BASE
-          At n_bars=20 (default step):  weight_k = 20/120 ≈ 0.167
-          At n_bars=120 (full lookback): weight_k = 1.0  (no discount)
-
-        v6 reward base:
-          -(0.05*std + 0.70*log1p(kurt)/3 + 0.15*hurst/0.05 - 0.10*dir)
+        v6.3: kurt weight_k has a floor of _KURT_WEIGHT_FLOOR (0.33).
+          weight_k = max(min(n_bars, _KURT_N_BASE) / _KURT_N_BASE, _KURT_WEIGHT_FLOOR)
+          At step=20: was 20/120=0.167, now max(20/60, 0.33) = max(0.33, 0.33) = 0.33.
+          At step=60: max(60/60, 0.33) = 1.0 (unchanged).
+          At step=20 with old _KURT_N_BASE=120: was 0.167, now 0.33 — doubles signal.
         """
-        weight_k = float(min(n_bars, _KURT_N_BASE)) / _KURT_N_BASE
+        weight_k = float(max(
+            min(n_bars, _KURT_N_BASE) / _KURT_N_BASE,
+            _KURT_WEIGHT_FLOOR,
+        ))
         r = -(
             0.05 * float(std_err_pct)
             + 0.70 * weight_k * float(np.log1p(kurt_err)) / 3.0
@@ -387,7 +373,7 @@ class AdaptiveCalibrator:
         dir_hit:     float,
         n_bars:      int = _KURT_N_BASE,
     ) -> None:
-        """v6.2: n_bars forwarded to _compute_reward for kurt discount."""
+        """v6.2+: n_bars forwarded to _compute_reward for kurt discount."""
         reward = self._compute_reward(std_err_pct, kurt_err, hurst_err, dir_hit, n_bars=n_bars)
         self._buffer.push(context, action.to_array(), reward)
         self._reward_history.append(reward)
