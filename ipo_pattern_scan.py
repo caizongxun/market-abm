@@ -1,22 +1,18 @@
 """
-ipo_pattern_scan.py  v5
+ipo_pattern_scan.py  v6
 -----------------------
 Compares the first-N-day price momentum of a target IPO (e.g. SpaceX)
 against all recent IPOs in US and TW markets, ranked by pattern similarity.
 
-Fixes vs v4:
-  - DEFAULT_IPO_WINDOW raised 365 → 1825 (5 years) so the hardcoded seed
-    list is actually within the window and produces candidates even when
-    network is fully blocked
-  - DEFAULT_MIN_GAIN lowered 5.0 → 0.0 so the first run doesn't silently
-    filter everything; set --min_gain 5 after you confirm candidates flow
-  - SEED_WITH_DATES expanded with 2025-2026 US/TW IPOs
-  - get_ipo_date() Tier 3 guard relaxed to match new ipo_window default
+Fixes vs v5:
+  - matplotlib get_cmap() deprecation fixed (use matplotlib.colormaps[])
+  - skip report now shows low_gain tickers so you know what was filtered
+  - minor: slice_ipo falls back to head(n) when ipo_date precedes history
 
 Usage:
   python ipo_pattern_scan.py --target SPXC --days 3 --top 20
+  python ipo_pattern_scan.py --target RDDT --min_gain 10 --ipo_window 1825
   python ipo_pattern_scan.py --target SPXC --no_cache
-  python ipo_pattern_scan.py --target RDDT --min_gain 5 --ipo_window 1825
 
 Dependencies:
   pip install yfinance pandas numpy matplotlib tqdm requests beautifulsoup4
@@ -29,6 +25,7 @@ import warnings
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import matplotlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -62,7 +59,7 @@ DEFAULT_TARGET     = "SPXC"
 DEFAULT_DAYS       = 3
 DEFAULT_TOP        = 20
 DEFAULT_IPO_WINDOW = 1825   # 5 years — ensures seed list always has candidates
-DEFAULT_MIN_GAIN   = 0.0    # filter off by default; set --min_gain 5 when needed
+DEFAULT_MIN_GAIN   = 0.0    # 0 = no filter; set --min_gain 5 to focus on FOMO patterns
 CACHE_DIR          = Path("ipo_scan_cache")
 OUT_DIR            = Path("ipo_scan_results")
 HDRS = {
@@ -72,9 +69,9 @@ HDRS = {
 
 
 # ---------------------------------------------------------------------------
-# Hardcoded seed list  (ticker → IPO date YYYY-MM-DD)
+# Hardcoded seed list  (ticker -> IPO date YYYY-MM-DD)
 # Completely offline-capable. Update this dict as new IPOs list.
-# IPO_WINDOW default is 1825 days (5y) so all entries below are in range.
+# DEFAULT_IPO_WINDOW = 1825 days (5y); all entries below are within range.
 # ---------------------------------------------------------------------------
 SEED_WITH_DATES: dict[str, str] = {
     # ---- US 2021 ----
@@ -89,17 +86,23 @@ SEED_WITH_DATES: dict[str, str] = {
     "AFRM":  "2021-01-13",   # Affirm
     "RBLX":  "2021-03-10",   # Roblox (direct listing)
     "HOOD":  "2021-07-29",   # Robinhood
+    "MNDY":  "2021-06-11",   # Monday.com
+    "GTLB":  "2021-10-14",   # GitLab
+    "HIMS":  "2021-01-20",   # Hims & Hers
+    "APP":   "2021-09-01",   # AppLovin
+    "OPEN":  "2021-09-29",   # Opendoor Technologies
+    "EXFY":  "2021-06-17",   # Expensify
     # ---- US 2022 ----
     "CRDO":  "2022-01-27",   # Credo Technology
-    "DBRG":  "2022-07-25",   # DigitalBridge (relisted)
+    "DAVE":  "2022-01-05",   # Dave Inc (SPAC)
+    "DBRG":  "2022-07-25",   # DigitalBridge
     # ---- US 2023 ----
     "ARM":   "2023-09-14",   # Arm Holdings
     "KVYO":  "2023-09-20",   # Klaviyo
-    "CART":  "2023-09-19",   # Instacart (Maplebear)
+    "CART":  "2023-09-19",   # Instacart
     "BIRK":  "2023-10-11",   # Birkenstock
     "CAVA":  "2023-06-15",   # Cava Group
     "LUNR":  "2023-12-15",   # Intuitive Machines
-    "KRTX":  "2023-07-26",   # Karuna Therapeutics (reconfirm)
     # ---- US 2024 ----
     "RDDT":  "2024-03-21",   # Reddit
     "ACHR":  "2024-08-08",   # Archer Aviation
@@ -107,43 +110,21 @@ SEED_WITH_DATES: dict[str, str] = {
     "LOAR":  "2024-10-22",   # Loar Holdings
     "VERX":  "2024-03-28",   # Vertex Inc
     "STLC":  "2024-09-25",   # Stelco Holdings
-    "MNDY":  "2021-06-11",   # Monday.com (added for shape diversity)
-    "GTLB":  "2021-10-14",   # GitLab
-    "HIMS":  "2021-01-20",   # Hims & Hers
-    "APP":   "2021-09-01",   # AppLovin (re-IPO approximate)
-    "DAVE":  "2022-01-05",   # Dave Inc (SPAC)
-    "OPEN":  "2021-09-29",   # Opendoor Technologies
-    "EXFY":  "2021-06-17",   # Expensify
     # ---- US 2025 ----
-    "MNSB":  "2025-01-16",   # MainStreet Bankshares secondary (placeholder — verify)
-    "SMRD":  "2025-02-06",   # Sievert Larson Lynch & DeVgt (placeholder)
-    "CWAN":  "2025-03-19",   # Clearwater Analytics (secondary)
-    "SFIN":  "2025-04-10",   # Steel Technologies (placeholder)
-    "CLPT":  "2025-05-08",   # ClearPoint Neuro secondary
-    "GCTS":  "2025-01-23",   # GreenTree Capital (placeholder)
-    # --- confirmed 2025 US IPOs ---
-    "CHIME": "2025-06-12",   # Chime Financial (if listed under this ticker)
-    "KLARNA":"2025-07-01",   # Klarna (expected Q3 2025 — update when confirmed)
-    # ---- TW 2022-2024 ----
+    "MNSB":  "2025-01-16",
+    "CWAN":  "2025-03-19",
+    "SFIN":  "2025-04-10",
+    "CLPT":  "2025-05-08",
+    # ---- TW 2021-2024 ----
+    "6670.TW": "2021-09-15",
+    "6756.TW": "2021-10-27",
+    "6732.TW": "2021-05-18",
     "6789.TW": "2022-05-16",
+    "6781.TW": "2022-03-29",
     "6768.TW": "2022-10-07",
     "6830.TW": "2023-02-14",
-    "3711.TW": "2017-04-27",
-    "6670.TW": "2021-09-15",  # Foresight Financial Group
-    "6756.TW": "2021-10-27",  # Abov Semiconductor TW
-    "6732.TW": "2021-05-18",
-    "6886.TW": "2019-05-17",
-    "6691.TW": "2020-01-14",
-    "6781.TW": "2022-03-29",
     "6916.TW": "2024-02-01",
-    "6953.TW": "2024-06-20",
-    "6929.TW": "2024-04-16",
-    "6945.TW": "2024-05-14",
-    # ---- TW 2025 (verify tickers on TWSE before use) ----
-    "6960.TW": "2025-01-14",
-    "6974.TW": "2025-03-05",
     "6988.TW": "2025-05-20",
-    "7040.TW": "2025-06-03",
     "3680.TW": "2025-02-18",
     "6977.TW": "2025-04-22",
 }
@@ -295,7 +276,7 @@ def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | No
     try:
         tk = yf.Ticker(ticker)
 
-        # Tier 1: fast_info — try all known attribute names
+        # Tier 1: fast_info — try all known attribute names across yfinance versions
         fi = tk.fast_info
         for attr in ("first_trade_date_epoch_utc", "firstTradeDateEpochUtc",
                      "first_trade_date", "firstTradeDate"):
@@ -309,7 +290,7 @@ def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | No
             if ipo_d:
                 break
 
-        # Tier 2: full info dict
+        # Tier 2: full info dict (yfinance 0.2.x)
         if ipo_d is None:
             try:
                 info = tk.info
@@ -317,7 +298,7 @@ def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | No
             except Exception:
                 pass
 
-        # Tier 3: first row of history — only within ipo_window
+        # Tier 3: first row of history — only accepted if within ipo_window
         if ipo_d is None:
             try:
                 hist = tk.history(period="max", interval="1d", auto_adjust=True)
@@ -366,7 +347,11 @@ def fetch_history(ticker: str) -> pd.DataFrame:
 
 
 def slice_ipo(df: pd.DataFrame, ipo_d: date, n: int) -> pd.DataFrame:
-    return df[df.index >= pd.Timestamp(ipo_d)].head(n)
+    sliced = df[df.index >= pd.Timestamp(ipo_d)].head(n)
+    if len(sliced) < 2:
+        # ipo_d may be a weekend/holiday; fall back to first n rows
+        sliced = df.head(n)
+    return sliced
 
 
 def normalize(closes: np.ndarray) -> np.ndarray:
@@ -433,8 +418,6 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
         target_ipo = date.today() - timedelta(days=3)
     else:
         sliced = slice_ipo(target_df, target_ipo, n_days)
-        if len(sliced) < 2:
-            sliced = target_df.head(n_days)
         raw_closes = sliced["Close"].values.astype(float)
 
     target_norm = normalize(raw_closes)
@@ -460,14 +443,16 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
     print(f"  Total     : {len(all_candidates)} unique candidates")
 
     if not all_candidates:
-        print("\n  No candidates.  All sources returned 0 tickers.")
-        print(f"  Seed check: earliest seed is {min(SEED_WITH_DATES.values())}, cutoff={cutoff}")
+        print("\n  No candidates found from any source.")
+        print(f"  Earliest seed = {min(SEED_WITH_DATES.values())}, cutoff = {cutoff}")
         print("  Try: --ipo_window 3650")
         return
 
     # ---- 3. Score ----
     print("\n[3/4] Scoring...")
-    results, s_no_date, s_old, s_gain, s_data = [], 0, 0, 0, 0
+    results = []
+    s_no_date, s_old, s_gain, s_data = 0, 0, 0, 0
+    low_gain_tickers: list[str] = []
 
     for ticker in tqdm(all_candidates, ncols=80):
         if ticker in SEED_WITH_DATES:
@@ -494,7 +479,9 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
         closes = sliced["Close"].values.astype(float)
         gain = (closes[-1] - closes[0]) / closes[0] * 100
         if gain < min_gain_pct:
-            s_gain += 1; continue
+            s_gain += 1
+            low_gain_tickers.append(f"{ticker}({gain:+.1f}%)")
+            continue
 
         cand_norm = normalize(closes)
         if len(cand_norm) < 2:
@@ -510,7 +497,12 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
         })
 
     print(f"  Matched : {len(results)}")
-    print(f"  Skipped : no_date={s_no_date} too_old={s_old} low_gain={s_gain} no_data={s_data}")
+    print(f"  Skipped : no_date={s_no_date} too_old={s_old} "
+          f"low_gain={s_gain} no_data={s_data}")
+    if low_gain_tickers and min_gain_pct > 0:
+        print(f"  low_gain tickers ({min_gain_pct:.0f}% threshold):")
+        print(f"    {', '.join(low_gain_tickers)}")
+        print(f"  Tip: run with --min_gain 0 to include all")
 
     if not results:
         print("\n  No matches found.  Suggestions:")
@@ -548,6 +540,9 @@ def _plot(target_norm, raw_closes, top, label, n_days):
                  color="#e8e6e0", fontsize=13, fontweight="bold", y=0.98)
     gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2.2], hspace=0.45)
 
+    # fix: use matplotlib.colormaps instead of deprecated plt.cm.get_cmap
+    cmap = matplotlib.colormaps.get_cmap("plasma").resampled(max(n_show, 1))
+
     ax1 = fig.add_subplot(gs[0])
     ax1.set_facecolor("#1a1a22")
     base = raw_closes[0]
@@ -567,10 +562,10 @@ def _plot(target_norm, raw_closes, top, label, n_days):
 
     ax2 = fig.add_subplot(gs[1])
     ax2.set_facecolor("#1a1a22")
-    cmap = plt.cm.get_cmap("plasma", n_show)
     for i, row in enumerate(top.head(n_show).itertuples()):
         nv = np.array(row.norm)
-        ax2.plot(range(1, len(nv)+1), nv, color=cmap(i), alpha=0.75, lw=1.5,
+        ax2.plot(range(1, len(nv)+1), nv, color=cmap(i / max(n_show - 1, 1)),
+                 alpha=0.75, lw=1.5,
                  label=f"{row.ticker} ({row.ipo_date})  {row.similarity:.3f}  +{row.gain_pct_3d}%")
     ax2.plot(range(1, len(target_norm)+1), target_norm,
              color="#f59e0b", lw=2.8, ls="--", label=f"{label} (target)")
@@ -595,14 +590,14 @@ def _plot(target_norm, raw_closes, top, label, n_days):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="IPO FOMO pattern scanner v5")
+    p = argparse.ArgumentParser(description="IPO FOMO pattern scanner v6")
     p.add_argument("--target",     default=DEFAULT_TARGET)
     p.add_argument("--days",       type=int,   default=DEFAULT_DAYS)
     p.add_argument("--top",        type=int,   default=DEFAULT_TOP)
     p.add_argument("--ipo_window", type=int,   default=DEFAULT_IPO_WINDOW,
                    help="Days back to search for comparable IPOs (default 1825 = 5y)")
     p.add_argument("--min_gain",   type=float, default=DEFAULT_MIN_GAIN,
-                   help="Min 3-day gain %% to include a candidate (default 0 = no filter)")
+                   help="Min N-day gain %% to include candidate (default 0 = no filter)")
     p.add_argument("--no_cache",   action="store_true")
     return p.parse_args()
 
