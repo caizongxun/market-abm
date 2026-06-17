@@ -1,7 +1,27 @@
 """
-stat_process.py  v57
-====================
+stat_process.py  v57.1
+======================
 純統計過程模型，完全不使用 agent。
+
+v57.1: Fix per-window kurtosis explosion in generate() Step 6.
+
+     Root cause:
+       jump_std is fitted in raw-scale (e.g. 0.02–0.05 per bar), but
+       Step 6 operates in z-score space (std≈1 after Steps 1–5).
+       Old formula:
+           ek_amp  = sqrt(max(target_ek / 6, 1))   # oversampled ek
+           eff_std = jump_std * ek_amp              # raw-scale × dimensionless
+       For typical params: jump_std≈0.03, ret_std≈0.01,
+       target_ek≈8 (oversampled) → eff_std ≈ 3/0.01 × 1.15 ≈ 3.5 in z units.
+       20 such jumps on a 20-bar window → kurtosis explodes (783 observed).
+
+     Fix:
+       1. Normalise jump_std to z-score units:
+              jump_std_z = jump_std / max(ret_std, 1e-10)
+       2. Use raw (non-oversampled) target_ek for amplitude:
+              raw_ek = target_ek / _EK_OVERSAMPLE
+              ek_amp = sqrt(max(raw_ek / 6.0, 1.0))
+       3. Hard-clip eff_std to [0.5, 4.0] as a z-space safety rail.
 
 v57: Revert global pass to v54 logic; drop _global_kurtosis_inject.
 
@@ -572,7 +592,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (unchanged from v54/v55/v56)
+# 2. GENERATE
 #
 # 管線：
 #   Step 1  採樣 nct with iterative nc correction
@@ -580,7 +600,7 @@ def fit(
 #   Step 3  ACF lag1 微調
 #   Step 4  GARCH(1,1) clip (0.5, 2.0)
 #   Step 5  Skew post-shift: 2-iter, clamp 0.20
-#   Step 6  jump 疊加
+#   Step 6  jump 疊加  (v57.1: eff_std 改在 z-score 空間計算)
 #   Step 7  exact rescale → (ret_mu, ret_std)
 #   Step 8  OHLC wick
 #   Step 9  Volume
@@ -671,15 +691,24 @@ def generate(
     # Step 5: Skew post-shift — 2-iter, clamp 0.20 per-window
     z_shifted = _skew_post_shift(z_garch, target_skew=skew_raw, clamp=0.20)
 
-    # Step 6: jump 疊加 (ek-amplified + skew-biased)
+    # Step 6: jump 疊加 (v57.1: eff_std 在 z-score 空間計算)
+    #
+    # v57.1 fix: jump_std is raw-scale (fitted from log_rets, e.g. 0.02-0.05).
+    # Steps 1-5 produce z in z-score space (std≈1).  Must normalise before
+    # computing eff_std, otherwise jump magnitude is 3-7σ per event.
+    #
+    # Also use raw (non-oversampled) target_ek for ek_amp so that the
+    # amplitude factor reflects actual market ek, not the inflated target.
     z_work = z_shifted.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
         if n_jumps > 0:
-            jump_idx = rng.choice(n_bars, size=n_jumps, replace=False)
-            ek_amp   = float(np.sqrt(max(target_ek / 6.0, 1.0)))
-            eff_std  = jump_std * ek_amp
-            skew_b   = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
+            jump_idx   = rng.choice(n_bars, size=n_jumps, replace=False)
+            jump_std_z = jump_std / max(ret_std, 1e-10)   # normalise to z-space
+            raw_ek     = target_ek / _EK_OVERSAMPLE        # remove oversample factor
+            ek_amp     = float(np.sqrt(max(raw_ek / 6.0, 1.0)))
+            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 4.0))  # z-space safety rail
+            skew_b     = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
             z_work[jump_idx] += rng.normal(skew_b, eff_std, size=n_jumps)
 
     # Step 7: exact rescale → (ret_mu, ret_std)
