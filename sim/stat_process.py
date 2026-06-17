@@ -1,28 +1,32 @@
 """
-stat_process.py  v65
+stat_process.py  v66
 ====================
-v65 (P1): Raise kurtosis ceiling for high-kurt assets (e.g. UNH).
-  - _TARGET_EK_MAX: 30.0 → 60.0
-    UNH window-level kurtosis can exceed 30; previously both fit() and
-    OnlineRidgePredictor.predict_correction() clipped target_ek to 30,
-    making it impossible for the calibrator to learn upward adjustments.
-  - ek_oversample_adj clip upper bound: 6.0 → 10.0
-    When _ek_decay_ema is very low (strong soft-clip decay), the
-    adaptive multiplier is now allowed to reach up to 10× instead of 6×,
-    giving the pipeline more headroom to compensate for high-kurtosis assets.
+v66 (P1b): Per-window realised-kurtosis feedback into calibrator context.
 
-v64: Wire ek_oversample_adj into AdaptiveCalibrator.build_context().
-     Previously build_context() was called without ek_oversample, so it
-     always produced a 9-dim vector (ek_oversample=1.0 default).
-     The calibrator therefore could not learn the mapping
-     "ek_adj too low → raise d_target_ek", making its d_target_ek
-     corrections random w.r.t. the actual kurtosis deficit.
-     Fix: pass ek_oversample=ek_oversample_adj to build_context(),
-     producing a 10-dim vector (Patch 1 of the v64 trilogy).
-     No other change; all statistical generation code is identical to v63.
+  Problem:
+    build_context() 的第 10 維在每個 window 進入 calibrator 時都是
+    ek_oversample_adj（全域 EMA 狀態），對於 UNH 這類第一個 window
+    全域 EMA 還沒有返饵資訊，導致 XGB/Ridge 的 d_target_ek
+    指令跟一般品種一樣，學不到「高 kurtosis 需要大幅調高」。
 
+  Fix:
+    在 fit() 後、calibrator.predict() 前，從 df_fit 的 log_rets
+    直接計算 realised_ek，然後：
+
+      ek_oversample_init = max(ek_oversample_adj,
+                               realised_ek / max(params["target_ek"], 1.0))
+
+    把這個 per-window 的 ek_oversample_init 傳入 build_context()。
+    這樣 UNH 第一個 window 的 context dim-10 就已是 ~5–8，
+    而不是全域 EMA 決定的較小値。
+
+    同時 ek_oversample_adj 上限 6→12，與 _TARGET_EK_MAX=60 /
+    _EK_OVERSAMPLE=3.2 的具高比對齊。
+
+v65 (P1): _TARGET_EK_MAX 30->60, ek_oversample_adj clip upper 6->10.
+v64: Wire ek_oversample_adj into build_context (10-dim context).
 v63: Fix two bugs causing kurtosis to not converge across windows.
-v62: Fix kurtosis 10.6 → 3.14 collapse observed after v61.
+v62: Fix kurtosis 10.6->3.14 collapse after v61.
 """
 from __future__ import annotations
 
@@ -36,12 +40,12 @@ from scipy import stats
 from scipy.optimize import minimize_scalar
 
 try:
-    from sim.calibrator import AdaptiveCalibrator  # noqa: F401 – import guard
+    from sim.calibrator import AdaptiveCalibrator  # noqa: F401
 except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# StatParams  (named-tuple-like dataclass)
+# StatParams
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -84,7 +88,6 @@ def _log_returns(closes: np.ndarray) -> np.ndarray:
 
 
 def _fit_df_scan(log_rets: np.ndarray) -> float:
-    """Fit Student-t df via log-likelihood scan."""
     std = float(np.std(log_rets)) + 1e-10
     z   = log_rets / std
     best_df, best_ll = 30.0, -np.inf
@@ -105,7 +108,6 @@ def _fit_skewnorm(log_rets: np.ndarray) -> Tuple[float, float, float]:
 
 
 def hurst_exponent(ts: np.ndarray, min_len: int = 20) -> float:
-    """R/S hurst estimate; returns 0.5 on failure."""
     ts = np.asarray(ts, dtype=float)
     n  = len(ts)
     if n < min_len:
@@ -203,8 +205,7 @@ def _fit_volume_params(df: pd.DataFrame, log_rets: np.ndarray):
 # 1. FIT
 # ---------------------------------------------------------------------------
 
-_TARGET_EK_MAX = 60.0   # v65: raised from 30.0 to accommodate high-kurt assets (e.g. UNH)
-
+_TARGET_EK_MAX = 60.0   # v65: raised from 30.0
 _EK_OVERSAMPLE = 3.2
 
 
@@ -358,23 +359,19 @@ def generate(
     acf_lag1  = float(params["acf_lag1"])
     target_ek = float(params["target_ek"])
 
-    # Student-t base returns
     df_nct = _df_from_ek(target_ek)
     t_rets = stats.t.rvs(df=df_nct, size=n, random_state=rng) * ret_std + ret_mu
 
-    # Skew warp
     if abs(skew_a) > 0.05:
         skn = stats.skewnorm.rvs(a=skew_a, size=n, random_state=rng)
         skn = (skn - np.mean(skn)) / (np.std(skn) + 1e-10) * ret_std
         blend = float(np.clip(abs(skew_a) / 5.0, 0.0, 0.5))
         t_rets = (1.0 - blend) * t_rets + blend * skn
 
-    # GARCH vol
     vols = _simulate_garch_vol(n, ret_std, vp, acf_lag1, rng)
     vol_scale = vols / (ret_std + 1e-10)
     t_rets = t_rets * vol_scale
 
-    # Jump overlay
     if jump_freq > 0 and jump_std > 0:
         jump_mask = rng.random(n) < jump_freq
         n_jumps   = int(jump_mask.sum())
@@ -382,10 +379,8 @@ def generate(
             jumps = stats.t.rvs(df=3.0, size=n_jumps, random_state=rng) * jump_std
             t_rets[jump_mask] += jumps
 
-    # Kurtosis topup
     t_rets = _kurtosis_topup(t_rets, target_ek, rng)
 
-    # ACF autocorrelation injection (Hurst)
     if abs(acf_lag1) > 0.02 and n > 5:
         ar_rets = np.empty(n)
         ar_rets[0] = t_rets[0]
@@ -393,11 +388,9 @@ def generate(
             ar_rets[i] = acf_lag1 * ar_rets[i - 1] + np.sqrt(max(1.0 - acf_lag1**2, 0.01)) * t_rets[i]
         t_rets = ar_rets
 
-    # Normalise std back to target
     actual_std = float(np.std(t_rets)) + 1e-10
     t_rets = t_rets / actual_std * ret_std
 
-    # Build price series
     prices = np.empty(n + 1)
     prices[0] = start_price
     for i in range(n):
@@ -407,7 +400,6 @@ def generate(
     opens  = prices[:-1]
     closes = prices[1:]
 
-    # OHLC from wick model
     raw_range = np.abs(closes - opens) / (np.exp(stats.expon.rvs(scale=1.0/wick_lam, size=n, random_state=rng)) + 1e-6)
     raw_range = np.clip(raw_range, 0.0, opens * 0.20)
     half = raw_range / 2.0
@@ -415,7 +407,6 @@ def generate(
     lows  = np.minimum(opens, closes) - half
     lows  = np.maximum(lows, opens * 0.01)
 
-    # Volume
     vol_log_mean  = float(params["vol_log_mean"])
     vol_log_std   = float(params["vol_log_std"])
     vol_ret_beta  = float(params["vol_ret_beta"])
@@ -444,10 +435,6 @@ def generate(
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
-    """
-    Incremental ridge regression predictor: fits params from window history.
-    """
-
     def __init__(self, alpha: float = 1.0):
         self._alpha    = alpha
         self._X:       List[List[float]] = []
@@ -506,9 +493,9 @@ class OnlineRidgePredictor:
         n     = len(X)
         blend = float(np.clip((n - 3) / 10.0, 0.0, 0.40))
 
-        new_std   = float(np.clip((1-blend)*params["ret_std"]       + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), 1e-5, 0.20))
-        new_hurst = float(np.clip((1-blend)*params["hurst_target"]  + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.30, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]     + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
+        new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), 1e-5, 0.20))
+        new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.30, 0.69))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
 
         return StatParams(**{**dict(params),
                              "ret_std": new_std,
@@ -592,7 +579,7 @@ def rolling_fit_generate(
 
         ek_oversample_adj = float(np.clip(
             _EK_OVERSAMPLE / max(_ek_decay_ema, 0.15),
-            1.5, 10.0,   # v65: upper bound raised from 6.0 to 10.0
+            1.5, 12.0,   # v66: upper bound raised from 10.0 to 12.0
         ))
 
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
@@ -609,8 +596,27 @@ def rolling_fit_generate(
         calib_action = None
         if calibrator is not None:
             from sim.calibrator import AdaptiveCalibrator
-            # v64: pass ek_oversample_adj into build_context (10-dim)
-            ctx          = AdaptiveCalibrator.build_context(params, ek_oversample=ek_oversample_adj)
+
+            # v66 (P1b): compute per-window realised kurtosis from df_fit
+            # and use it to initialise the ek_oversample dimension in context,
+            # instead of always passing ek_oversample_adj (global EMA value).
+            # This ensures UNH's first window already has a large dim-10 value,
+            # letting XGB/Ridge map it to a large d_target_ek correction.
+            _fit_log_rets = _log_returns(df_fit["Close"].values)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                _realised_ek = float(stats.kurtosis(_fit_log_rets))
+            # ek_oversample_init: how many times larger does target_ek need to be
+            # relative to what fit() already produced?  Use max so we never shrink
+            # below the global EMA estimate.
+            _ek_needed = max(_realised_ek, 1.0)
+            _ek_produced = max(float(params["target_ek"]) / max(ek_oversample_adj, 1.0), 1.0)
+            ek_oversample_init = float(np.clip(
+                max(ek_oversample_adj, _ek_needed / _ek_produced),
+                1.0, 12.0,
+            ))
+
+            ctx          = AdaptiveCalibrator.build_context(params, ek_oversample=ek_oversample_init)
             calib_action = calibrator.predict(ctx)
             params_dict  = calib_action.apply(dict(params))
             params       = StatParams(**params_dict)
@@ -655,7 +661,7 @@ def rolling_fit_generate(
 
         if calibrator is not None and calib_action is not None:
             if all(np.isfinite(v) for v in [std_err_pct, kurt_err, hurst_err, dir_hit]):
-                # v64: ctx already includes ek_oversample_adj (10-dim)
+                # record with the same ctx used for predict (contains ek_oversample_init)
                 calibrator.record(
                     context     = ctx,
                     action      = calib_action,
@@ -687,28 +693,29 @@ def rolling_fit_generate(
             print(
                 f"[stat] w{window_idx:3d}"
                 f"  std={params['ret_std']:.4f}  ek={params['target_ek']:.2f}"
-                f"  ek_adj={ek_oversample_adj:.2f}"
+                f"  ek_adj={ek_oversample_adj:.2f}  ek_init={ek_oversample_init if calibrator else '---'}"
                 f"  kurt_err={kurt_str}"
                 f"  c_err={c_err:+.3f}"
                 f"{calib_str}"
             )
 
         param_log.append({
-            "window":          window_idx,
-            "fit_start":       fit_start,
-            "fit_end":         fit_end,
-            "ret_std":         float(params["ret_std"]),
-            "ret_skew_a":      float(params["ret_skew_a"]),
-            "hurst":           float(params["hurst_target"]),
-            "target_ek":       float(params["target_ek"]),
+            "window":            window_idx,
+            "fit_start":         fit_start,
+            "fit_end":           fit_end,
+            "ret_std":           float(params["ret_std"]),
+            "ret_skew_a":        float(params["ret_skew_a"]),
+            "hurst":             float(params["hurst_target"]),
+            "target_ek":         float(params["target_ek"]),
             "ek_oversample_adj": ek_oversample_adj,
-            "jump_freq":       float(params["jump_freq"]),
-            "vol_persistence": float(params["vol_persistence"]),
-            "std_err_pct":     std_err_pct,
-            "kurt_err":        kurt_err,
-            "hurst_err":       hurst_err if np.isfinite(hurst_err) else None,
-            "dir_hit":         dir_hit,
-            "c_err":           c_err,
+            "ek_oversample_init": ek_oversample_init if calibrator else None,  # v66
+            "jump_freq":         float(params["jump_freq"]),
+            "vol_persistence":   float(params["vol_persistence"]),
+            "std_err_pct":       std_err_pct,
+            "kurt_err":          kurt_err,
+            "hurst_err":         hurst_err if np.isfinite(hurst_err) else None,
+            "dir_hit":           dir_hit,
+            "c_err":             c_err,
         })
 
         window_idx += 1
@@ -767,7 +774,6 @@ def rolling_fit_generate(
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
 
-        # Global pass: soft-clip + skew align + std pin
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -821,7 +827,6 @@ def rolling_fit_generate(
         df_result["High"]  = df_result["High"].values * price_ratio
         df_result["Low"]   = df_result["Low"].values  * price_ratio
 
-    # Append summary entry
     param_log.append({
         "_summary":  True,
         "n_windows": window_idx,
