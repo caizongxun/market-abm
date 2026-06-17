@@ -1,28 +1,25 @@
 """
-stat_process.py  v66
+stat_process.py  v67
 ====================
-v66 (P1b): Per-window realised-kurtosis feedback into calibrator context.
+v67: Per-symbol dynamic soft_clip inner/outer based on median target_ek.
 
   Problem:
-    build_context() 的第 10 維在每個 window 進入 calibrator 時都是
-    ek_oversample_adj（全域 EMA 狀態），對於 UNH 這類第一個 window
-    全域 EMA 還沒有返饵資訊，導致 XGB/Ridge 的 d_target_ek
-    指令跟一般品種一樣，學不到「高 kurtosis 需要大幅調高」。
+    Global-pass _soft_clip_z uses fixed inner=3.0, outer=6.0.
+    For high-kurtosis symbols (e.g. UNH with target_ek ~25),
+    this compresses too aggressively at z=3, destroying the fat tails
+    that the calibrator worked hard to produce, and causing the
+    _ek_decay_ema to see a large decay_ratio -> ek_oversample spirals up.
 
   Fix:
-    在 fit() 後、calibrator.predict() 前，從 df_fit 的 log_rets
-    直接計算 realised_ek，然後：
+    After all windows are done, compute median_target_ek from param_log,
+    then set:
+      inner = max(3.0, sqrt(median_target_ek))   # UNH: sqrt(25)=5.0
+      outer = inner * 2.0                         # UNH: 10.0
+    Pass these into _soft_clip_z instead of the fixed module constants.
+    _SOFT_CLIP_INNER / _SOFT_CLIP_OUTER kept as defaults for any other
+    callers that don't have a param_log.
 
-      ek_oversample_init = max(ek_oversample_adj,
-                               realised_ek / max(params["target_ek"], 1.0))
-
-    把這個 per-window 的 ek_oversample_init 傳入 build_context()。
-    這樣 UNH 第一個 window 的 context dim-10 就已是 ~5–8，
-    而不是全域 EMA 決定的較小値。
-
-    同時 ek_oversample_adj 上限 6→12，與 _TARGET_EK_MAX=60 /
-    _EK_OVERSAMPLE=3.2 的具高比對齊。
-
+v66 (P1b): Per-window realised-kurtosis feedback into calibrator context.
 v65 (P1): _TARGET_EK_MAX 30->60, ek_oversample_adj clip upper 6->10.
 v64: Wire ek_oversample_adj into build_context (10-dim context).
 v63: Fix two bugs causing kurtosis to not converge across windows.
@@ -509,7 +506,7 @@ class OnlineRidgePredictor:
 _ek_decay_ema: float = 1.0
 _EK_DECAY_EMA_ALPHA = 0.20
 
-_SOFT_CLIP_INNER = 3.0
+_SOFT_CLIP_INNER = 3.0   # default fallback for callers without param_log
 _SOFT_CLIP_OUTER = 6.0
 _SKEW_ANCHOR_BAND = 0.30
 
@@ -598,17 +595,10 @@ def rolling_fit_generate(
             from sim.calibrator import AdaptiveCalibrator
 
             # v66 (P1b): compute per-window realised kurtosis from df_fit
-            # and use it to initialise the ek_oversample dimension in context,
-            # instead of always passing ek_oversample_adj (global EMA value).
-            # This ensures UNH's first window already has a large dim-10 value,
-            # letting XGB/Ridge map it to a large d_target_ek correction.
             _fit_log_rets = _log_returns(df_fit["Close"].values)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 _realised_ek = float(stats.kurtosis(_fit_log_rets))
-            # ek_oversample_init: how many times larger does target_ek need to be
-            # relative to what fit() already produced?  Use max so we never shrink
-            # below the global EMA estimate.
             _ek_needed = max(_realised_ek, 1.0)
             _ek_produced = max(float(params["target_ek"]) / max(ek_oversample_adj, 1.0), 1.0)
             ek_oversample_init = float(np.clip(
@@ -661,7 +651,6 @@ def rolling_fit_generate(
 
         if calibrator is not None and calib_action is not None:
             if all(np.isfinite(v) for v in [std_err_pct, kurt_err, hurst_err, dir_hit]):
-                # record with the same ctx used for predict (contains ek_oversample_init)
                 calibrator.record(
                     context     = ctx,
                     action      = calib_action,
@@ -787,7 +776,21 @@ def rolling_fit_generate(
             warnings.simplefilter("ignore")
             ek_before = float(stats.kurtosis(z_norm))
 
-        z_wins = _soft_clip_z(z_norm, inner=_SOFT_CLIP_INNER, outer=_SOFT_CLIP_OUTER)
+        # v67: dynamic soft_clip thresholds based on median target_ek across windows
+        window_ek_vals = [
+            row["target_ek"]
+            for row in param_log
+            if not row.get("_summary") and "target_ek" in row
+        ]
+        if window_ek_vals:
+            median_target_ek = float(np.median(window_ek_vals))
+            sc_inner = float(max(_SOFT_CLIP_INNER, np.sqrt(median_target_ek)))
+            sc_outer = sc_inner * 2.0
+        else:
+            sc_inner = _SOFT_CLIP_INNER
+            sc_outer = _SOFT_CLIP_OUTER
+
+        z_wins = _soft_clip_z(z_norm, inner=sc_inner, outer=sc_outer)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -804,6 +807,7 @@ def rolling_fit_generate(
             print(
                 f"[stat] global-pass  ek_before={ek_before:.2f}"
                 f"  ek_after={ek_after:.2f}"
+                f"  sc_inner={sc_inner:.2f}  sc_outer={sc_outer:.2f}"
                 f"  decay={ek_after/max(ek_before,1e-3):.3f}"
                 f"  ema={_ek_decay_ema:.3f}"
                 f"  oversample_next={_EK_OVERSAMPLE/max(_ek_decay_ema,0.15):.2f}"
