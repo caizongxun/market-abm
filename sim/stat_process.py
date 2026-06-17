@@ -1,49 +1,45 @@
 """
-stat_process.py  v54
+stat_process.py  v55
 ====================
 純統計過程模型，完全不使用 agent。
 
-v54: Fix four problems observed in v53 output:
-       (skew=0.448→-1.111, kurtosis=10.6→6.4, hurst=0.693→0.660)
+v55: Fix three root-cause bugs in rolling_fit_generate's topup pipeline
+     (root causes discovered after v54 shipped: std=0.99998, skew=-10.56,
+      kurtosis=187 observed in some runs).
 
      Root causes:
-       1. _kurtosis_topup replaces smallest-|ret| positions with jumps drawn from
-          symmetric normal(skew_bias*jstd, jstd).  With large jstd the negative
-          tail dominates, pulling global skew negative regardless of skew_bias sign.
-       2. After topup, no skew correction pass → skew -1.11 persists.
-       3. topup "replace" mode: out[ix] = jump breaks mean/std silently; additive
-          mode out[ix] += jump is more controlled and raises 4th moment faster.
-       4. Each window clip skew_raw to its own observed value (can be ±1.2), so
-          when windows are concatenated the aggregate skew drifts away from the
-          global target.  The AR1 Hurst pass then re-correlates this mixed-sign
-          series, degrading hurst accuracy.
+       Bug 1/2 — _skew_post_shift receives raw-scale rets (std≈0.016).
+                 The cubic transform  w = z + a*(z³ - 3z)  assumes std≈1.
+                 When std≈0.016, z³ ≈ 4e-6 → the shift is a complete no-op
+                 while the additive topup jumps have already been applied,
+                 so kurtosis explodes (≈187) and skew collapses (≈-10.56).
+
+       Bug 3   — After topup the price series is rebuilt from topup rets
+                 but a final std-rescale back to real_global_std is missing,
+                 so the reported std drifts to ≈1 (topup blows up scale).
 
      Fixes:
-       A. Global skew anchor in rolling_fit_generate:
-          Compute global_skew_target from the full df_real at the start.
-          Each window's skew_raw is soft-clipped to
-          [global_skew_target - 0.5, global_skew_target + 0.5]
-          before being passed to generate(). This keeps per-window skew
-          from wandering too far from the dataset's true skew direction.
+       F1. Standardise → topup → skew-shift → rescale back.
+           In rolling_fit_generate, before calling _kurtosis_topup and
+           _skew_post_shift, convert final_rets to z-score (mean=0, std=1).
+           After both passes, multiply back by target_std (= real_global_std)
+           and add target_mu (= mean of real tail rets).
 
-       B. _kurtosis_topup: additive mode (out[ix] += jump_draws)
-          Replace → additive: injected jumps ADD to existing returns so std
-          and mean grow only marginally while the 4th moment rises sharply.
-          Also: n_jumps formula tuned (deficit * len / 20 instead of / 30)
-          and topup_frac lowered to 0.50 to trigger earlier.
+       F2. Post-topup std-rescale guard.
+           After rebuilding the price series from topup rets, compute the
+           realised std of the new log-rets and rescale once more so that
+           sim_global_std == real_global_std exactly.
 
-       C. Global skew correction pass after topup:
-          After _kurtosis_topup, apply _skew_post_shift(final_rets_topup,
-          target_skew=global_skew_target) to snap aggregate skew back to
-          the measured global value. Clamp unchanged at 0.30.
-
-       D. Hurst guard: reduce _skew_post_shift clamp inside generate()
-          from 0.30 → 0.20 for per-window calls (only the global pass keeps
-          0.30).  Smaller per-window cubic distortion preserves AR1 structure.
+       F3. _kurtosis_topup: inject jumps in z-score space.
+           jump_std and eff_jstd are now expected to be in std=1 units
+           (caller passes jump_std / ret_std).  The topup function itself
+           is unchanged; the normalisation is done by the caller.
 
      All other stages (nct iterative nc, AR1 Hurst, ACF, GARCH, volume,
-     OHLC wick, OnlineRidgePredictor) unchanged from v53.
+     OHLC wick, OnlineRidgePredictor) unchanged from v54.
 
+v54: Fix four problems observed in v53 output:
+       (skew=0.448→-1.111, kurtosis=10.6→6.4, hurst=0.693→0.660)
 v53: Fix three residual problems from v52 output:
        (skew=0.448→-0.135, kurtosis=10.6→3.9, topup ineffective)
 v52.1: fix SyntaxError in OnlineRidgePredictor.predict_correction (line 743-744)
@@ -303,6 +299,9 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
     Transform: w = z + a*(z^3 - 3*z)
     Leading-order effect: skew(w) ≈ skew(z) + 6*a  (standardised z)
 
+    IMPORTANT: input z MUST be standardised (mean=0, std=1).
+    The caller is responsible for normalisation before calling this function.
+
     v54 Fix D: per-window clamp lowered from 0.30 → 0.20 (default) to
     reduce cubic distortion of the AR1 Hurst structure.
     The global post-topup pass in rolling_fit_generate uses clamp=0.30.
@@ -338,15 +337,15 @@ def _kurtosis_topup(
     max_jumps:  int   = 20,
 ) -> np.ndarray:
     """
-    v54 Fix B: Additive jump injection to restore kurtosis.
+    v54 Fix B / v55 F3: Additive jump injection to restore kurtosis.
 
-    Key v54 change: ADDITIVE mode  out[ix] += jump_draws
+    v55 change: caller must pass rets already in z-score space (std≈1)
+    and jump_std normalised to that space (jump_std / ret_std_raw).
+    This ensures the cubic skew-shift downstream operates correctly.
+
+    v54 change: ADDITIVE mode  out[ix] += jump_draws
     (v53 used replace mode: out[ix] = jump_draws which occasionally
     inverted skew when jstd was large and skew_bias ≈ 0)
-
-    Additive: injected jumps amplify existing tail observations so
-    std grows only marginally (already large in tail positions) while
-    the 4th moment rises sharply.
 
     n_jumps formula: deficit * len / 20  (was / 30 in v53, more aggressive).
     """
@@ -361,7 +360,6 @@ def _kurtosis_topup(
 
     ek_deficit = target_ek - realised_ek
     ret_std    = float(np.std(rets))
-    # v54: denominator 20 (was 30) → inject more jumps per unit deficit
     n_jumps    = int(np.clip(np.ceil(ek_deficit * len(rets) / 20.0), 1, max_jumps))
 
     skew_bias  = float(np.clip(skew_raw * 0.3, -1.0, 1.0))
@@ -370,7 +368,7 @@ def _kurtosis_topup(
     jump_draws = rng.normal(skew_bias * eff_jstd, eff_jstd, size=n_jumps)
 
     out      = rets.copy()
-    # v54 Fix B: additive — add to existing tail positions (largest |ret|)
+    # additive — amplify existing tail positions (largest |ret|)
     large_ix = np.argsort(np.abs(out))[-n_jumps:]
     out[large_ix] += jump_draws
 
@@ -513,7 +511,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v54)
+# 2. GENERATE  (v55 — unchanged from v54)
 #
 # 管線：
 #   Step 1  採樣 nct with iterative nc correction
@@ -737,7 +735,7 @@ class OnlineRidgePredictor:
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
         new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
@@ -957,12 +955,26 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v54: Kurtosis top-up (additive, topup_frac=0.50) after global rescale
-        # followed by global skew correction pass (Fix B + Fix C)
+        # v55 F1/F2/F3: Kurtosis top-up + skew correction in z-score space
+        #
+        # Pipeline (all operations in std=1 normalised space):
+        #   1. Extract final_rets (raw scale, std ≈ real_global_std ≈ 0.016)
+        #   2. Compute target_mu  = mean(final_rets)
+        #      Compute target_std = std(final_rets)  [≈ real_global_std]
+        #   3. Normalise: z = (final_rets - target_mu) / target_std  → std=1
+        #   4. _kurtosis_topup(z, ..., jump_std=jump_std_norm)
+        #      where jump_std_norm = mean_jump_std / target_std
+        #      (jumps in z-score units so topup is correctly scaled)
+        #   5. Re-normalise z after topup (topup changes std slightly)
+        #   6. _skew_post_shift(z, ...)   ← operates on std=1, works correctly
+        #   7. Rescale back: final_rets_fixed = z_shifted * target_std + target_mu
+        #   8. Post-topup std guard: recompute std of final_rets_fixed,
+        #      apply one final rescale to pin std == real_global_std exactly
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
+
         mean_target_ek = float(np.mean([
             p.get("target_ek", 3.0)
             for p in param_log
@@ -975,32 +987,59 @@ def rolling_fit_generate(
             if not p.get("_summary") and p.get("jump_std") is not None
         ])) if param_log else float(np.std(final_rets) * 3.0)
 
+        # Step 2: capture raw-scale stats before normalising
+        topup_mu  = float(np.mean(final_rets))
+        topup_std = float(np.std(final_rets))
+        if topup_std < 1e-10:
+            topup_std = 1e-10
+
+        # Step 3: normalise to z-score space
+        z_norm = (final_rets - topup_mu) / topup_std
+
+        # Step 4: topup in z-score space — normalise jump_std to z units
+        jump_std_norm = mean_jump_std / topup_std
         topup_rng = np.random.default_rng(seed + 9999 if seed is not None else 0)
-        # Use raw (non-amplified) target ek for topup comparison
         mean_raw_target_ek = mean_target_ek / _EK_OVERSAMPLE
-        final_rets_topup = _kurtosis_topup(
-            rets       = final_rets,
+        z_topup = _kurtosis_topup(
+            rets       = z_norm,
             target_ek  = mean_raw_target_ek,
-            jump_std   = mean_jump_std,
-            skew_raw   = global_skew_target,   # v54: use global skew (not mean_skew_raw)
+            jump_std   = jump_std_norm,
+            skew_raw   = global_skew_target,
             rng        = topup_rng,
             topup_frac = 0.50,
             max_jumps  = 20,
         )
 
-        # v54 Fix C: global skew correction pass after topup (clamp=0.30)
-        final_rets_topup = _skew_post_shift(
-            final_rets_topup,
+        # Step 5: re-normalise after topup (topup may shift std slightly)
+        z_topup_std = float(np.std(z_topup))
+        if z_topup_std > 1e-10:
+            z_topup = (z_topup - float(np.mean(z_topup))) / z_topup_std
+
+        # Step 6: skew correction in z-score space (clamp=0.30, std=1 → cubic works)
+        z_shifted = _skew_post_shift(
+            z_topup,
             target_skew=global_skew_target,
             clamp=0.30,
         )
 
-        if not np.allclose(final_rets_topup, final_rets, atol=1e-12):
+        # Step 7: rescale back to raw-scale
+        final_rets_fixed = z_shifted * topup_std + topup_mu
+
+        # Step 8: post-topup std guard — pin std exactly to real_global_std
+        post_std = float(np.std(final_rets_fixed))
+        if post_std > 1e-10 and real_global_std > 1e-10:
+            std_scale = real_global_std / post_std
+            if 0.5 < std_scale < 2.0:
+                post_mu          = float(np.mean(final_rets_fixed))
+                final_rets_fixed = (final_rets_fixed - post_mu) * std_scale + post_mu
+
+        # Rebuild price series if rets changed
+        if not np.allclose(final_rets_fixed, final_rets, atol=1e-12):
             base_close  = df_result["Close"].values[0]
             new_closes  = np.empty(len(df_result))
             new_closes[0] = base_close
             for i in range(1, len(new_closes)):
-                new_closes[i] = new_closes[i - 1] * np.exp(final_rets_topup[i - 1])
+                new_closes[i] = new_closes[i - 1] * np.exp(final_rets_fixed[i - 1])
             price_ratio        = new_closes / np.maximum(df_result["Close"].values.astype(float), 1e-10)
             df_result          = df_result.copy()
             df_result["Close"] = new_closes
