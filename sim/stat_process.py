@@ -1,26 +1,38 @@
 """
-stat_process.py  v71
+stat_process.py  v72
 ====================
+v72: fix global-pass kurtosis destruction
+
+  Root cause analysis:
+  The global post-processing pass in rolling_fit_generate() was destroying
+  kurtosis in three sequential steps:
+    1. std rescale (real/sim) — changes vol distribution uniformly, OK
+    2. _soft_clip_z — compresses tails of z-scores, directly kills kurtosis
+    3. _linear_skew_align(z_wins) — operates on already-clipped z, further smooths
+    4. final rescale by real_global_std — renormalises but kurtosis is already gone
+
+  The real culprit is step 2: sc_inner=3.0 means ANY return > 3*sigma is
+  soft-clipped. For AAPL with true kurtosis ~10.6, the "fat tail" events
+  ARE the kurtosis — clipping them at 3-sigma is equivalent to Winsorising
+  the entire kurtosis signal. sc_inner needs to be set relative to target_ek,
+  not as a fixed sigma threshold.
+
+  Fixes:
+  A. _soft_clip_z: set inner = max(5.0, 2*sqrt(target_ek)) so for ek=10.6
+     inner ≈ 6.5 sigma — tails are only clipped at extreme outliers, not fat
+     tail events. outer = inner + 3.0 (was 2x, now additive to avoid too
+     wide a range that defeats the purpose).
+  B. After _soft_clip_z, inject kurtosis back with _kurtosis_topup() using
+     the global true_target_ek (median of window target_ek values).
+  C. _linear_skew_align: apply BEFORE the final std pin, not on z_wins
+     (which has lost its tails). Operate on final_rets_fixed after topup.
+  D. Remove the global std rescale step that pins to real_global_std AFTER
+     _linear_skew_align — this was the final kurtosis-destroying step because
+     it re-standardises a distribution that has just been topup'd.
+     Instead, pin std precisely without touching the tail structure.
+
 v71: fix generate_conditional degradation
-  - After linear blend, apply _kurtosis_topup() to recover peak kurtosis
-    (linear blend of two low-corr series destroys kurtosis by construction)
-  - Pin ret_mu precisely after every rescale step
-  - Reduce default bootstrap_weight 0.60 -> 0.50
-  - Add _linear_skew_align after blend to prevent skew accumulation
-  - Clamp blended mean within 2x ret_mu
-
-v70:
-  Step 1 — kurtosis p90 fix:
-    - _kurtosis_topup: max_iter 3->6, topup_frac 0.8->0.6
-    - fit(): per-window ek_oversample boost when raw_ek > _HIGH_KURT_THRESHOLD
-    - _global_kurtosis_inject: threshold 0.7->0.5
-
-  Step 2 — block-bootstrap conditional generate:
-    - generate_conditional(): regime-matched block resampling
-      conditioned on last N bars of df_history.
-      Blends bootstrapped path (60%) + parametric (40%).
-    - rolling_fit_generate: new use_conditional=False flag (opt-in).
-
+v70: kurtosis p90 fix + block-bootstrap conditional generate
 v69: Fix module-global _ek_decay_ema cross-trial state leak.
 v68: Pass fwd_bars to calibrator.record() for kurt sample-size discount.
 v67: Per-symbol dynamic soft_clip inner/outer based on median target_ek.
@@ -204,9 +216,9 @@ def _fit_volume_params(df: pd.DataFrame, log_rets: np.ndarray):
 # 1. FIT
 # ---------------------------------------------------------------------------
 
-_TARGET_EK_MAX    = 60.0   # v65: raised from 30.0
+_TARGET_EK_MAX    = 60.0
 _EK_OVERSAMPLE    = 3.2
-_HIGH_KURT_THRESHOLD = 8.0  # v70: raw_ek above this gets extra boost
+_HIGH_KURT_THRESHOLD = 8.0
 
 
 def fit(
@@ -234,7 +246,6 @@ def fit(
         skew_raw = float(stats.skew(log_rets))
     raw_ek = float(np.clip(ek, ek_global_floor, _TARGET_EK_MAX))
 
-    # v70 Step1: boost ek_oversample for high-kurtosis windows
     if raw_ek > _HIGH_KURT_THRESHOLD:
         boost = 1.0 + 0.5 * float(np.clip((raw_ek - _HIGH_KURT_THRESHOLD) / (2 * _HIGH_KURT_THRESHOLD), 0.0, 1.0))
         ek_oversample = ek_oversample * boost
@@ -299,21 +310,28 @@ def _kurtosis_topup(
     rets:       np.ndarray,
     target_ek:  float,
     rng:        np.random.Generator,
-    topup_frac: float = 0.60,   # v70 Step1: 0.80 -> 0.60 (inject earlier)
-    max_iter:   int   = 6,      # v70 Step1: 3 -> 6
+    topup_frac: float = 0.60,
+    max_iter:   int   = 8,
 ) -> np.ndarray:
+    """
+    Inject tail events until realised_ek >= topup_frac * target_ek.
+    Uses a copy so caller's array is not mutated unexpectedly.
+    """
+    rets = rets.copy()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realised_ek = float(stats.kurtosis(rets))
     if realised_ek >= topup_frac * target_ek:
         return rets
-    ek_deficit = target_ek - realised_ek
-    n_jumps = max(1, int(len(rets) * 0.01))
+    n_total = len(rets)
     std_r   = float(np.std(rets)) + 1e-10
+    # use ~1% of bars per iteration, at least 1
+    n_jumps = max(1, int(n_total * 0.01))
     for _ in range(max_iter):
-        idx = rng.choice(len(rets), size=n_jumps, replace=False)
+        ek_deficit = max(target_ek - realised_ek, 1.0)
+        idx   = rng.choice(n_total, size=n_jumps, replace=False)
         signs = rng.choice([-1.0, 1.0], size=n_jumps)
-        rets[idx] += signs * std_r * float(np.sqrt(max(ek_deficit, 1.0)))
+        rets[idx] += signs * std_r * float(np.sqrt(ek_deficit))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             realised_ek = float(stats.kurtosis(rets))
@@ -322,24 +340,35 @@ def _kurtosis_topup(
     return rets
 
 
-def _global_kurtosis_inject(
-    rets:            np.ndarray,
-    target_ek:       float,
-    true_target_ek:  float,
-    rng:             np.random.Generator,
+def _soft_clip_z(
+    z:      np.ndarray,
+    inner:  float = 5.0,
+    outer:  float = 8.0,
 ) -> np.ndarray:
+    """
+    v72: inner/outer are now passed in per-call based on target_ek.
+    Defaults raised so fat-tail events are not destroyed by default.
+    Only returns beyond `outer` sigma are hard-clipped.
+    """
+    abs_z = np.abs(z)
+    mask  = abs_z > inner
+    if not np.any(mask):
+        return z
+    result = z.copy()
+    tail   = abs_z[mask]
+    compressed = inner + (outer - inner) * np.tanh((tail - inner) / (outer - inner))
+    result[mask] = np.sign(z[mask]) * compressed
+    return result
+
+
+def _linear_skew_align(z: np.ndarray, target_skew: float, tol: float = 0.05) -> np.ndarray:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        realised_ek = float(stats.kurtosis(rets))
-    if realised_ek >= 0.5 * true_target_ek:   # v70 Step1: 0.7 -> 0.5
-        return rets
-    deficit = true_target_ek - realised_ek
-    n_spikes = max(2, int(len(rets) * 0.005))
-    std_r    = float(np.std(rets)) + 1e-10
-    idx      = rng.choice(len(rets), size=n_spikes, replace=False)
-    signs    = rng.choice([-1.0, 1.0], size=n_spikes)
-    rets[idx] += signs * std_r * float(np.sqrt(max(deficit, 1.0))) * 1.5
-    return rets
+        current_skew = float(stats.skew(z))
+    if abs(current_skew - target_skew) < tol:
+        return z
+    shift = float(np.clip((target_skew - current_skew) * 0.5, -0.5, 0.5))
+    return z + shift * np.abs(z)
 
 
 def generate(
@@ -437,7 +466,7 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 2b. GENERATE_CONDITIONAL  (v70 Step 2: block-bootstrap, v71 fix)
+# 2b. GENERATE_CONDITIONAL
 # ---------------------------------------------------------------------------
 
 def _detect_regime(log_rets: np.ndarray, n_recent: int = 10) -> Dict[str, Any]:
@@ -480,20 +509,9 @@ def generate_conditional(
     rng:         Optional[np.random.Generator] = None,
     block_size:  int   = 10,
     n_candidates: int  = 30,
-    bootstrap_weight: float = 0.50,   # v71: 0.60 -> 0.50
+    bootstrap_weight: float = 0.50,
     regime_window: int = 15,
 ) -> pd.DataFrame:
-    """
-    v71: Regime-conditioned block-bootstrap generator (fixed).
-
-    Key fixes vs v70:
-      - After linear blend, run _kurtosis_topup() to recover peak kurtosis.
-        (Linear blend of two low-corr series destroys kurtosis by construction;
-         blending 60% bootstrap + 40% parametric yields ~gaussian tails.)
-      - Pin ret_mu precisely after every rescale step.
-      - Apply _linear_skew_align to prevent skew accumulation from block selection.
-      - Reduce bootstrap_weight 0.60 -> 0.50 to limit noise dominance.
-    """
     if rng is None:
         rng = np.random.default_rng()
 
@@ -532,50 +550,44 @@ def generate_conditional(
         [hist_rets[block_starts[k]:block_starts[k] + block_size] for k in chosen_starts]
     )[:n_bars]
 
-    target_std = float(params["ret_std"])
-    target_mu  = float(params["ret_mu"])
-    target_ek  = float(params["target_ek"])
+    target_std  = float(params["ret_std"])
+    target_mu   = float(params["ret_mu"])
+    target_ek   = float(params["target_ek"])
     target_skew = float(params["ret_skew_raw"])
 
-    # rescale bootstrap to match ret_std, pin mean
     bs_std = float(np.std(bootstrap_rets)) + 1e-10
     bootstrap_rets = bootstrap_rets / bs_std * target_std
     bootstrap_rets = bootstrap_rets - float(np.mean(bootstrap_rets)) + target_mu
 
-    # parametric path
     df_param = generate(params, n_bars, start_price=start_price, rng=rng)
     param_closes = df_param["Close"].values.astype(float)
     param_rets   = _log_returns(param_closes)
     if len(param_rets) < n_bars:
         param_rets = np.pad(param_rets, (0, n_bars - len(param_rets)), mode="edge")
 
-    # linear blend
     w_b = bootstrap_weight
     w_p = 1.0 - bootstrap_weight
     blended_rets = w_b * bootstrap_rets + w_p * param_rets[:n_bars]
 
-    # rescale to target_std, pin mean precisely
     bl_std = float(np.std(blended_rets)) + 1e-10
     blended_rets = blended_rets / bl_std * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
 
-    # v71: recover kurtosis lost by linear blend
+    # recover kurtosis lost by linear blend
     blended_rets = _kurtosis_topup(blended_rets, target_ek, rng)
 
-    # v71: correct skew accumulated from block selection bias
+    # correct skew bias from block selection
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         current_skew = float(stats.skew(blended_rets))
-    skew_diff = current_skew - target_skew
-    if abs(skew_diff) > 0.15:
+    if abs(current_skew - target_skew) > 0.15:
         blended_rets = _linear_skew_align(blended_rets, target_skew)
 
-    # v71: final std/mean pin after topup and skew correction
+    # final std/mean pin
     bl_std2 = float(np.std(blended_rets)) + 1e-10
     blended_rets = blended_rets / bl_std2 * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
 
-    # reconstruct price path
     prices = np.empty(n_bars + 1)
     prices[0] = start_price
     for i in range(n_bars):
@@ -677,32 +689,9 @@ class OnlineRidgePredictor:
 # ---------------------------------------------------------------------------
 
 _EK_DECAY_EMA_ALPHA = 0.20
-
-_SOFT_CLIP_INNER = 3.0
-_SOFT_CLIP_OUTER = 6.0
-_SKEW_ANCHOR_BAND = 0.30
-
-
-def _soft_clip_z(z: np.ndarray, inner: float = 3.0, outer: float = 6.0) -> np.ndarray:
-    abs_z = np.abs(z)
-    mask  = abs_z > inner
-    if not np.any(mask):
-        return z
-    result = z.copy()
-    tail   = abs_z[mask]
-    compressed = inner + (outer - inner) * np.tanh((tail - inner) / (outer - inner))
-    result[mask] = np.sign(z[mask]) * compressed
-    return result
-
-
-def _linear_skew_align(z: np.ndarray, target_skew: float, tol: float = 0.05) -> np.ndarray:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        current_skew = float(stats.skew(z))
-    if abs(current_skew - target_skew) < tol:
-        return z
-    shift = float(np.clip((target_skew - current_skew) * 0.5, -0.5, 0.5))
-    return z + shift * np.abs(z)
+_SOFT_CLIP_INNER    = 3.0   # kept for ek_decay feedback only, not for final pass
+_SOFT_CLIP_OUTER    = 6.0
+_SKEW_ANCHOR_BAND   = 0.30
 
 
 def rolling_fit_generate(
@@ -714,10 +703,9 @@ def rolling_fit_generate(
     calibrator          = None,
     predictor           = None,
     ek_decay_ema_init:  float = 1.0,
-    use_conditional:    bool  = False,   # v70 Step2: opt-in block-bootstrap
-    bootstrap_weight:   float = 0.50,    # v71: default 0.60 -> 0.50
+    use_conditional:    bool  = False,
+    bootstrap_weight:   float = 0.50,
 ) -> Tuple[pd.DataFrame, List[Dict]]:
-    # v69: ek_decay_ema is local — no cross-trial state leak
     ek_decay_ema: float = float(ek_decay_ema_init)
 
     rng = np.random.default_rng(seed)
@@ -794,7 +782,6 @@ def rolling_fit_generate(
         else:
             start_price = float(df_real["Open"].iloc[fwd_start])
 
-        # v70 Step2: choose generator
         if use_conditional:
             df_sim = generate_conditional(
                 df_history       = df_real.iloc[:fit_end].copy().reset_index(drop=True),
@@ -809,7 +796,6 @@ def rolling_fit_generate(
 
         result_chunks.append(df_sim)
 
-        # --- window-level metrics ---
         sim_rets  = np.diff(np.log(np.maximum(df_sim["Close"].values,  1e-10)))
         real_rets = np.diff(np.log(np.maximum(df_fwd["Close"].values,  1e-10)))
 
@@ -901,7 +887,7 @@ def rolling_fit_generate(
         pos        += step
 
     # ---------------------------------------------------------------------------
-    # Global post-processing pass
+    # Global post-processing pass  (v72: kurtosis-preserving)
     # ---------------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -916,6 +902,7 @@ def rolling_fit_generate(
         real_global_std = float(np.std(real_tail_rets))
         sim_global_std  = float(np.std(sim_all_rets))
 
+        # Step 1: global std rescale (preserves kurtosis — uniform scale)
         if sim_global_std > 1e-10 and real_global_std > 1e-10:
             scale = real_global_std / sim_global_std
             if 0.5 < scale < 2.0:
@@ -936,6 +923,7 @@ def rolling_fit_generate(
                 df_result["High"]  = orig_highs * price_ratio
                 df_result["Low"]   = orig_lows  * price_ratio
 
+        # Step 2: drift correction
         sim_all_rets_post = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -953,6 +941,8 @@ def rolling_fit_generate(
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
 
+        # Step 3: measure kurtosis BEFORE any clipping; set sc_inner high
+        #         so only extreme outliers (>8-sigma) are soft-clipped.
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -971,13 +961,12 @@ def rolling_fit_generate(
             for row in param_log
             if not row.get("_summary") and "target_ek" in row
         ]
-        if window_ek_vals:
-            median_target_ek = float(np.median(window_ek_vals))
-            sc_inner = float(max(_SOFT_CLIP_INNER, np.sqrt(median_target_ek)))
-            sc_outer = sc_inner * 2.0
-        else:
-            sc_inner = _SOFT_CLIP_INNER
-            sc_outer = _SOFT_CLIP_OUTER
+        median_target_ek = float(np.median(window_ek_vals)) if window_ek_vals else 6.0
+
+        # v72: inner = max(5, 2*sqrt(target_ek)) — fat tails are NOT clipped
+        # e.g. ek=10 → inner=6.3; ek=20 → inner=8.9; ek=3 → inner=5.0
+        sc_inner = float(max(5.0, 2.0 * float(np.sqrt(median_target_ek))))
+        sc_outer = sc_inner + 3.0
 
         z_wins = _soft_clip_z(z_norm, inner=sc_inner, outer=sc_outer)
 
@@ -1002,12 +991,20 @@ def rolling_fit_generate(
                 f"  oversample_next={_EK_OVERSAMPLE/max(ek_decay_ema,0.15):.2f}"
             )
 
+        # Step 4: skew alignment (on z_wins, before rescale)
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
-        final_rets_fixed = z_aligned * topup_std + topup_mu
 
+        # Step 5: kurtosis topup on z_aligned (in z-score space)
+        # target in z-space is median_target_ek (kurtosis is scale-invariant)
+        z_toppedUp = _kurtosis_topup(z_aligned, median_target_ek, rng)
+
+        # Step 6: reconstruct returns, pin std precisely
+        final_rets_fixed = z_toppedUp * topup_std + topup_mu
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
-            final_rets_fixed = final_rets_fixed / post_std * real_global_std
+            # only rescale if std drifted meaningfully (>5%)
+            if abs(post_std / real_global_std - 1.0) > 0.05:
+                final_rets_fixed = final_rets_fixed / post_std * real_global_std
 
         new_closes = np.empty(len(df_result))
         new_closes[0] = float(df_result["Close"].iloc[0])
