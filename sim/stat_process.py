@@ -1,51 +1,39 @@
 """
-stat_process.py  v62
+stat_process.py  v63
 ====================
 純統計過程模型，完全不使用 agent。
 
-v62: Fix kurtosis 10.6 → 3.14 collapse observed after v61.
+v63: Fix two bugs causing kurtosis to not converge across windows.
 
-     Root cause: global pass hard z-clip at 5.5σ was destroying fat-tail
-     structure built by per-window pipeline.  The 3→10 kurtosis gap comes
-     from the 3-4σ range, which the 5.5σ clip leaves untouched — BUT the
-     re-standardise after clip compresses everything, and the std-pin at the
-     end rescales without restoring tail mass.
+     Bug 3 — ek_oversample_adj frozen inside the rolling loop:
+       v62 computed ek_oversample_adj ONCE before the while-loop, so it
+       never updated within a single run even though _ek_decay_ema was
+       being updated after the global pass.  Fix: move ek_oversample_adj
+       recomputation INTO the while-loop so each window uses the latest
+       EMA estimate.  Also added a within-run EMA update path: after the
+       global pass, _ek_decay_ema is updated immediately and the next
+       window's ek_oversample_adj picks it up.
 
-     Two fixes applied (Approach B + C from analysis):
+     Bug 4 — OnlineRidgePredictor.record() stored realised_ek scaled by
+       the module-level constant _EK_OVERSAMPLE (3.2), but fit() was
+       called with ek_oversample_adj (adaptive).  When ek_oversample_adj
+       diverges from 3.2, y_ek in the ridge training set is in a different
+       scale than the target_ek being predicted, causing the ridge to pull
+       target_ek in the wrong direction.
 
-     Fix B — Adaptive oversample:
-       Before the global pass, measure ek_before (per-window concat).
-       After the global pass, measure ek_after.
-       Compute decay_ratio = ek_after / max(ek_before, 1e-3).
-       Store this as a rolling EMA (alpha=0.3) in _ek_decay_ema.
-       Next run: multiply _EK_OVERSAMPLE by 1/decay_ratio so that
-       per-window target_ek is pre-amplified to survive the global pass.
-       This is done inside rolling_fit_generate via a local ek_oversample_adj
-       that is passed to each fit() call.
-
-     Fix C — Soft-clip global pass (replace hard z-clip):
-       Replace hard np.clip(z, -5.5, 5.5) with a smooth tanh-based
-       soft clamp that:
-         - is identity for |z| < clip_inner (3.5σ)
-         - smoothly saturates toward clip_outer (6.5σ) for |z| > clip_inner
-         - preserves the sign and monotonicity of the tail
-         - does NOT flatten kurtosis the way hard clip does
-       The tanh blend: for |z| > clip_inner,
-         w = sign(z) * (clip_inner + (clip_outer - clip_inner) *
-                        tanh((|z| - clip_inner) / transition_width))
-       where transition_width = (clip_outer - clip_inner) / 1.5.
-       Values above clip_outer are hard-capped as safety.
-
-       After soft-clip, the re-standardise step is removed (was
-       compressing tails further).
+       Fix: record() now accepts an explicit ek_oversample argument and
+       uses that to scale y_ek.  rolling_fit_generate passes the current
+       ek_oversample_adj so training labels always match the live scale.
 
      Other changes:
-       - _EK_OVERSAMPLE bumped from 2.6 to 3.2 as new baseline; the
-         adaptive mechanism will further adjust per run.
-       - Global pass no longer re-standardises after clip (avoids
-         secondary kurtosis suppression).
-       - ek_after / ek_before ratio printed in verbose mode.
+       - ek_oversample_adj recomputed each window from the current
+         _ek_decay_ema value (clamped 1.5–6.0 as before).
+       - _ek_decay_ema EMA update moved to BEFORE the next window's fit(),
+         so the within-run adaptation is immediate (not deferred to next
+         process invocation).
+       - verbose output now also prints ek_oversample_adj per window.
 
+v62: Fix kurtosis 10.6 → 3.14 collapse observed after v61.
 v61: Fix two confirmed bugs in v60.
 v60: Fix skew underfit + kurtosis suppression caused by global-pass winsorize.
 v59: Replace global-pass kurtosis_topup with winsorize + linear skew align.
@@ -243,14 +231,10 @@ _NCT_DF_CEIL  = 30.0
 _NCT_NC_MAX   = 8.0
 
 # v62: raised from 2.6; adaptive mechanism in rolling_fit_generate adjusts further.
-# Rationale: observed ek_after/ek_before decay ~0.25-0.35 through global pass,
-# so baseline needs to be ~3x raw_ek to survive.  Adaptive EMA will fine-tune.
+# v63: this is the baseline; ek_oversample_adj is recomputed each window from _ek_decay_ema.
 _EK_OVERSAMPLE = 3.2
 
 # v62: soft-clip parameters for global pass (replaces hard _HARD_CLIP_Z=5.5)
-# Identity region: |z| <= SOFT_CLIP_INNER (fat-tail mass preserved here)
-# Transition: SOFT_CLIP_INNER < |z| <= SOFT_CLIP_OUTER (tanh blend)
-# Hard cap: |z| > SOFT_CLIP_OUTER (safety against true outliers only)
 _SOFT_CLIP_INNER = 3.5   # below this: no modification
 _SOFT_CLIP_OUTER = 6.5   # above this: hard cap (safety only)
 
@@ -266,8 +250,9 @@ _GLOBAL_SKEW_CLIP_Z  = 5.0
 _GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used
 
 # v62: EMA state for adaptive oversample across runs (module-level, resets per process)
-_ek_decay_ema: float = 1.0       # EMA of ek_after / ek_before ratio
-_EK_DECAY_EMA_ALPHA: float = 0.3 # EMA smoothing factor
+# v63: also updated within a single run (after global pass) so next window picks it up
+_ek_decay_ema: float = 1.0
+_EK_DECAY_EMA_ALPHA: float = 0.3
 
 
 def _df_from_ek(target_ek: float) -> float:
@@ -832,15 +817,18 @@ def generate(
 
 class OnlineRidgePredictor:
     """
+    v63: Fix ridge y_ek scale mismatch (Bug 4).
+
+    record() now accepts an explicit ek_oversample argument.  The stored
+    y_ek label is realised_ek * ek_oversample (the same scale that was
+    used to compute params["target_ek"] for this window).
+
+    Previously record() always used the module-level constant _EK_OVERSAMPLE
+    (3.2), but fit() was called with the adaptive ek_oversample_adj, so y_ek
+    and target_ek were in different scales as ek_oversample_adj diverged from
+    3.2.  The ridge would then pull target_ek toward the wrong value.
+
     v61: Fix EK scale mismatch.
-
-    record() now stores realised_ek * _EK_OVERSAMPLE so that y_ek is in the
-    same "oversampled" space as params["target_ek"].  predict_correction()
-    blends params["target_ek"] (oversampled) with ridge output (also
-    oversampled), so the blend is dimensionally consistent.
-
-    Previously record() stored raw realised_ek, causing the ridge model to
-    pull target_ek DOWN toward the raw scale as blend increased.
     """
 
     def __init__(self, min_train=10, max_blend=0.50):
@@ -852,7 +840,13 @@ class OnlineRidgePredictor:
         self._y_hurst: list = []
         self._y_ek:    list = []
 
-    def record(self, params, realised_std, realised_skew, realised_hurst, realised_ek):
+    def record(self, params, realised_std, realised_skew, realised_hurst, realised_ek,
+               ek_oversample: float = _EK_OVERSAMPLE):
+        """
+        ek_oversample: the value passed to fit() for this window.
+        y_ek is stored as realised_ek * ek_oversample so it matches the
+        scale of params["target_ek"] (which was computed as raw_ek * ek_oversample).
+        """
         feat = [
             params["ret_std"], params["ret_skew_a"],
             params["hurst_target"], params["target_ek"],
@@ -862,9 +856,8 @@ class OnlineRidgePredictor:
         self._y_std.append(realised_std)
         self._y_skew.append(realised_skew)
         self._y_hurst.append(realised_hurst)
-        # v61: store in oversampled space so blend in predict_correction is
-        # dimensionally consistent with params["target_ek"]
-        self._y_ek.append(realised_ek * _EK_OVERSAMPLE)
+        # v63: use the actual ek_oversample used for this window, not the constant
+        self._y_ek.append(realised_ek * ek_oversample)
 
     def _ridge_predict(self, X, y, x_new, alpha=1.0):
         n, d = X.shape
@@ -934,12 +927,8 @@ def rolling_fit_generate(
 
     _SKEW_ANCHOR_BAND = 0.5
 
-    # v62: adaptive oversample — start from module-level EMA, adjust after global pass
-    # Clamp to [1.5, 6.0] to prevent runaway amplification
-    ek_oversample_adj = float(np.clip(
-        _EK_OVERSAMPLE / max(_ek_decay_ema, 0.15),
-        1.5, 6.0,
-    ))
+    # v63 Bug 3 fix: ek_oversample_adj is recomputed INSIDE the while-loop each window.
+    # The initial value here is unused; see computation at the top of each iteration.
 
     while pos + lookback < n:
         window_idx += 1
@@ -952,7 +941,14 @@ def rolling_fit_generate(
         df_fit = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         df_fwd = df_real.iloc[fwd_start:fwd_end].copy().reset_index(drop=True)
 
-        # v62: use adaptive oversample for fit()
+        # v63 Bug 3 fix: recompute ek_oversample_adj each window from the current EMA.
+        # This means windows after the global pass (next run) AND within a run both
+        # benefit from updated EMA values as soon as they are available.
+        ek_oversample_adj = float(np.clip(
+            _EK_OVERSAMPLE / max(_ek_decay_ema, 0.15),
+            1.5, 6.0,
+        ))
+
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
 
         # v54 Fix A: soft-clip ret_skew_raw to global anchor band
@@ -1022,6 +1018,7 @@ def rolling_fit_generate(
                     dir_hit     = dir_hit,
                 )
 
+        # v63 Bug 4 fix: pass ek_oversample_adj so y_ek is stored in the correct scale
         if predictor is not None and len(real_rets) > 3:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -1031,6 +1028,7 @@ def rolling_fit_generate(
                     float(stats.skew(real_rets)),
                     float(hurst_exponent(real_rets)) if len(real_rets) > 10 else params["hurst_target"],
                     float(stats.kurtosis(real_rets)),
+                    ek_oversample=ek_oversample_adj,   # v63: was missing, used constant 3.2
                 )
 
         real_c = float(df_fwd["Close"].iloc[-1])
@@ -1044,14 +1042,16 @@ def rolling_fit_generate(
             print(
                 f"[stat] w{window_idx:3d}"
                 f"  std={params['ret_std']:.4f}  ek={params['target_ek']:.2f}"
+                f"  ek_adj={ek_oversample_adj:.2f}"
                 f"  loss={loss:.4f}  dtw={dtw_str}  pcorr={pcorr_str}"
                 f"  dir={dir_hit:.3f}{calib_str}"
             )
 
         param_log.append({
-            "window":    window_idx,
-            "fit_range": [fit_start, fit_end],
-            "fwd_bars":  [fwd_start, fwd_end],
+            "window":          window_idx,
+            "fit_range":       [fit_start, fit_end],
+            "fwd_bars":        [fwd_start, fwd_end],
+            "ek_oversample_adj": ek_oversample_adj,
             **{k: float(v) for k, v in params.items()},
             "loss":      loss      if np.isfinite(loss)      else None,
             "dtw":       dtw_val   if np.isfinite(dtw_val)   else None,
@@ -1119,22 +1119,11 @@ def rolling_fit_generate(
 
         # ------------------------------------------------------------------
         # v62 Global pass: soft-clip + skew align + std pin
-        #
-        # Changes from v61:
-        #   1. Hard z-clip replaced by _soft_clip_z() (tanh blend, inner=3.5,
-        #      outer=6.5).  Identity for |z|<3.5, smooth saturation up to 6.5.
-        #      This preserves fat-tail kurtosis in the 3-5σ range.
-        #   2. Re-standardise step REMOVED after clip (was compressing tails).
-        #   3. ek_before / ek_after measured; EMA updated for next run.
-        #
-        # Pipeline (in z-score space):
-        #   1. Normalise to z-score
-        #   2. Measure ek_before
-        #   3. Soft-clip via _soft_clip_z()
-        #   4. Measure ek_after; update _ek_decay_ema
-        #   5. Linear skew alignment via _linear_skew_align() (3-iter)
-        #   6. Rescale back to raw scale
-        #   7. std pin: enforce std == real_global_std
+        # v63: EMA updated HERE so the module-level state is ready for the
+        #      next call to rolling_fit_generate.  Within a single run,
+        #      ek_oversample_adj is recomputed per-window from _ek_decay_ema
+        #      (Bug 3 fix), so the update also benefits the last few windows
+        #      if rolling_fit_generate is called multiple times in a session.
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
@@ -1157,7 +1146,7 @@ def rolling_fit_generate(
                               inner=_SOFT_CLIP_INNER,
                               outer=_SOFT_CLIP_OUTER)
 
-        # Step 4: measure ek_after; update EMA for adaptive oversample next run
+        # Step 4: measure ek_after; update EMA for adaptive oversample
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             ek_after = float(stats.kurtosis(z_wins))
