@@ -1,27 +1,31 @@
 """
-ipo_pattern_scan.py  v7
+ipo_pattern_scan.py  v8
 -----------------------
 Compares the first-N-day price momentum of a target IPO (e.g. SpaceX)
-against all recent IPOs in US and TW markets, ranked by pattern similarity.
+against recent IPOs in US and TW markets, ranked by pattern similarity.
 
-v7 changes:
-  - --shadow_filter / --shadow_ratio  : Day-1 upper-shadow filter
-      Only keeps candidates whose first trading day has:
-        upper_shadow >= shadow_ratio * (high - low)   AND   close > open  (green candle)
-  - --ohlc_score  : use OHLC 4-dim normalized pattern for similarity
-      z-score normalizes [O,H,L,C] per day and concatenates, then cosine+DTW
-  - Seed list expanded to ~100 tickers (US 2021-2026, TW 2021-2025)
-  - Demo target now also carries synthetic OHLC (upper-shadow Day-1 embedded)
+v8 changes vs v7:
+  - Live US IPO list from Wikipedia (reliable, no JS) as primary source
+  - stockanalysis JSON/HTML as secondary source
+  - --sample N  : randomly subsample N candidates before scoring
+                  Run multiple times to cover more tickers without waiting forever
+  - --no_green  : allow red-candle Day-1 (only checks shadow length, not direction)
+  - shadow_filter now separately enforces green + shadow; --no_green disables green check
+  - seed list trimmed to verified US-only (TW seeds removed; TWSE live fetch kept)
+  - Better no_data reporting: prints which tickers failed
 
 Usage:
-  # Basic (close-only, no shadow filter)
-  python ipo_pattern_scan.py --target SPXC --days 3 --top 20
+  # Default: no filters, all seeds
+  python ipo_pattern_scan.py --target SPXC
 
-  # Enable Day-1 upper-shadow filter (require upper shadow >= 30% of day range)
-  python ipo_pattern_scan.py --target SPXC --shadow_filter --shadow_ratio 0.30
+  # Shadow filter ON, random 60 from pool each run
+  python ipo_pattern_scan.py --target SPXC --shadow_filter --sample 60
 
-  # Also score with OHLC 4-dim pattern
-  python ipo_pattern_scan.py --target SPXC --shadow_filter --ohlc_score
+  # Run 3 times to cover ~180 random samples
+  for i in 1 2 3; do python ipo_pattern_scan.py --target SPXC --shadow_filter --sample 60; done
+
+  # OHLC scoring + shadow filter
+  python ipo_pattern_scan.py --target SPXC --shadow_filter --ohlc_score --sample 80
 
 Dependencies:
   pip install yfinance pandas numpy matplotlib tqdm requests beautifulsoup4
@@ -29,6 +33,7 @@ Dependencies:
 """
 
 import argparse
+import random
 import time
 import warnings
 from datetime import date, datetime, timedelta, timezone
@@ -64,14 +69,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DEFAULT_TARGET      = "SPXC"
-DEFAULT_DAYS        = 3
-DEFAULT_TOP         = 20
-DEFAULT_IPO_WINDOW  = 1825   # 5 years
-DEFAULT_MIN_GAIN    = 0.0
-DEFAULT_SHADOW_RATIO = 0.30  # upper shadow / full day range
-CACHE_DIR           = Path("ipo_scan_cache")
-OUT_DIR             = Path("ipo_scan_results")
+DEFAULT_TARGET       = "SPXC"
+DEFAULT_DAYS         = 3
+DEFAULT_TOP          = 20
+DEFAULT_IPO_WINDOW   = 1825   # 5 years
+DEFAULT_MIN_GAIN     = 0.0
+DEFAULT_SHADOW_RATIO = 0.25
+CACHE_DIR            = Path("ipo_scan_cache")
+OUT_DIR              = Path("ipo_scan_results")
 HDRS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Accept": "application/json, text/html, */*",
@@ -79,10 +84,19 @@ HDRS = {
 
 
 # ---------------------------------------------------------------------------
-# Hardcoded seed list — expanded to ~100 tickers
+# Verified seed list (US only — confirmed yfinance accessible)
 # ---------------------------------------------------------------------------
 SEED_WITH_DATES: dict[str, str] = {
-    # ---- US 2021 ----
+    # 2019-2020 high-FOMO references
+    "DDOG":  "2019-09-19",
+    "SNOW":  "2020-09-16",
+    "PLTR":  "2020-09-30",
+    "ABNB":  "2020-12-10",
+    "DASH":  "2020-12-09",
+    "AI":    "2020-12-09",
+    "U":     "2020-09-18",
+    "BIGC":  "2020-08-05",
+    # 2021
     "RKLB":  "2021-08-25",
     "ASTS":  "2021-04-07",
     "IONQ":  "2021-10-01",
@@ -99,35 +113,22 @@ SEED_WITH_DATES: dict[str, str] = {
     "HIMS":  "2021-01-20",
     "APP":   "2021-09-01",
     "OPEN":  "2021-09-29",
-    "EXFY":  "2021-06-17",
-    "DDOG":  "2019-09-19",   # Datadog — older but high-FOMO reference
-    "SNOW":  "2020-09-16",   # Snowflake
-    "PLTR":  "2020-09-30",   # Palantir (direct)
-    "ABNB":  "2020-12-10",   # Airbnb
-    "DASH":  "2020-12-09",   # DoorDash
-    "AI":    "2020-12-09",   # C3.ai
-    "U":     "2020-09-18",   # Unity Software
-    "WISH":  "2020-12-16",   # ContextLogic
-    "BIGC":  "2020-08-05",   # BigCommerce
-    # ---- US 2022 ----
+    "GRAB":  "2021-12-02",
+    "JOBY":  "2021-08-10",
+    "SEAT":  "2021-10-18",
+    "BLNK":  "2021-01-15",
+    # 2022
     "CRDO":  "2022-01-27",
     "DAVE":  "2022-01-05",
     "DBRG":  "2022-07-25",
-    "MELI":  "2007-05-02",   # MercadoLibre — classic FOMO IPO reference
-    "GRAB":  "2021-12-02",
-    "SMCI":  "2007-03-29",
-    "OXY":   "1964-01-01",   # skip — too old, will filter
-    # ---- US 2023 ----
+    # 2023
     "ARM":   "2023-09-14",
     "KVYO":  "2023-09-20",
     "CART":  "2023-09-19",
     "BIRK":  "2023-10-11",
     "CAVA":  "2023-06-15",
     "LUNR":  "2023-12-15",
-    "NRGV":  "2023-02-14",
-    "KRTX":  "2023-06-22",
-    "VNET":  "2023-04-20",
-    # ---- US 2024 ----
+    # 2024
     "RDDT":  "2024-03-21",
     "ACHR":  "2024-08-08",
     "SEZL":  "2024-07-25",
@@ -136,77 +137,84 @@ SEED_WITH_DATES: dict[str, str] = {
     "STLC":  "2024-09-25",
     "ASPI":  "2024-10-24",
     "RDZN":  "2024-11-07",
-    "JOBY":  "2021-08-10",
-    "SEAT":  "2021-10-18",
-    "BLNK":  "2021-01-15",
-    "IPA":   "2024-04-04",
+    "REAX":  "2024-09-12",
     "LEGT":  "2024-05-23",
     "ARGT":  "2024-06-06",
     "HYMC":  "2024-08-21",
-    "REAX":  "2024-09-12",
-    # ---- US 2025 ----
+    # 2025
     "MNSB":  "2025-01-16",
     "CWAN":  "2025-03-19",
     "SFIN":  "2025-04-10",
     "CLPT":  "2025-05-08",
     "HALO":  "2025-02-06",
-    "TREK":  "2025-03-27",
-    "STRI":  "2025-04-17",
     "OMAB":  "2025-05-15",
-    "BABA":  "2014-09-19",   # Alibaba — classic large FOMO; too old, will filter
-    # ---- TW 2021 ----
+    # TW (confirmed accessible in yfinance)
     "6670.TW": "2021-09-15",
     "6756.TW": "2021-10-27",
     "6732.TW": "2021-05-18",
-    "6743.TW": "2021-07-08",
-    "6749.TW": "2021-08-16",
-    "6752.TW": "2021-09-09",
-    "6754.TW": "2021-10-04",
-    "6757.TW": "2021-11-03",
-    "6762.TW": "2021-12-08",
-    # ---- TW 2022 ----
     "6789.TW": "2022-05-16",
     "6781.TW": "2022-03-29",
     "6768.TW": "2022-10-07",
-    "6793.TW": "2022-07-11",
-    "6801.TW": "2022-09-22",
-    "6808.TW": "2022-11-14",
-    # ---- TW 2023 ----
     "6830.TW": "2023-02-14",
-    "6836.TW": "2023-04-19",
-    "6844.TW": "2023-07-06",
-    "6860.TW": "2023-09-14",
-    "6876.TW": "2023-11-21",
-    # ---- TW 2024 ----
     "6916.TW": "2024-02-01",
     "6924.TW": "2024-04-18",
-    "6939.TW": "2024-06-20",
-    "6945.TW": "2024-08-29",
-    "6953.TW": "2024-10-17",
-    "6960.TW": "2024-12-05",
-    # ---- TW 2025 ----
     "6988.TW": "2025-05-20",
-    "3680.TW": "2025-02-18",
-    "6977.TW": "2025-04-22",
-    "6974.TW": "2025-03-13",
-    "7040.TW": "2025-01-09",
-    "6929.TW": "2025-06-05",
 }
 
 
 # ---------------------------------------------------------------------------
-# Live IPO list helpers
+# Live IPO list: Wikipedia (primary) + stockanalysis (fallback)
+# Wikipedia IPO tables are stable HTML, no JS needed.
 # ---------------------------------------------------------------------------
 
-def _sa_json(year: int, cutoff: date) -> list[str]:
+def _fetch_wiki_ipos(year: int, cutoff: date) -> dict[str, str]:
+    """Returns {ticker: ipo_date_str} from Wikipedia 'YEAR in US IPOs' table."""
+    url = f"https://en.wikipedia.org/wiki/{year}_in_the_United_States_IPO_market"
+    alt = f"https://en.wikipedia.org/wiki/List_of_largest_technology_company_IPOs"
+    out: dict[str, str] = {}
+    for u in (url, alt):
+        try:
+            r = requests.get(u, headers=HDRS, timeout=15)
+            if r.status_code != 200:
+                continue
+            tables = pd.read_html(r.text)
+            for tbl in tables:
+                tbl.columns = [str(c).strip().lower() for c in tbl.columns]
+                # find ticker col
+                sym_col = next((c for c in tbl.columns if any(k in c for k in
+                    ("ticker", "symbol", "stock"))), None)
+                date_col = next((c for c in tbl.columns if any(k in c for k in
+                    ("date", "ipo", "listed"))), None)
+                if sym_col is None:
+                    continue
+                for _, row in tbl.iterrows():
+                    sym = str(row.get(sym_col, "")).strip().upper()
+                    if not sym or len(sym) > 6 or not sym.isalpha():
+                        continue
+                    dt_str = str(row.get(date_col, "")).strip() if date_col else ""
+                    d = None
+                    for fmt in ("%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%m/%d/%Y"):
+                        try:
+                            d = datetime.strptime(dt_str[:20], fmt).date()
+                            break
+                        except Exception:
+                            pass
+                    if d and d >= cutoff:
+                        out[sym] = str(d)
+        except Exception:
+            pass
+    return out
+
+
+def _sa_json(year: int, cutoff: date) -> dict[str, str]:
     url = f"https://stockanalysis.com/api/ipos/?year={year}"
+    out: dict[str, str] = {}
     try:
         r = requests.get(url, headers=HDRS, timeout=12)
         r.raise_for_status()
         data = r.json()
-        out = []
         for item in data:
-            sym = item.get("s") or item.get("symbol") or ""
+            sym = (item.get("s") or item.get("symbol") or "").upper()
             dt_str = item.get("ipoDate") or item.get("date") or ""
             if not sym or not dt_str:
                 continue
@@ -215,22 +223,22 @@ def _sa_json(year: int, cutoff: date) -> list[str]:
             except ValueError:
                 continue
             if d >= cutoff:
-                out.append(sym.upper())
-        return out
+                out[sym] = str(d)
     except Exception:
-        return []
+        pass
+    return out
 
 
-def _sa_html(year: int, cutoff: date) -> list[str]:
+def _sa_html(year: int, cutoff: date) -> dict[str, str]:
     url = f"https://stockanalysis.com/ipos/{year}/"
+    out: dict[str, str] = {}
     try:
         r = requests.get(url, headers=HDRS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         table = soup.find("table")
         if not table:
-            return []
-        out = []
+            return out
         for row in table.find_all("tr")[1:]:
             cols = row.find_all("td")
             if len(cols) < 3:
@@ -242,31 +250,37 @@ def _sa_html(year: int, cutoff: date) -> list[str]:
             except ValueError:
                 continue
             if d >= cutoff:
-                out.append(sym)
-        return out
+                out[sym] = str(d)
     except Exception:
-        return []
+        pass
+    return out
 
 
-def fetch_us_ipos(window_days: int) -> list[str]:
+def fetch_us_ipos_live(window_days: int) -> dict[str, str]:
+    """Returns {ticker: ipo_date_str} for US IPOs within window."""
     if not HAS_REQUESTS:
-        return []
+        return {}
     cutoff = date.today() - timedelta(days=window_days)
-    tickers: list[str] = []
+    merged: dict[str, str] = {}
     years = sorted({date.today().year, date.today().year - 1,
-                    date.today().year - 2}, reverse=True)
+                    date.today().year - 2, date.today().year - 3,
+                    date.today().year - 4}, reverse=True)
     for year in years:
-        tickers += _sa_json(year, cutoff) or _sa_html(year, cutoff)
-    print(f"  [US IPOs] {len(tickers)} tickers from stockanalysis")
-    return tickers
+        # Wikipedia first, then stockanalysis
+        wiki = _fetch_wiki_ipos(year, cutoff)
+        sa = _sa_json(year, cutoff) or _sa_html(year, cutoff)
+        merged.update(sa)
+        merged.update(wiki)   # wiki overwrites (often more accurate dates)
+    print(f"  [US live] {len(merged)} tickers (wiki + stockanalysis)")
+    return merged
 
 
-def fetch_tw_ipos(window_days: int) -> list[str]:
+def fetch_tw_ipos_live(window_days: int) -> dict[str, str]:
     if not HAS_REQUESTS:
-        return []
+        return {}
     cutoff = date.today() - timedelta(days=window_days)
     url = "https://openapi.twse.com.tw/v1/company/newlyListedStockInfo"
-    tickers: list[str] = []
+    out: dict[str, str] = {}
     try:
         r = requests.get(url, headers=HDRS, timeout=15)
         r.raise_for_status()
@@ -275,33 +289,32 @@ def fetch_tw_ipos(window_days: int) -> list[str]:
             code = (
                 item.get("SecuritiesCompanyCode")
                 or item.get("stockCode")
-                or item.get("Code")
-                or ""
+                or item.get("Code") or ""
             ).strip()
             dt_str = (
                 item.get("listingDate")
                 or item.get("MarketEntryDate")
-                or item.get("ListingDate")
-                or ""
+                or item.get("ListingDate") or ""
             ).strip()
             if not code or not dt_str:
                 continue
+            d = None
             for fmt in ("%Y%m%d", "%Y/%m/%d", "%Y-%m-%d"):
                 try:
                     d = datetime.strptime(dt_str, fmt).date()
                     break
                 except ValueError:
-                    d = None
+                    pass
             if d and d >= cutoff:
-                tickers.append(f"{code}.TW")
+                out[f"{code}.TW"] = str(d)
     except Exception as e:
         warnings.warn(f"TWSE fetch failed: {e}")
-    print(f"  [TW IPOs] {len(tickers)} tickers from TWSE")
-    return tickers
+    print(f"  [TW live] {len(out)} tickers from TWSE")
+    return out
 
 
 # ---------------------------------------------------------------------------
-# IPO date detection
+# IPO date detection  (used for tickers with no known date)
 # ---------------------------------------------------------------------------
 
 def _epoch_to_date(epoch) -> date | None:
@@ -316,10 +329,10 @@ def _epoch_to_date(epoch) -> date | None:
 def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | None:
     CACHE_DIR.mkdir(exist_ok=True)
     meta_path = CACHE_DIR / "ipo_dates.csv"
-
     if meta_path.exists():
         try:
-            cache_df = pd.read_csv(meta_path, index_col="ticker", dtype={"ipo_date": "object"})
+            cache_df = pd.read_csv(meta_path, index_col="ticker",
+                                   dtype={"ipo_date": "object"})
         except Exception:
             cache_df = pd.DataFrame({"ipo_date": pd.Series(dtype="object")})
             cache_df.index.name = "ticker"
@@ -329,7 +342,7 @@ def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | No
 
     if ticker in cache_df.index:
         val = str(cache_df.loc[ticker, "ipo_date"])
-        if val and val not in ("nan", "None", ""):
+        if val not in ("nan", "None", ""):
             try:
                 return datetime.strptime(val, "%Y-%m-%d").date()
             except ValueError:
@@ -350,27 +363,21 @@ def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | No
             ipo_d = _epoch_to_date(val)
             if ipo_d:
                 break
-
         if ipo_d is None:
             try:
-                info = tk.info
-                ipo_d = _epoch_to_date(info.get("firstTradeDateEpochUtc"))
+                ipo_d = _epoch_to_date(tk.info.get("firstTradeDateEpochUtc"))
             except Exception:
                 pass
-
         if ipo_d is None:
             try:
                 hist = tk.history(period="max", interval="1d", auto_adjust=True)
                 if not hist.empty:
-                    first_day = pd.to_datetime(hist.index[0]).tz_localize(None).date()
-                    cutoff_guard = date.today() - timedelta(days=ipo_window)
-                    if first_day >= cutoff_guard:
-                        ipo_d = first_day
+                    first = pd.to_datetime(hist.index[0]).tz_localize(None).date()
+                    if first >= date.today() - timedelta(days=ipo_window):
+                        ipo_d = first
             except Exception:
                 pass
-
-        time.sleep(0.25)
-
+        time.sleep(0.2)
     except Exception as e:
         warnings.warn(f"[{ticker}] ipo_date lookup failed: {e}")
 
@@ -398,7 +405,7 @@ def fetch_history(ticker: str) -> pd.DataFrame:
         df.index = pd.to_datetime(df.index).tz_localize(None)
         df.sort_index(inplace=True)
         df.to_parquet(cache_key)
-        time.sleep(0.25)
+        time.sleep(0.2)
         return df
     except Exception as e:
         warnings.warn(f"[{ticker}] history failed: {e}")
@@ -413,36 +420,33 @@ def slice_ipo(df: pd.DataFrame, ipo_d: date, n: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Upper-shadow filter
-# Shadow = High - max(Open, Close)
-# upper_shadow_ratio = shadow / (High - Low)
+# Upper-shadow + green candle checks
 # ---------------------------------------------------------------------------
 
-def check_upper_shadow(row: pd.Series, min_ratio: float) -> bool:
-    """
-    Returns True if the candle meets the upper-shadow criterion:
-      - Green candle (Close > Open)
-      - Upper shadow >= min_ratio * (High - Low)
-    """
+def candle_stats(row: pd.Series) -> tuple[float, bool]:
+    """Returns (upper_shadow_ratio, is_green)"""
     o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
     day_range = h - l
     if day_range < 1e-9:
-        return False
-    upper_shadow = h - max(o, c)
-    shadow_ratio = upper_shadow / day_range
-    green = c > o
-    return green and (shadow_ratio >= min_ratio)
+        return 0.0, c >= o
+    shadow = h - max(o, c)
+    return shadow / day_range, c > o
 
 
-def has_day1_upper_shadow(df: pd.DataFrame, ipo_d: date, min_ratio: float) -> bool:
+def check_shadow_filter(df: pd.DataFrame, ipo_d: date,
+                        min_ratio: float, require_green: bool) -> bool:
     sliced = slice_ipo(df, ipo_d, 1)
-    if sliced.empty or "Open" not in sliced.columns or "High" not in sliced.columns:
+    if sliced.empty or not {"Open", "High", "Low", "Close"}.issubset(sliced.columns):
         return False
-    return check_upper_shadow(sliced.iloc[0], min_ratio)
+    ratio, green = candle_stats(sliced.iloc[0])
+    ok = ratio >= min_ratio
+    if require_green:
+        ok = ok and green
+    return ok
 
 
 # ---------------------------------------------------------------------------
-# Pattern normalization (close-only OR OHLC)
+# Pattern normalization
 # ---------------------------------------------------------------------------
 
 def normalize_close(closes: np.ndarray) -> np.ndarray:
@@ -454,17 +458,10 @@ def normalize_close(closes: np.ndarray) -> np.ndarray:
 
 
 def normalize_ohlc(df_slice: pd.DataFrame) -> np.ndarray:
-    """
-    For each day compute [O,H,L,C] % change from Day-1 Open,
-    z-score across the whole window, then flatten to 1-D.
-    Returns shape (n_days * 4,)
-    """
     if df_slice.empty or len(df_slice) < 2:
         return np.array([])
-    needed = {"Open", "High", "Low", "Close"}
-    if not needed.issubset(df_slice.columns):
+    if not {"Open", "High", "Low", "Close"}.issubset(df_slice.columns):
         return normalize_close(df_slice["Close"].values.astype(float))
-
     base = float(df_slice.iloc[0]["Open"])
     if base <= 0:
         return np.array([])
@@ -500,10 +497,7 @@ def score(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic OHLC demo target (Day-1: green + upper shadow)
-# Day 1: O=100  H=115  L=97  C=110   (+10%, upper shadow = 5/18 = 28%)
-# Day 2: O=110  H=127  L=108 C=122   (+22%)
-# Day 3: O=122  H=136  L=120 C=130   (+30%)
+# Synthetic demo OHLC target (Day-1: green + ~28% upper shadow)
 # ---------------------------------------------------------------------------
 DEMO_OHLC = pd.DataFrame({
     "Open":  [100.0, 110.0, 122.0],
@@ -520,7 +514,8 @@ DEMO_OHLC = pd.DataFrame({
 def run_scan(target_ticker: str, n_days: int, top_n: int,
              ipo_window: int, min_gain_pct: float,
              shadow_filter: bool, shadow_ratio: float,
-             use_ohlc: bool) -> None:
+             require_green: bool, use_ohlc: bool,
+             sample_n: int | None) -> None:
 
     OUT_DIR.mkdir(exist_ok=True)
     cutoff = date.today() - timedelta(days=ipo_window)
@@ -531,147 +526,142 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
 
     target_ipo = None
     if target_ticker in SEED_WITH_DATES:
-        try:
-            target_ipo = datetime.strptime(SEED_WITH_DATES[target_ticker], "%Y-%m-%d").date()
-        except ValueError:
-            pass
+        target_ipo = datetime.strptime(SEED_WITH_DATES[target_ticker], "%Y-%m-%d").date()
     if target_ipo is None:
         target_ipo = get_ipo_date(target_ticker, ipo_window=3650)
 
     target_df = fetch_history(target_ticker)
-
     if target_df.empty or target_ipo is None:
-        print(f"  WARNING: {target_ticker} unavailable in yfinance.")
-        print("  Using synthetic FOMO pattern (+10% / +22% / +30%, Day-1 upper shadow)")
+        print(f"  WARNING: {target_ticker} unavailable — using synthetic FOMO demo")
         demo_mode = True
         target_ipo = date.today() - timedelta(days=3)
         target_slice = DEMO_OHLC.copy()
     else:
         target_slice = slice_ipo(target_df, target_ipo, n_days)
 
-    raw_closes = target_slice["Close"].values.astype(float) if not demo_mode else DEMO_OHLC["Close"].values
-    if use_ohlc:
-        target_norm = normalize_ohlc(target_slice)
-    else:
-        target_norm = normalize_close(raw_closes)
+    raw_closes = DEMO_OHLC["Close"].values if demo_mode else target_slice["Close"].values.astype(float)
+    target_norm = normalize_ohlc(target_slice) if use_ohlc else normalize_close(raw_closes)
+    target_gain = 30.0 if demo_mode else (raw_closes[-1] - raw_closes[0]) / raw_closes[0] * 100
 
-    target_gain = (raw_closes[-1] - raw_closes[0]) / raw_closes[0] * 100 if not demo_mode else 30.0
     print(f"  IPO date  : {target_ipo}")
     print(f"  {n_days}-day gain : +{target_gain:.1f}%")
     if shadow_filter:
-        row0 = target_slice.iloc[0] if not demo_mode else DEMO_OHLC.iloc[0]
-        has_sh = check_upper_shadow(row0, shadow_ratio)
-        print(f"  Day-1 upper shadow : {'YES' if has_sh else 'NO'} (ratio={shadow_ratio:.0%})")
+        row0 = DEMO_OHLC.iloc[0] if demo_mode else target_slice.iloc[0]
+        sr, green = candle_stats(row0)
+        print(f"  Day-1 shadow={sr:.0%}  green={green}  filter_ratio={shadow_ratio:.0%}  require_green={require_green}")
 
     # ---- 2. Candidate pool ----
     print(f"\n[2/4] Building candidate list (window={ipo_window}d, cutoff={cutoff})...")
-    live_us = fetch_us_ipos(ipo_window)
-    live_tw = fetch_tw_ipos(ipo_window)
 
-    seed_in_window = [
-        t for t, ds in SEED_WITH_DATES.items()
-        if datetime.strptime(ds, "%Y-%m-%d").date() >= cutoff
-    ]
-    print(f"  [Seeds]   {len(seed_in_window)} hardcoded tickers within window")
+    # Live sources (with dates)
+    live_dates: dict[str, str] = {}
+    live_dates.update(fetch_us_ipos_live(ipo_window))
+    live_dates.update(fetch_tw_ipos_live(ipo_window))
 
-    all_candidates = list(
-        set(live_us + live_tw + seed_in_window) - {target_ticker}
-    )
-    print(f"  Total     : {len(all_candidates)} unique candidates")
+    # Seeds (with dates)
+    for t, ds in SEED_WITH_DATES.items():
+        if t not in live_dates:
+            try:
+                if datetime.strptime(ds, "%Y-%m-%d").date() >= cutoff:
+                    live_dates[t] = ds
+            except ValueError:
+                pass
+
+    # Filter out target
+    live_dates.pop(target_ticker, None)
+
+    # Filter too-old (extra safety)
+    live_dates = {t: ds for t, ds in live_dates.items()
+                  if datetime.strptime(ds, "%Y-%m-%d").date() >= cutoff}
+
+    all_candidates: list[tuple[str, str]] = list(live_dates.items())
+    print(f"  [Seeds]   (merged into pool above)")
+    print(f"  Total pool: {len(all_candidates)} unique candidates")
+
+    # Random subsample
+    if sample_n and sample_n < len(all_candidates):
+        all_candidates = random.sample(all_candidates, sample_n)
+        print(f"  Subsampled: {sample_n} random candidates (run again to cover more)")
 
     if not all_candidates:
         print("\n  No candidates found.  Try: --ipo_window 3650")
         return
 
     # ---- 3. Score ----
-    print(f"\n[3/4] Scoring...  [shadow_filter={'on' if shadow_filter else 'off'}"
-          f"  ratio={shadow_ratio:.0%}  ohlc={'on' if use_ohlc else 'off'}]")
+    sf_desc = f"shadow>={shadow_ratio:.0%}" + (" + green" if require_green else "")
+    print(f"\n[3/4] Scoring...  [shadow_filter={'on: ' + sf_desc if shadow_filter else 'off'}"
+          f"  ohlc={'on' if use_ohlc else 'off'}]")
     results = []
-    s_no_date, s_old, s_gain, s_data, s_shadow = 0, 0, 0, 0, 0
-    low_gain_tickers: list[str] = []
-    shadow_skip_tickers: list[str] = []
+    s_gain, s_data, s_shadow = 0, 0, 0
+    no_data_list: list[str] = []
+    shadow_skip_list: list[str] = []
 
-    for ticker in tqdm(all_candidates, ncols=80):
-        if ticker in SEED_WITH_DATES:
-            try:
-                ipo_d = datetime.strptime(SEED_WITH_DATES[ticker], "%Y-%m-%d").date()
-            except ValueError:
-                ipo_d = None
-        else:
-            ipo_d = get_ipo_date(ticker, ipo_window=ipo_window)
-
-        if ipo_d is None:
-            s_no_date += 1; continue
-        if ipo_d < cutoff:
-            s_old += 1; continue
+    for ticker, ipo_ds in tqdm(all_candidates, ncols=80):
+        try:
+            ipo_d = datetime.strptime(ipo_ds, "%Y-%m-%d").date()
+        except ValueError:
+            continue
 
         df = fetch_history(ticker)
         if df.empty:
-            s_data += 1; continue
+            s_data += 1
+            no_data_list.append(ticker)
+            continue
 
         sliced = slice_ipo(df, ipo_d, n_days)
         if len(sliced) < 2:
-            s_data += 1; continue
+            s_data += 1
+            no_data_list.append(ticker)
+            continue
 
         closes = sliced["Close"].values.astype(float)
         gain = (closes[-1] - closes[0]) / closes[0] * 100
         if gain < min_gain_pct:
             s_gain += 1
-            low_gain_tickers.append(f"{ticker}({gain:+.1f}%)")
             continue
 
-        # Upper-shadow filter on Day-1
         if shadow_filter:
-            if not has_day1_upper_shadow(df, ipo_d, shadow_ratio):
+            if not check_shadow_filter(df, ipo_d, shadow_ratio, require_green):
                 s_shadow += 1
-                shadow_skip_tickers.append(ticker)
+                shadow_skip_list.append(ticker)
                 continue
 
-        if use_ohlc:
-            cand_norm = normalize_ohlc(sliced)
-        else:
-            cand_norm = normalize_close(closes)
-
+        cand_norm = normalize_ohlc(sliced) if use_ohlc else normalize_close(closes)
         if len(cand_norm) < 2:
-            s_data += 1; continue
+            s_data += 1
+            continue
 
-        # Day-1 shadow stats for reporting
-        day1_shadow_ratio = 0.0
-        day1_green = False
-        if "Open" in sliced.columns and "High" in sliced.columns:
-            r0 = sliced.iloc[0]
-            o, h, l, c = float(r0["Open"]), float(r0["High"]), float(r0["Low"]), float(r0["Close"])
-            day_range = h - l
-            if day_range > 1e-9:
-                day1_shadow_ratio = (h - max(o, c)) / day_range
-                day1_green = c > o
+        # Day-1 stats
+        day1_shadow, day1_green = 0.0, False
+        if {"Open", "High", "Low", "Close"}.issubset(sliced.columns):
+            day1_shadow, day1_green = candle_stats(sliced.iloc[0])
 
         results.append({
             "ticker":            ticker,
-            "ipo_date":          str(ipo_d),
+            "ipo_date":          ipo_ds,
             "gain_pct_3d":       round(gain, 2),
             "similarity":        round(score(target_norm, cand_norm), 4),
             "day1_green":        day1_green,
-            "day1_shadow_ratio": round(day1_shadow_ratio, 3),
+            "day1_shadow_ratio": round(day1_shadow, 3),
             "closes":            closes.tolist(),
             "norm":              cand_norm.tolist(),
         })
 
     print(f"  Matched : {len(results)}")
-    print(f"  Skipped : no_date={s_no_date} too_old={s_old} "
-          f"low_gain={s_gain} no_data={s_data} no_shadow={s_shadow}")
-    if low_gain_tickers and min_gain_pct > 0:
-        print(f"  low_gain tickers ({min_gain_pct:.0f}% threshold):")
-        print(f"    {', '.join(low_gain_tickers)}")
-    if shadow_skip_tickers:
-        print(f"  shadow_skip ({len(shadow_skip_tickers)} tickers — no upper shadow or red Day-1):")
-        print(f"    {', '.join(shadow_skip_tickers[:30])}")
+    print(f"  Skipped : low_gain={s_gain}  no_data={s_data}  no_shadow={s_shadow}")
+    if no_data_list:
+        print(f"  no_data  : {', '.join(no_data_list[:20])}" +
+              (f" ... (+{len(no_data_list)-20})" if len(no_data_list) > 20 else ""))
+    if shadow_skip_list:
+        print(f"  shadow_skip ({len(shadow_skip_list)}): {', '.join(shadow_skip_list[:25])}" +
+              (f" ... (+{len(shadow_skip_list)-25})" if len(shadow_skip_list) > 25 else ""))
 
     if not results:
-        print("\n  No matches found.  Suggestions:")
+        print("\n  No matches. Suggestions:")
+        print("    --shadow_ratio 0.15    loosen shadow threshold")
+        print("    --no_green             allow red Day-1 candles")
         print("    --min_gain 0           disable gain filter")
         print("    --ipo_window 3650      widen date window")
-        print("    --shadow_ratio 0.15    loosen shadow requirement")
         return
 
     # ---- 4. Output ----
@@ -680,16 +670,17 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
     top = df_out.head(top_n)
     label = f"{target_ticker}{'_DEMO' if demo_mode else ''}"
 
-    # Print table
-    display_cols = ["ticker", "ipo_date", "gain_pct_3d", "similarity", "day1_green", "day1_shadow_ratio"]
+    display_cols = ["ticker", "ipo_date", "gain_pct_3d", "similarity",
+                    "day1_green", "day1_shadow_ratio"]
     print("\n" + "=" * 80)
     print(f"  TOP {top_n} SIMILAR IPOs — {label}  (first {n_days} days)")
-    print(f"  shadow_filter={shadow_filter}  ohlc_score={use_ohlc}")
+    print(f"  shadow_filter={shadow_filter}  require_green={require_green}  ohlc_score={use_ohlc}")
     print("=" * 80)
     print(top[display_cols].to_string(index=False))
     print("=" * 80)
 
-    csv_path = OUT_DIR / f"similar_ipos_{label.replace('.','_')}.csv"
+    safe = label.replace(".", "_")
+    csv_path = OUT_DIR / f"similar_ipos_{safe}.csv"
     top.drop(columns=["closes", "norm"]).to_csv(csv_path, index=False)
     print(f"  CSV   -> {csv_path}")
     _plot(target_norm, raw_closes, top, label, n_days, use_ohlc)
@@ -705,7 +696,7 @@ def _plot(target_norm, raw_closes, top, label, n_days, use_ohlc):
     score_type = "OHLC 4-dim" if use_ohlc else "close z-score"
     fig.suptitle(
         f"IPO FOMO Pattern Match  ·  {label}  (first {n_days} days)  [{score_type}]",
-        color="#e8e6e0", fontsize=13, fontweight="bold", y=0.98
+        color="#e8e6e0", fontsize=13, fontweight="bold", y=0.98,
     )
     gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2.2], hspace=0.45)
     cmap = matplotlib.colormaps.get_cmap("plasma").resampled(max(n_show, 1))
@@ -721,7 +712,7 @@ def _plot(target_norm, raw_closes, top, label, n_days, use_ohlc):
         ax1.text(xs[i], v + 0.3, f"+{v:.1f}%", ha="center", va="bottom",
                  color="#fcd34d", fontsize=9, fontweight="bold")
     ax1.axhline(0, color="#4a4a5a", lw=0.8, ls="--")
-    ax1.set_title(f"{label}  —  % gain from IPO open", color="#9ca3af", fontsize=10)
+    ax1.set_title(f"{label} — % gain from IPO open", color="#9ca3af", fontsize=10)
     ax1.set_xlabel("Trading Day", color="#6b7280", fontsize=9)
     ax1.set_ylabel("% from open", color="#6b7280", fontsize=9)
     ax1.tick_params(colors="#6b7280")
@@ -730,33 +721,26 @@ def _plot(target_norm, raw_closes, top, label, n_days, use_ohlc):
 
     ax2 = fig.add_subplot(gs[1])
     ax2.set_facecolor("#1a1a22")
-
-    # For OHLC norm, plot length = n_days*4; close norm = n_days
-    # Use close-only norm for visual comparison even if scoring was OHLC
     for i, row in enumerate(top.head(n_show).itertuples()):
         nv = np.array(row.norm)
         if len(nv) > n_days + 1:
-            # OHLC flattened — pick Close index (index 3, 7, 11, ...)
-            close_idx = [3 + 4*k for k in range(n_days) if 3 + 4*k < len(nv)]
+            close_idx = [3 + 4 * k for k in range(n_days) if 3 + 4 * k < len(nv)]
             nv_plot = nv[close_idx]
         else:
             nv_plot = nv
-        shadow_tag = f"  sh={row.day1_shadow_ratio:.0%}{'↑' if row.day1_green else '↓'}"
-        ax2.plot(range(1, len(nv_plot)+1), nv_plot,
-                 color=cmap(i / max(n_show - 1, 1)),
-                 alpha=0.75, lw=1.5,
-                 label=f"{row.ticker} ({row.ipo_date})  {row.similarity:.3f}  +{row.gain_pct_3d}%{shadow_tag}")
+        tag = f"  sh={row.day1_shadow_ratio:.0%}{'↑' if row.day1_green else '↓'}"
+        ax2.plot(range(1, len(nv_plot) + 1), nv_plot,
+                 color=cmap(i / max(n_show - 1, 1)), alpha=0.75, lw=1.5,
+                 label=f"{row.ticker} ({row.ipo_date})  {row.similarity:.3f}  +{row.gain_pct_3d}%{tag}")
 
-    # Target close norm
-    t_norm_plot = target_norm
-    if len(t_norm_plot) > n_days + 1:
-        close_idx = [3 + 4*k for k in range(n_days) if 3 + 4*k < len(t_norm_plot)]
-        t_norm_plot = t_norm_plot[close_idx]
-    ax2.plot(range(1, len(t_norm_plot)+1), t_norm_plot,
+    t_plot = target_norm
+    if len(t_plot) > n_days + 1:
+        close_idx = [3 + 4 * k for k in range(n_days) if 3 + 4 * k < len(t_plot)]
+        t_plot = t_plot[close_idx]
+    ax2.plot(range(1, len(t_plot) + 1), t_plot,
              color="#f59e0b", lw=2.8, ls="--", label=f"{label} (target)")
-
     ax2.axhline(0, color="#4a4a5a", lw=0.8, ls="--")
-    ax2.set_title(f"Top {n_show} similar patterns (z-score normalized)  sh=Day-1 shadow ratio",
+    ax2.set_title(f"Top {n_show} similar (sh=shadow ratio, ↑=green ↓=red Day-1)",
                   color="#9ca3af", fontsize=10)
     ax2.set_xlabel("Trading Day", color="#6b7280", fontsize=9)
     ax2.set_ylabel("Z-score", color="#6b7280", fontsize=9)
@@ -778,34 +762,41 @@ def _plot(target_norm, raw_closes, top, label, n_days, use_ohlc):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="IPO FOMO pattern scanner v7")
-    p.add_argument("--target",       default=DEFAULT_TARGET)
-    p.add_argument("--days",         type=int,   default=DEFAULT_DAYS)
-    p.add_argument("--top",          type=int,   default=DEFAULT_TOP)
-    p.add_argument("--ipo_window",   type=int,   default=DEFAULT_IPO_WINDOW)
-    p.add_argument("--min_gain",     type=float, default=DEFAULT_MIN_GAIN)
+    p = argparse.ArgumentParser(description="IPO FOMO pattern scanner v8")
+    p.add_argument("--target",        default=DEFAULT_TARGET)
+    p.add_argument("--days",          type=int,   default=DEFAULT_DAYS)
+    p.add_argument("--top",           type=int,   default=DEFAULT_TOP)
+    p.add_argument("--ipo_window",    type=int,   default=DEFAULT_IPO_WINDOW)
+    p.add_argument("--min_gain",      type=float, default=DEFAULT_MIN_GAIN)
     p.add_argument("--shadow_filter", action="store_true",
-                   help="Only keep candidates with Day-1 upper shadow + green candle")
-    p.add_argument("--shadow_ratio", type=float, default=DEFAULT_SHADOW_RATIO,
-                   help="Min upper_shadow / day_range (default 0.30 = 30%%)")
-    p.add_argument("--ohlc_score",   action="store_true",
-                   help="Score using OHLC 4-dim pattern instead of close-only")
-    p.add_argument("--no_cache",     action="store_true")
+                   help="Keep only candidates with Day-1 upper shadow >= shadow_ratio")
+    p.add_argument("--shadow_ratio",  type=float, default=DEFAULT_SHADOW_RATIO,
+                   help="Min upper_shadow / day_range (default 0.25)")
+    p.add_argument("--no_green",      action="store_true",
+                   help="With --shadow_filter: allow red-candle Day-1 (only checks shadow size)")
+    p.add_argument("--ohlc_score",    action="store_true",
+                   help="Score with OHLC 4-dim pattern instead of close-only")
+    p.add_argument("--sample",        type=int,   default=None,
+                   help="Randomly subsample N candidates before scoring (run multiple times)")
+    p.add_argument("--no_cache",      action="store_true")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     if args.no_cache and CACHE_DIR.exists():
-        import shutil; shutil.rmtree(CACHE_DIR)
+        import shutil
+        shutil.rmtree(CACHE_DIR)
         print("Cache cleared.")
     run_scan(
-        target_ticker  = args.target,
-        n_days         = args.days,
-        top_n          = args.top,
-        ipo_window     = args.ipo_window,
-        min_gain_pct   = args.min_gain,
-        shadow_filter  = args.shadow_filter,
-        shadow_ratio   = args.shadow_ratio,
-        use_ohlc       = args.ohlc_score,
+        target_ticker = args.target,
+        n_days        = args.days,
+        top_n         = args.top,
+        ipo_window    = args.ipo_window,
+        min_gain_pct  = args.min_gain,
+        shadow_filter = args.shadow_filter,
+        shadow_ratio  = args.shadow_ratio,
+        require_green = not args.no_green,
+        use_ohlc      = args.ohlc_score,
+        sample_n      = args.sample,
     )
