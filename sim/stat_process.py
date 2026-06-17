@@ -1,7 +1,32 @@
 """
-stat_process.py  v56.1
+stat_process.py  v57
 ====================
 純統計過程模型，完全不使用 agent。
+
+v57: Revert global pass to v54 logic; drop _global_kurtosis_inject.
+
+     Root causes of v56 global pass regression:
+       R1. _global_kurtosis_inject G1 tail-clip operated on final_rets
+           (raw scale, ~0.01/bar), NOT on z-score space.  The threshold
+           tail_clip_z=6 was therefore never triggered (typical |final_ret|
+           << 1.0 << 6.0), making G1 a no-op.
+       R2. G2 injection also ran in raw-scale space, so injected magnitude
+           _GLOBAL_INJECT_Z=3.5 → 3.5×0.01 = 0.035 per bar, far too small
+           to move kurtosis.
+       R3. v56 removed _kurtosis_topup from the global pass entirely.
+           Per-window _kurtosis_topup is fine (runs in z-score space), but
+           the global topup was the primary correction stage; removing it
+           left residual kurtosis deficit uncorrected.
+
+     Fix (v57):
+       - Restore v54 global pass pipeline:
+           1. mean_raw_target_ek = mean(target_ek over param_log) / _EK_OVERSAMPLE
+           2. _kurtosis_topup(final_rets_z, target_ek=mean_raw_target_ek, ...)
+              where final_rets_z is normalised to z-score space (std≈1)
+           3. _skew_post_shift(z, clamp=0.30) immediately after topup
+           4. Rescale back to raw scale
+           5. Post-fix std guard: pin std == real_global_std
+       - _global_kurtosis_inject kept in file but DEPRECATED / not called.
 
 v56.1: Fix SyntaxError in OnlineRidgePredictor.predict_correction (line 775):
        np.array(self._y_ek] → np.array(self._y_ek)
@@ -19,27 +44,6 @@ v56: Fix kurtosis=783 / skew=-27 explosion introduced by v55 global topup.
        B3. jump_std_norm = mean_jump_std / topup_std sometimes >> 10
            (mean_jump_std from raw-scale param_log is e.g. 0.05;
             topup_std ≈ 0.016 → ratio 3.1, but occasionally 8–12).
-
-     Fix (v56): replace the dangerous _kurtosis_topup call in the global
-     post-concat pass with a two-step safe injection:
-
-       Step G1 — soft tail-clip in z-score space.
-         Cap |z| > TAIL_CLIP_Z (default 6.0).  Clipped values are scaled
-         to TAIL_CLIP_Z * U[1.0, 1.05] to keep a little randomness.
-         This prevents any single point from dominating the 4th moment.
-
-       Step G2 — light targeted injection.
-         Compute true_target_ek = mean of RAW observed ek from param_log
-         (not the oversampled target_ek field — use ret_skew_raw-adjacent
-         field; we store raw_ek = target_ek / _EK_OVERSAMPLE).
-         If realised_ek < 0.6 * true_target_ek, inject at most N_INJECT=5
-         draws of exactly INJECT_Z=3.5 σ (sign = sign of skew target if
-         non-zero, else alternating ±).  Each draw is a fixed-magnitude
-         injection capped at INJECT_Z_MAX=4.0, so no explosion is possible.
-
-       Step G3 — skew post-shift (unchanged from v55, clamp=0.30).
-
-     All per-window generate() logic unchanged from v54/v55.
 
 v55: Fix three root-cause bugs in rolling_fit_generate's topup pipeline
      (root causes discovered after v54 shipped: std=0.99998, skew=-10.56,
@@ -236,11 +240,11 @@ _NCT_NC_MAX   = 8.0
 # v53 Fix B: pipeline degrades kurtosis ~55%; pre-amplify target_ek by this factor
 _EK_OVERSAMPLE = 1.8
 
-# v56 global-pass safety constants
-_GLOBAL_TAIL_CLIP_Z  = 6.0   # hard cap |z| in z-score space (prevents explosion)
-_GLOBAL_N_INJECT     = 5     # max injected outliers in global pass
-_GLOBAL_INJECT_Z     = 3.5   # magnitude of each injected point (z units)
-_GLOBAL_INJECT_Z_MAX = 4.0   # hard cap on any single injected z value
+# v56 global-pass safety constants (kept for reference; _global_kurtosis_inject is DEPRECATED)
+_GLOBAL_TAIL_CLIP_Z  = 6.0
+_GLOBAL_N_INJECT     = 5
+_GLOBAL_INJECT_Z     = 3.5
+_GLOBAL_INJECT_Z_MAX = 4.0
 
 
 def _df_from_ek(target_ek: float) -> float:
@@ -350,10 +354,15 @@ def _kurtosis_topup(
 ) -> np.ndarray:
     """
     v54 Fix B: Additive jump injection to restore kurtosis.
-    Used ONLY inside per-window generate().  NOT used in the global
-    post-concat pass (v56: global pass uses _global_kurtosis_inject instead).
 
-    Input rets should be in z-score space (std≈1) when called from generate().
+    Used in BOTH per-window generate() AND the global post-concat pass
+    (v57: global pass restored to v54 logic).
+
+    Input rets should be in z-score space (std≈1).
+
+    The global pass caller must:
+      - pass target_ek = mean_raw_target_ek (= mean(target_ek)/EK_OVERSAMPLE)
+      - pass jump_std  = mean_jump_std_norm  (= mean(jump_std)/topup_std)
     """
     if len(rets) < 4:
         return rets
@@ -388,26 +397,20 @@ def _global_kurtosis_inject(
     trigger_frac:    float = 0.60,
 ) -> np.ndarray:
     """
-    v56: Safe global kurtosis correction in z-score space (std≈1).
+    DEPRECATED (v57): this function is NOT called anywhere.
 
-    Two sub-steps:
-      G1. Soft tail-clip: clamp |z| > _GLOBAL_TAIL_CLIP_Z to
-          _GLOBAL_TAIL_CLIP_Z * U[1.0, 1.05].  Prevents runaway outliers
-          while keeping the distribution fat-tailed.
+    v56 attempted a two-step safe injection (G1 tail-clip + G2 injection),
+    but the caller passed raw-scale final_rets instead of z-score space,
+    making both G1 and G2 ineffective.  Kept for reference only.
 
-      G2. Light injection: if realised_ek < trigger_frac * true_target_ek,
-          inject at most _GLOBAL_N_INJECT points of magnitude _GLOBAL_INJECT_Z.
-          Sign follows skew_target if |skew_target| > 0.1, else alternating ±1.
-          Each injected value is hard-capped at _GLOBAL_INJECT_Z_MAX.
-
-    Returns modified z (still approx std=1 after re-normalise by caller).
+    Use _kurtosis_topup() for global pass corrections instead.
     """
     if len(z) < 4:
         return z
 
     out = z.copy()
 
-    # G1: soft tail-clip
+    # G1: soft tail-clip (ineffective when z is raw-scale, ~0.01/bar)
     abs_z    = np.abs(out)
     clip_ix  = np.where(abs_z > _GLOBAL_TAIL_CLIP_Z)[0]
     if len(clip_ix) > 0:
@@ -427,7 +430,6 @@ def _global_kurtosis_inject(
     signs    = np.array([sign_val * (1 if i % 2 == 0 else -1) for i in range(n_inject)])
 
     inject_z = float(np.clip(_GLOBAL_INJECT_Z, 0.0, _GLOBAL_INJECT_Z_MAX))
-    # Place at the n_inject positions with largest |z| (amplify existing tails)
     large_ix = np.argsort(np.abs(out))[-n_inject:]
     for k, ix in enumerate(large_ix):
         new_val = float(np.sign(out[ix]) if abs(out[ix]) > 0.1 else signs[k]) * inject_z
@@ -570,7 +572,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v56 — unchanged from v54/v55)
+# 2. GENERATE  (unchanged from v54/v55/v56)
 #
 # 管線：
 #   Step 1  採樣 nct with iterative nc correction
@@ -991,17 +993,17 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v56: Safe global kurtosis + skew correction
+        # v57: Global kurtosis + skew correction (restored to v54 logic)
         #
-        # Pipeline (all operations in std=1 normalised space):
+        # Pipeline (all in z-score space, std≈1):
         #   1. Extract final_rets after drift alignment
-        #   2. Compute true_target_ek = mean of RAW observed ek from
-        #      param_log (= target_ek / _EK_OVERSAMPLE per window)
-        #   3. Normalise to z-score space (mean=0, std=1)
-        #   4. _global_kurtosis_inject:
-        #        G1. soft tail-clip |z| > 6 → no explosion possible
-        #        G2. inject ≤5 points of magnitude 3.5σ only if needed
-        #   5. Re-normalise z after injection
+        #   2. mean_raw_target_ek = mean(target_ek) / _EK_OVERSAMPLE
+        #      (correct: compare realised ek against RAW target, not oversampled)
+        #   3. mean_jump_std_norm = mean(jump_std) / topup_std
+        #      (normalise jump_std to z-score units)
+        #   4. Normalise final_rets → z-score space
+        #   5. _kurtosis_topup(z, target_ek=mean_raw_target_ek,
+        #                         jump_std=mean_jump_std_norm, ...)
         #   6. _skew_post_shift(z, clamp=0.30)
         #   7. Rescale back to raw scale
         #   8. Post-fix std guard: pin std == real_global_std
@@ -1009,15 +1011,6 @@ def rolling_fit_generate(
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
-
-        # true_target_ek: use RAW observed ek (remove oversample factor)
-        raw_ek_vals = [
-            p.get("target_ek", 3.0) / _EK_OVERSAMPLE
-            for p in param_log
-            if not p.get("_summary") and p.get("target_ek") is not None
-        ]
-        true_target_ek = float(np.mean(raw_ek_vals)) if raw_ek_vals else 3.0
-        true_target_ek = float(np.clip(true_target_ek, 1.0, _TARGET_EK_MAX))
 
         # Normalise to z-score space
         topup_mu  = float(np.mean(final_rets))
@@ -1027,24 +1020,40 @@ def rolling_fit_generate(
 
         z_norm = (final_rets - topup_mu) / topup_std
 
-        # G1 + G2: safe injection (no explosion possible)
+        # mean_raw_target_ek: remove oversample factor so comparison is apples-to-apples
+        raw_ek_vals = [
+            p.get("target_ek", 3.0) / _EK_OVERSAMPLE
+            for p in param_log
+            if not p.get("_summary") and p.get("target_ek") is not None
+        ]
+        mean_raw_target_ek = float(np.mean(raw_ek_vals)) if raw_ek_vals else 3.0
+        mean_raw_target_ek = float(np.clip(mean_raw_target_ek, 1.0, _TARGET_EK_MAX))
+
+        # mean_jump_std in z-score units
+        jump_std_vals = [
+            p.get("jump_std", 0.0)
+            for p in param_log
+            if not p.get("_summary") and p.get("jump_std") is not None
+        ]
+        mean_jump_std      = float(np.mean(jump_std_vals)) if jump_std_vals else 0.0
+        mean_jump_std_norm = float(mean_jump_std / topup_std) if topup_std > 1e-10 else 3.0
+        mean_jump_std_norm = float(np.clip(mean_jump_std_norm, 1.0, 6.0))
+
         topup_rng = np.random.default_rng(seed + 9999 if seed is not None else 0)
-        z_injected = _global_kurtosis_inject(
-            z              = z_norm,
-            true_target_ek = true_target_ek,
-            skew_target    = global_skew_target,
-            rng            = topup_rng,
-            trigger_frac   = 0.60,
+
+        z_topup = _kurtosis_topup(
+            rets       = z_norm,
+            target_ek  = mean_raw_target_ek,
+            jump_std   = mean_jump_std_norm,
+            skew_raw   = global_skew_target,
+            rng        = topup_rng,
+            topup_frac = 0.50,
+            max_jumps  = 20,
         )
 
-        # Re-normalise after injection
-        z_inj_std = float(np.std(z_injected))
-        if z_inj_std > 1e-10:
-            z_injected = (z_injected - float(np.mean(z_injected))) / z_inj_std
-
-        # Skew post-shift in z-score space
+        # Skew post-shift in z-score space (clamp=0.30 for global pass)
         z_shifted = _skew_post_shift(
-            z_injected,
+            z_topup,
             target_skew=global_skew_target,
             clamp=0.30,
         )
@@ -1052,7 +1061,7 @@ def rolling_fit_generate(
         # Rescale back to raw scale
         final_rets_fixed = z_shifted * topup_std + topup_mu
 
-        # Post-fix std guard
+        # Post-fix std guard: pin std == real_global_std
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
             std_scale = real_global_std / post_std
