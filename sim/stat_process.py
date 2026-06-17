@@ -1,20 +1,19 @@
 """
-stat_process.py  v69
+stat_process.py  v70
 ====================
+v70:
+  Step 1 — kurtosis p90 fix:
+    - _kurtosis_topup: max_iter 3->6, topup_frac 0.8->0.6
+    - fit(): per-window ek_oversample boost when raw_ek > _HIGH_KURT_THRESHOLD
+    - _global_kurtosis_inject: threshold 0.7->0.5
+
+  Step 2 — block-bootstrap conditional generate:
+    - generate_conditional(): regime-matched block resampling
+      conditioned on last N bars of df_history.
+      Blends bootstrapped path (60%) + parametric (40%).
+    - rolling_fit_generate: new use_conditional=False flag (opt-in).
+
 v69: Fix module-global _ek_decay_ema cross-trial state leak.
-
-  Problem:
-    _ek_decay_ema was a module-level variable, mutated by every call to
-    rolling_fit_generate(). In bench_generalize with 100 sequential trials,
-    each trial inherited the ema left by the previous one, making
-    ek_oversample_adj non-deterministic per symbol and inflating kurt_err
-    variance (especially for high-kurtosis symbols like UNH).
-
-  Fix:
-    _ek_decay_ema is now a local variable inside rolling_fit_generate(),
-    initialized to ek_decay_ema_init (default 1.0, caller-supplied).
-    The module-level constant is removed.
-
 v68: Pass fwd_bars to calibrator.record() for kurt sample-size discount.
 v67: Per-symbol dynamic soft_clip inner/outer based on median target_ek.
 v66 (P1b): Per-window realised-kurtosis feedback into calibrator context.
@@ -197,8 +196,9 @@ def _fit_volume_params(df: pd.DataFrame, log_rets: np.ndarray):
 # 1. FIT
 # ---------------------------------------------------------------------------
 
-_TARGET_EK_MAX = 60.0   # v65: raised from 30.0
-_EK_OVERSAMPLE = 3.2
+_TARGET_EK_MAX    = 60.0   # v65: raised from 30.0
+_EK_OVERSAMPLE    = 3.2
+_HIGH_KURT_THRESHOLD = 8.0  # v70: raw_ek above this gets extra boost
 
 
 def fit(
@@ -224,7 +224,14 @@ def fit(
         warnings.simplefilter("ignore")
         ek       = float(stats.kurtosis(log_rets))
         skew_raw = float(stats.skew(log_rets))
-    raw_ek    = float(np.clip(ek, ek_global_floor, _TARGET_EK_MAX))
+    raw_ek = float(np.clip(ek, ek_global_floor, _TARGET_EK_MAX))
+
+    # v70 Step1: boost ek_oversample for high-kurtosis windows
+    if raw_ek > _HIGH_KURT_THRESHOLD:
+        # linearly ramp from 1.0x at threshold to 1.5x at 3x threshold
+        boost = 1.0 + 0.5 * float(np.clip((raw_ek - _HIGH_KURT_THRESHOLD) / (2 * _HIGH_KURT_THRESHOLD), 0.0, 1.0))
+        ek_oversample = ek_oversample * boost
+
     target_ek = float(np.clip(raw_ek * ek_oversample, ek_global_floor, _TARGET_EK_MAX))
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
@@ -253,7 +260,7 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE
+# 2. GENERATE  (parametric)
 # ---------------------------------------------------------------------------
 
 def _df_from_ek(target_ek: float) -> float:
@@ -285,8 +292,8 @@ def _kurtosis_topup(
     rets:       np.ndarray,
     target_ek:  float,
     rng:        np.random.Generator,
-    topup_frac: float = 0.8,
-    max_iter:   int   = 3,
+    topup_frac: float = 0.60,   # v70 Step1: 0.80 -> 0.60 (inject earlier)
+    max_iter:   int   = 6,      # v70 Step1: 3 -> 6
 ) -> np.ndarray:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -317,7 +324,7 @@ def _global_kurtosis_inject(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realised_ek = float(stats.kurtosis(rets))
-    if realised_ek >= 0.7 * true_target_ek:
+    if realised_ek >= 0.5 * true_target_ek:   # v70 Step1: 0.7 -> 0.5
         return rets
     deficit = true_target_ek - realised_ek
     n_spikes = max(2, int(len(rets) * 0.005))
@@ -423,6 +430,172 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
+# 2b. GENERATE_CONDITIONAL  (v70 Step 2: block-bootstrap)
+# ---------------------------------------------------------------------------
+
+def _detect_regime(log_rets: np.ndarray, n_recent: int = 10) -> Dict[str, Any]:
+    """
+    Characterise recent regime for block matching.
+    Returns a dict with:
+      - hurst: float
+      - vol_ratio: recent_vol / global_vol  (>1 = vol expansion)
+      - momentum: sign of recent cumulative return  (+1/-1)
+      - vol_level: recent vol (absolute)
+    """
+    if len(log_rets) < n_recent + 5:
+        return {"hurst": 0.5, "vol_ratio": 1.0, "momentum": 0, "vol_level": float(np.std(log_rets))}
+    recent = log_rets[-n_recent:]
+    global_vol = float(np.std(log_rets)) + 1e-10
+    recent_vol = float(np.std(recent)) + 1e-10
+    h = hurst_exponent(log_rets, min_len=20)
+    return {
+        "hurst":      h,
+        "vol_ratio":  recent_vol / global_vol,
+        "momentum":   int(np.sign(float(np.sum(recent)))),
+        "vol_level":  recent_vol,
+    }
+
+
+def _score_block_regime_match(
+    block_rets: np.ndarray,
+    target_regime: Dict[str, Any],
+) -> float:
+    """
+    Score how well a candidate block matches the target regime.
+    Lower = better match. Returns a non-negative distance.
+    """
+    if len(block_rets) < 3:
+        return 1e9
+    h_block    = hurst_exponent(block_rets, min_len=4) if len(block_rets) >= 8 else 0.5
+    vol_block  = float(np.std(block_rets)) + 1e-10
+    mom_block  = int(np.sign(float(np.sum(block_rets))))
+    vol_target = float(target_regime["vol_level"]) + 1e-10
+
+    d_hurst = abs(h_block - float(target_regime["hurst"])) / 0.4          # normalise by hurst range
+    d_vol   = abs(vol_block / vol_target - float(target_regime["vol_ratio"])) / 1.0
+    d_mom   = 0.0 if mom_block == int(target_regime["momentum"]) or target_regime["momentum"] == 0 else 0.5
+    return d_hurst + 0.5 * d_vol + 0.3 * d_mom
+
+
+def generate_conditional(
+    df_history:  pd.DataFrame,
+    params:      StatParams,
+    n_bars:      int,
+    start_price: float = 100.0,
+    rng:         Optional[np.random.Generator] = None,
+    block_size:  int   = 10,
+    n_candidates: int  = 30,
+    bootstrap_weight: float = 0.60,
+    regime_window: int = 15,
+) -> pd.DataFrame:
+    """
+    v70 Step 2: Regime-conditioned block-bootstrap generator.
+
+    Algorithm:
+      1. Detect regime from the last `regime_window` bars of df_history.
+      2. Slide a window of size `block_size` across all of df_history;
+         score each candidate block by regime match.
+      3. Sample blocks proportionally to match quality (soft-min weighting).
+      4. Stitch bootstrap path + rescale to match params.ret_std.
+      5. Blend with parametric generate() at ratio bootstrap_weight:(1-bootstrap_weight).
+      6. Rescale blended path to start_price and match ret_std.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    hist_closes = df_history["Close"].values.astype(float)
+    hist_rets   = _log_returns(hist_closes)
+
+    regime = _detect_regime(hist_rets, n_recent=regime_window)
+
+    # --- collect candidate blocks and score ---
+    n_hist = len(hist_rets)
+    min_blocks_needed = max(n_bars // block_size + 1, 3)
+
+    if n_hist < block_size + 2:
+        # fallback: not enough history for block bootstrap
+        return generate(params, n_bars, start_price=start_price, rng=rng)
+
+    scores: List[float] = []
+    block_starts: List[int] = []
+    for i in range(0, n_hist - block_size, max(1, block_size // 2)):
+        b = hist_rets[i:i + block_size]
+        s = _score_block_regime_match(b, regime)
+        scores.append(s)
+        block_starts.append(i)
+
+    if not scores:
+        return generate(params, n_bars, start_price=start_price, rng=rng)
+
+    scores_arr = np.array(scores, dtype=float)
+    # convert distance -> weight: lower score = higher weight
+    # use softmin: w_i = exp(-score_i) / sum
+    inv_scores = np.exp(-scores_arr * 3.0)  # temperature=1/3
+    inv_scores = inv_scores / (inv_scores.sum() + 1e-10)
+
+    # --- bootstrap blocks to fill n_bars ---
+    n_blocks_needed = n_bars // block_size + 2
+    chosen_starts = rng.choice(
+        len(block_starts),
+        size=n_blocks_needed,
+        replace=True,
+        p=inv_scores,
+    )
+    bootstrap_rets = np.concatenate(
+        [hist_rets[block_starts[k]:block_starts[k] + block_size] for k in chosen_starts]
+    )[:n_bars]
+
+    # rescale bootstrapped rets to match params.ret_std
+    bs_std = float(np.std(bootstrap_rets)) + 1e-10
+    target_std = float(params["ret_std"])
+    bootstrap_rets = bootstrap_rets / bs_std * target_std
+    # centre around params.ret_mu
+    bootstrap_rets = bootstrap_rets - float(np.mean(bootstrap_rets)) + float(params["ret_mu"])
+
+    # --- parametric path ---
+    df_param = generate(params, n_bars, start_price=start_price, rng=rng)
+    param_closes = df_param["Close"].values.astype(float)
+    param_rets   = _log_returns(param_closes)
+    if len(param_rets) < n_bars:
+        param_rets = np.pad(param_rets, (0, n_bars - len(param_rets)), mode="edge")
+
+    # --- blend ---
+    w_b = bootstrap_weight
+    w_p = 1.0 - bootstrap_weight
+    blended_rets = w_b * bootstrap_rets + w_p * param_rets[:n_bars]
+
+    # --- rescale blended to target_std ---
+    bl_std = float(np.std(blended_rets)) + 1e-10
+    blended_rets = blended_rets / bl_std * target_std
+    blended_rets = blended_rets - float(np.mean(blended_rets)) + float(params["ret_mu"])
+
+    # --- reconstruct price path ---
+    prices = np.empty(n_bars + 1)
+    prices[0] = start_price
+    for i in range(n_bars):
+        prices[i + 1] = prices[i] * np.exp(blended_rets[i])
+    prices = np.maximum(prices, 1e-4)
+
+    opens  = prices[:-1]
+    closes = prices[1:]
+
+    # reuse param df for OHLV structure (highs/lows/volumes already computed)
+    price_ratio = closes / np.maximum(param_closes[:n_bars], 1e-10)
+    highs   = df_param["High"].values[:n_bars].astype(float)   * price_ratio
+    lows    = df_param["Low"].values[:n_bars].astype(float)    * price_ratio
+    lows    = np.maximum(lows, opens * 0.01)
+    volumes = df_param["Volume"].values[:n_bars]
+
+    return pd.DataFrame({
+        "Open":   opens,
+        "High":   highs,
+        "Low":    lows,
+        "Close":  closes,
+        "Volume": volumes,
+    })
+
+
+# ---------------------------------------------------------------------------
 # 3. ONLINE RIDGE PREDICTOR
 # ---------------------------------------------------------------------------
 
@@ -500,7 +673,7 @@ class OnlineRidgePredictor:
 
 _EK_DECAY_EMA_ALPHA = 0.20
 
-_SOFT_CLIP_INNER = 3.0   # default fallback for callers without param_log
+_SOFT_CLIP_INNER = 3.0
 _SOFT_CLIP_OUTER = 6.0
 _SKEW_ANCHOR_BAND = 0.30
 
@@ -535,10 +708,11 @@ def rolling_fit_generate(
     verbose:    bool  = True,
     calibrator          = None,
     predictor           = None,
-    ek_decay_ema_init:  float = 1.0,   # v69: caller-supplied initial ema (default clean)
+    ek_decay_ema_init:  float = 1.0,
+    use_conditional:    bool  = False,   # v70 Step2: opt-in block-bootstrap
+    bootstrap_weight:   float = 0.60,    # blend ratio for generate_conditional
 ) -> Tuple[pd.DataFrame, List[Dict]]:
-    # v69: ek_decay_ema is now a LOCAL variable — no module-level state leak
-    # between sequential bench_generalize trials.
+    # v69: ek_decay_ema is local — no cross-trial state leak
     ek_decay_ema: float = float(ek_decay_ema_init)
 
     rng = np.random.default_rng(seed)
@@ -615,7 +789,18 @@ def rolling_fit_generate(
         else:
             start_price = float(df_real["Open"].iloc[fwd_start])
 
-        df_sim = generate(params, n_bars=fwd_bars, start_price=start_price, rng=rng)
+        # v70 Step2: choose generator
+        if use_conditional:
+            df_sim = generate_conditional(
+                df_history       = df_real.iloc[:fit_end].copy().reset_index(drop=True),
+                params           = params,
+                n_bars           = fwd_bars,
+                start_price      = start_price,
+                rng              = rng,
+                bootstrap_weight = bootstrap_weight,
+            )
+        else:
+            df_sim = generate(params, n_bars=fwd_bars, start_price=start_price, rng=rng)
 
         result_chunks.append(df_sim)
 
@@ -675,15 +860,16 @@ def rolling_fit_generate(
         c_err  = (sim_c - real_c) / (real_c + 1e-10)
 
         if verbose:
-            kurt_str = f"{kurt_err:.2f}" if np.isfinite(kurt_err) else "N/A"
+            kurt_str  = f"{kurt_err:.2f}" if np.isfinite(kurt_err) else "N/A"
             calib_str = f"  [calib n={calibrator.n_experiences}]" if calibrator else ""
+            cond_str  = "  [cond]" if use_conditional else ""
             print(
                 f"[stat] w{window_idx:3d}"
                 f"  std={params['ret_std']:.4f}  ek={params['target_ek']:.2f}"
                 f"  ek_adj={ek_oversample_adj:.2f}  ek_init={ek_oversample_init if calibrator else '---'}"
                 f"  kurt_err={kurt_str}"
                 f"  c_err={c_err:+.3f}"
-                f"{calib_str}"
+                f"{calib_str}{cond_str}"
             )
 
         param_log.append({
@@ -703,6 +889,7 @@ def rolling_fit_generate(
             "hurst_err":         hurst_err if np.isfinite(hurst_err) else None,
             "dir_hit":           dir_hit,
             "c_err":             c_err,
+            "use_conditional":   use_conditional,
         })
 
         window_idx += 1
