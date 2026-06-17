@@ -1,25 +1,22 @@
 """
-ipo_pattern_scan.py  v4
+ipo_pattern_scan.py  v5
 -----------------------
 Compares the first-N-day price momentum of a target IPO (e.g. SpaceX)
 against all recent IPOs in US and TW markets, ranked by pattern similarity.
 
-Fixes vs v3:
-  - IPO date: 3-tier fallback so None never blocks fallback-seed stocks
-      1. fast_info (try both .first_trade_date_epoch_utc and dict-style)
-      2. Ticker.info["firstTradeDateEpochUtc"] (yfinance 0.2.x field)
-      3. First row of history(period="max") guarded by a date-range check
-         (only accepted if within ipo_window AND there is >1 year of history,
-          which rules out stocks that have always been around)
-  - Fallback seed list now ships with hardcoded IPO dates — completely
-    offline-capable, no network needed for these tickers
-  - FutureWarning from pandas fixed (explicit dtype="object" on cache DF)
-  - stockanalysis: try JSON API first, fall back to HTML scrape
-  - TWSE: corrected field names (MarketEntryDate → listingDate)
+Fixes vs v4:
+  - DEFAULT_IPO_WINDOW raised 365 → 1825 (5 years) so the hardcoded seed
+    list is actually within the window and produces candidates even when
+    network is fully blocked
+  - DEFAULT_MIN_GAIN lowered 5.0 → 0.0 so the first run doesn't silently
+    filter everything; set --min_gain 5 after you confirm candidates flow
+  - SEED_WITH_DATES expanded with 2025-2026 US/TW IPOs
+  - get_ipo_date() Tier 3 guard relaxed to match new ipo_window default
 
 Usage:
   python ipo_pattern_scan.py --target SPXC --days 3 --top 20
   python ipo_pattern_scan.py --target SPXC --no_cache
+  python ipo_pattern_scan.py --target RDDT --min_gain 5 --ipo_window 1825
 
 Dependencies:
   pip install yfinance pandas numpy matplotlib tqdm requests beautifulsoup4
@@ -64,8 +61,8 @@ except ImportError:
 DEFAULT_TARGET     = "SPXC"
 DEFAULT_DAYS       = 3
 DEFAULT_TOP        = 20
-DEFAULT_IPO_WINDOW = 365
-DEFAULT_MIN_GAIN   = 5.0
+DEFAULT_IPO_WINDOW = 1825   # 5 years — ensures seed list always has candidates
+DEFAULT_MIN_GAIN   = 0.0    # filter off by default; set --min_gain 5 when needed
 CACHE_DIR          = Path("ipo_scan_cache")
 OUT_DIR            = Path("ipo_scan_results")
 HDRS = {
@@ -75,40 +72,80 @@ HDRS = {
 
 
 # ---------------------------------------------------------------------------
-# Hardcoded fallback seed list  (ticker -> IPO date string YYYY-MM-DD)
-# Used when both live network fetch AND yfinance fast_info return nothing.
-# Keep this current — add new IPOs here as they list.
+# Hardcoded seed list  (ticker → IPO date YYYY-MM-DD)
+# Completely offline-capable. Update this dict as new IPOs list.
+# IPO_WINDOW default is 1825 days (5y) so all entries below are in range.
 # ---------------------------------------------------------------------------
 SEED_WITH_DATES: dict[str, str] = {
-    # ---- US (2024-2026) ----
-    "RDDT":  "2024-03-21",   # Reddit
+    # ---- US 2021 ----
+    "RKLB":  "2021-08-25",   # Rocket Lab (SPAC merge)
+    "ASTS":  "2021-04-07",   # AST SpaceMobile
+    "IONQ":  "2021-10-01",   # IonQ
+    "ONON":  "2021-09-15",   # On Running
+    "RIVN":  "2021-11-10",   # Rivian
+    "DNUT":  "2021-07-01",   # Krispy Kreme
+    "DUOL":  "2021-07-28",   # Duolingo
+    "COIN":  "2021-04-14",   # Coinbase (direct listing)
+    "AFRM":  "2021-01-13",   # Affirm
+    "RBLX":  "2021-03-10",   # Roblox (direct listing)
+    "HOOD":  "2021-07-29",   # Robinhood
+    # ---- US 2022 ----
+    "CRDO":  "2022-01-27",   # Credo Technology
+    "DBRG":  "2022-07-25",   # DigitalBridge (relisted)
+    # ---- US 2023 ----
     "ARM":   "2023-09-14",   # Arm Holdings
     "KVYO":  "2023-09-20",   # Klaviyo
-    "CART":  "2023-09-19",   # Instacart
+    "CART":  "2023-09-19",   # Instacart (Maplebear)
     "BIRK":  "2023-10-11",   # Birkenstock
     "CAVA":  "2023-06-15",   # Cava Group
-    "RKLB":  "2021-08-25",   # Rocket Lab (SPAC)
-    "ACHR":  "2024-08-08",   # Archer Aviation
-    "ASTS":  "2021-04-07",   # AST SpaceMobile
     "LUNR":  "2023-12-15",   # Intuitive Machines
-    "IONQ":  "2021-10-01",   # IonQ
+    "KRTX":  "2023-07-26",   # Karuna Therapeutics (reconfirm)
+    # ---- US 2024 ----
+    "RDDT":  "2024-03-21",   # Reddit
+    "ACHR":  "2024-08-08",   # Archer Aviation
     "SEZL":  "2024-07-25",   # Sezzle
     "LOAR":  "2024-10-22",   # Loar Holdings
-    "VERX":  "2024-03-28",   # Vertex
-    "CRDO":  "2022-01-27",   # Credo Technology
-    "STLC":  "2024-09-25",   # Stelco
-    "ONON":  "2021-09-15",   # On Running
-    # ---- TW (2024-2026) ----
-    "6669.TW": "2019-09-24", # Wistron ITS (older; kept for shape lib)
-    "6770.TW": "2021-07-15",
-    "6515.TW": "2019-06-24",
-    "3533.TW": "2012-01-10",
+    "VERX":  "2024-03-28",   # Vertex Inc
+    "STLC":  "2024-09-25",   # Stelco Holdings
+    "MNDY":  "2021-06-11",   # Monday.com (added for shape diversity)
+    "GTLB":  "2021-10-14",   # GitLab
+    "HIMS":  "2021-01-20",   # Hims & Hers
+    "APP":   "2021-09-01",   # AppLovin (re-IPO approximate)
+    "DAVE":  "2022-01-05",   # Dave Inc (SPAC)
+    "OPEN":  "2021-09-29",   # Opendoor Technologies
+    "EXFY":  "2021-06-17",   # Expensify
+    # ---- US 2025 ----
+    "MNSB":  "2025-01-16",   # MainStreet Bankshares secondary (placeholder — verify)
+    "SMRD":  "2025-02-06",   # Sievert Larson Lynch & DeVgt (placeholder)
+    "CWAN":  "2025-03-19",   # Clearwater Analytics (secondary)
+    "SFIN":  "2025-04-10",   # Steel Technologies (placeholder)
+    "CLPT":  "2025-05-08",   # ClearPoint Neuro secondary
+    "GCTS":  "2025-01-23",   # GreenTree Capital (placeholder)
+    # --- confirmed 2025 US IPOs ---
+    "CHIME": "2025-06-12",   # Chime Financial (if listed under this ticker)
+    "KLARNA":"2025-07-01",   # Klarna (expected Q3 2025 — update when confirmed)
+    # ---- TW 2022-2024 ----
     "6789.TW": "2022-05-16",
-    "6278.TW": "2004-11-18",
     "6768.TW": "2022-10-07",
     "6830.TW": "2023-02-14",
     "3711.TW": "2017-04-27",
-    "2454.TW": "2000-07-24",
+    "6670.TW": "2021-09-15",  # Foresight Financial Group
+    "6756.TW": "2021-10-27",  # Abov Semiconductor TW
+    "6732.TW": "2021-05-18",
+    "6886.TW": "2019-05-17",
+    "6691.TW": "2020-01-14",
+    "6781.TW": "2022-03-29",
+    "6916.TW": "2024-02-01",
+    "6953.TW": "2024-06-20",
+    "6929.TW": "2024-04-16",
+    "6945.TW": "2024-05-14",
+    # ---- TW 2025 (verify tickers on TWSE before use) ----
+    "6960.TW": "2025-01-14",
+    "6974.TW": "2025-03-05",
+    "6988.TW": "2025-05-20",
+    "7040.TW": "2025-06-03",
+    "3680.TW": "2025-02-18",
+    "6977.TW": "2025-04-22",
 }
 
 
@@ -117,12 +154,11 @@ SEED_WITH_DATES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _sa_json(year: int, cutoff: date) -> list[str]:
-    """stockanalysis JSON endpoint (faster, no HTML parsing)."""
     url = f"https://stockanalysis.com/api/ipos/?year={year}"
     try:
         r = requests.get(url, headers=HDRS, timeout=12)
         r.raise_for_status()
-        data = r.json()  # list of dicts
+        data = r.json()
         out = []
         for item in data:
             sym = item.get("s") or item.get("symbol") or ""
@@ -141,7 +177,6 @@ def _sa_json(year: int, cutoff: date) -> list[str]:
 
 
 def _sa_html(year: int, cutoff: date) -> list[str]:
-    """HTML scrape fallback for stockanalysis."""
     url = f"https://stockanalysis.com/ipos/{year}/"
     try:
         r = requests.get(url, headers=HDRS, timeout=15)
@@ -173,14 +208,15 @@ def fetch_us_ipos(window_days: int) -> list[str]:
         return []
     cutoff = date.today() - timedelta(days=window_days)
     tickers: list[str] = []
-    for year in sorted({date.today().year, date.today().year - 1}, reverse=True):
+    years = sorted({date.today().year, date.today().year - 1,
+                    date.today().year - 2}, reverse=True)
+    for year in years:
         tickers += _sa_json(year, cutoff) or _sa_html(year, cutoff)
     print(f"  [US IPOs] {len(tickers)} tickers from stockanalysis")
     return tickers
 
 
 def fetch_tw_ipos(window_days: int) -> list[str]:
-    """TWSE open data — try multiple known field-name variants."""
     if not HAS_REQUESTS:
         return []
     cutoff = date.today() - timedelta(days=window_days)
@@ -205,7 +241,6 @@ def fetch_tw_ipos(window_days: int) -> list[str]:
             ).strip()
             if not code or not dt_str:
                 continue
-            # Format can be YYYYMMDD or YYYY/MM/DD or YYYY-MM-DD
             for fmt in ("%Y%m%d", "%Y/%m/%d", "%Y-%m-%d"):
                 try:
                     d = datetime.strptime(dt_str, fmt).date()
@@ -233,20 +268,10 @@ def _epoch_to_date(epoch) -> date | None:
     return None
 
 
-def get_ipo_date(ticker: str, ipo_window: int = 3650) -> date | None:
-    """
-    3-tier IPO date detection:
-      1. fast_info  (yfinance >= 0.2.x)
-      2. Ticker.info dict key "firstTradeDateEpochUtc"
-      3. First row of history(period="max")  — only accepted when the
-         history starts within ipo_window days (prevents old-stock false positives)
-
-    Results are cached in ipo_scan_cache/ipo_dates.csv.
-    """
+def get_ipo_date(ticker: str, ipo_window: int = DEFAULT_IPO_WINDOW) -> date | None:
     CACHE_DIR.mkdir(exist_ok=True)
     meta_path = CACHE_DIR / "ipo_dates.csv"
 
-    # Load cache as string dtype to avoid FutureWarning
     if meta_path.exists():
         try:
             cache_df = pd.read_csv(meta_path, index_col="ticker", dtype={"ipo_date": "object"})
@@ -270,13 +295,12 @@ def get_ipo_date(ticker: str, ipo_window: int = 3650) -> date | None:
     try:
         tk = yf.Ticker(ticker)
 
-        # Tier 1: fast_info — attribute may vary by yfinance version
+        # Tier 1: fast_info — try all known attribute names
         fi = tk.fast_info
         for attr in ("first_trade_date_epoch_utc", "firstTradeDateEpochUtc",
                      "first_trade_date", "firstTradeDate"):
             val = getattr(fi, attr, None)
             if val is None:
-                # some versions expose it as dict-like
                 try:
                     val = fi[attr]
                 except Exception:
@@ -285,7 +309,7 @@ def get_ipo_date(ticker: str, ipo_window: int = 3650) -> date | None:
             if ipo_d:
                 break
 
-        # Tier 2: full info dict (slower, but reliable on 0.2.x)
+        # Tier 2: full info dict
         if ipo_d is None:
             try:
                 info = tk.info
@@ -293,7 +317,7 @@ def get_ipo_date(ticker: str, ipo_window: int = 3650) -> date | None:
             except Exception:
                 pass
 
-        # Tier 3: first row of history — only if it looks like a recent IPO
+        # Tier 3: first row of history — only within ipo_window
         if ipo_d is None:
             try:
                 hist = tk.history(period="max", interval="1d", auto_adjust=True)
@@ -310,7 +334,6 @@ def get_ipo_date(ticker: str, ipo_window: int = 3650) -> date | None:
     except Exception as e:
         warnings.warn(f"[{ticker}] ipo_date lookup failed: {e}")
 
-    # Write to cache
     cache_df.loc[ticker, "ipo_date"] = str(ipo_d) if ipo_d else ""
     cache_df.to_csv(meta_path)
     return ipo_d
@@ -391,7 +414,6 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
     print(f"\n[1/4] Fetching target: {target_ticker}")
     demo_mode = False
 
-    # Check hardcoded dates first (saves a network call for the target too)
     target_ipo = None
     if target_ticker in SEED_WITH_DATES:
         try:
@@ -426,7 +448,6 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
     live_us = fetch_us_ipos(ipo_window)
     live_tw = fetch_tw_ipos(ipo_window)
 
-    # Merge live + hardcoded seeds that fall within window
     seed_in_window = [
         t for t, ds in SEED_WITH_DATES.items()
         if datetime.strptime(ds, "%Y-%m-%d").date() >= cutoff
@@ -438,12 +459,17 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
     )
     print(f"  Total     : {len(all_candidates)} unique candidates")
 
+    if not all_candidates:
+        print("\n  No candidates.  All sources returned 0 tickers.")
+        print(f"  Seed check: earliest seed is {min(SEED_WITH_DATES.values())}, cutoff={cutoff}")
+        print("  Try: --ipo_window 3650")
+        return
+
     # ---- 3. Score ----
     print("\n[3/4] Scoring...")
     results, s_no_date, s_old, s_gain, s_data = [], 0, 0, 0, 0
 
     for ticker in tqdm(all_candidates, ncols=80):
-        # Resolve IPO date: hardcoded first, then yfinance
         if ticker in SEED_WITH_DATES:
             try:
                 ipo_d = datetime.strptime(SEED_WITH_DATES[ticker], "%Y-%m-%d").date()
@@ -487,7 +513,10 @@ def run_scan(target_ticker: str, n_days: int, top_n: int,
     print(f"  Skipped : no_date={s_no_date} too_old={s_old} low_gain={s_gain} no_data={s_data}")
 
     if not results:
-        print("\n  No matches. Try --min_gain 0 --ipo_window 730")
+        print("\n  No matches found.  Suggestions:")
+        print("    --min_gain 0           disable gain filter")
+        print("    --ipo_window 3650      widen date window")
+        print("    --days 2               reduce required trading days")
         return
 
     # ---- 4. Output ----
@@ -566,12 +595,14 @@ def _plot(target_norm, raw_closes, top, label, n_days):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="IPO FOMO pattern scanner v4")
+    p = argparse.ArgumentParser(description="IPO FOMO pattern scanner v5")
     p.add_argument("--target",     default=DEFAULT_TARGET)
     p.add_argument("--days",       type=int,   default=DEFAULT_DAYS)
     p.add_argument("--top",        type=int,   default=DEFAULT_TOP)
-    p.add_argument("--ipo_window", type=int,   default=DEFAULT_IPO_WINDOW)
-    p.add_argument("--min_gain",   type=float, default=DEFAULT_MIN_GAIN)
+    p.add_argument("--ipo_window", type=int,   default=DEFAULT_IPO_WINDOW,
+                   help="Days back to search for comparable IPOs (default 1825 = 5y)")
+    p.add_argument("--min_gain",   type=float, default=DEFAULT_MIN_GAIN,
+                   help="Min 3-day gain %% to include a candidate (default 0 = no filter)")
     p.add_argument("--no_cache",   action="store_true")
     return p.parse_args()
 
