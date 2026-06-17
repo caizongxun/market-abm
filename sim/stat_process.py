@@ -1,77 +1,46 @@
 """
-stat_process.py  v57.1
-======================
+stat_process.py  v58
+====================
 純統計過程模型，完全不使用 agent。
 
+v58: Fix global-pass kurtosis=776 / skew=-27 explosion (3 root causes).
+
+     Root cause analysis (v57.1 output: kurtosis=776, skew=-27):
+
+     R1. _kurtosis_topup eff_jstd not clipped for global pass.
+         Global pass passes jump_std = mean_jump_std_norm (z-space, ~1-6).
+         ret_std = std(z_norm) ≈ 1.0.
+         eff_jstd = max(mean_jump_std_norm, 1.0*3.0) = max(1~6, 3) = 3~6.
+         20 jumps × ±3~6σ on an 800-bar series → kurtosis explodes to 776.
+
+     Fix R1: Add max_eff_jstd parameter to _kurtosis_topup (default=None).
+         Global pass calls with max_eff_jstd=2.5.
+         Per-window calls unchanged (max_eff_jstd=None → no extra clip).
+
+     R2. topup_frac=0.50 in global pass is too permissive.
+         realised_ek ≈ 2-4, mean_raw_target_ek ≈ 3-5.
+         trigger threshold = 0.50 * 3~5 = 1.5~2.5.
+         Almost always fires, and ek_deficit is overestimated → n_jumps too high.
+
+     Fix R2: Global pass topup_frac 0.50 → 0.80.
+         Only fires when realised_ek < 0.80 * target_ek (genuine deficit).
+
+     R3. _skew_post_shift cubic z^3 amplified topup outliers → skew=-27.
+         After kurtosis topup injects ±3~6σ points, those extreme outliers
+         have z^3 ~ 27~216, so cubic term a*(z^3 - 3z) adds ±several sigma
+         of asymmetric push, collapsing skew to -27.
+
+     Fix R3: Soft-clip z to [-5, +5] before _skew_post_shift in global pass.
+         This neutralises outlier amplification without destroying kurtosis
+         (extreme values are already captured in the topup step).
+
 v57.1: Fix per-window kurtosis explosion in generate() Step 6.
-
-     Root cause:
-       jump_std is fitted in raw-scale (e.g. 0.02–0.05 per bar), but
-       Step 6 operates in z-score space (std≈1 after Steps 1–5).
-       Old formula:
-           ek_amp  = sqrt(max(target_ek / 6, 1))   # oversampled ek
-           eff_std = jump_std * ek_amp              # raw-scale × dimensionless
-       For typical params: jump_std≈0.03, ret_std≈0.01,
-       target_ek≈8 (oversampled) → eff_std ≈ 3/0.01 × 1.15 ≈ 3.5 in z units.
-       20 such jumps on a 20-bar window → kurtosis explodes (783 observed).
-
-     Fix:
-       1. Normalise jump_std to z-score units:
-              jump_std_z = jump_std / max(ret_std, 1e-10)
-       2. Use raw (non-oversampled) target_ek for amplitude:
-              raw_ek = target_ek / _EK_OVERSAMPLE
-              ek_amp = sqrt(max(raw_ek / 6.0, 1.0))
-       3. Hard-clip eff_std to [0.5, 4.0] as a z-space safety rail.
-
 v57: Revert global pass to v54 logic; drop _global_kurtosis_inject.
-
-     Root causes of v56 global pass regression:
-       R1. _global_kurtosis_inject G1 tail-clip operated on final_rets
-           (raw scale, ~0.01/bar), NOT on z-score space.  The threshold
-           tail_clip_z=6 was therefore never triggered (typical |final_ret|
-           << 1.0 << 6.0), making G1 a no-op.
-       R2. G2 injection also ran in raw-scale space, so injected magnitude
-           _GLOBAL_INJECT_Z=3.5 → 3.5×0.01 = 0.035 per bar, far too small
-           to move kurtosis.
-       R3. v56 removed _kurtosis_topup from the global pass entirely.
-           Per-window _kurtosis_topup is fine (runs in z-score space), but
-           the global topup was the primary correction stage; removing it
-           left residual kurtosis deficit uncorrected.
-
-     Fix (v57):
-       - Restore v54 global pass pipeline:
-           1. mean_raw_target_ek = mean(target_ek over param_log) / _EK_OVERSAMPLE
-           2. _kurtosis_topup(final_rets_z, target_ek=mean_raw_target_ek, ...)
-              where final_rets_z is normalised to z-score space (std≈1)
-           3. _skew_post_shift(z, clamp=0.30) immediately after topup
-           4. Rescale back to raw scale
-           5. Post-fix std guard: pin std == real_global_std
-       - _global_kurtosis_inject kept in file but DEPRECATED / not called.
-
-v56.1: Fix SyntaxError in OnlineRidgePredictor.predict_correction (line 775):
-       np.array(self._y_ek] → np.array(self._y_ek)
-
+v56.1: Fix SyntaxError in OnlineRidgePredictor.predict_correction (line 775).
 v56: Fix kurtosis=783 / skew=-27 explosion introduced by v55 global topup.
-
-     Root causes (v55 bugs):
-       B1. mean_target_ek is the OVERSAMPLED value (~30).  Dividing by
-           _EK_OVERSAMPLE gives ~16, which is still far above the realised
-           ek (~10), so ek_deficit ≈ 770 for an 800-bar series.
-       B2. n_jumps = ceil(ek_deficit * len / 20) clamps to max_jumps=20,
-           but each of the 20 largest positions gets an ADDITIVE draw of
-           eff_jstd ≈ jump_std_norm ≈ 3-6 in z-score units → single
-           outlier can reach 100+σ → kurtosis explodes.
-       B3. jump_std_norm = mean_jump_std / topup_std sometimes >> 10
-           (mean_jump_std from raw-scale param_log is e.g. 0.05;
-            topup_std ≈ 0.016 → ratio 3.1, but occasionally 8–12).
-
-v55: Fix three root-cause bugs in rolling_fit_generate's topup pipeline
-     (root causes discovered after v54 shipped: std=0.99998, skew=-10.56,
-      kurtosis=187 observed in some runs).
-v54: Fix four problems observed in v53 output:
-       (skew=0.448→-1.111, kurtosis=10.6→6.4, hurst=0.693→0.660)
-v53: Fix three residual problems from v52 output:
-       (skew=0.448→-0.135, kurtosis=10.6→3.9, topup ineffective)
+v55: Fix three root-cause bugs in rolling_fit_generate's topup pipeline.
+v54: Fix four problems observed in v53 output.
+v53: Fix three residual problems from v52 output.
 v52.1: fix SyntaxError in OnlineRidgePredictor.predict_correction (line 743-744)
 v52: Fix kurtosis collapse (10.6 → 1.3) and skew collapse (0.45 → 0.09).
 v51: Replace t-mixture (v50) with noncentral-t (nct) sampling.
@@ -266,6 +235,12 @@ _GLOBAL_N_INJECT     = 5
 _GLOBAL_INJECT_Z     = 3.5
 _GLOBAL_INJECT_Z_MAX = 4.0
 
+# v58: global pass eff_jstd ceiling (z-space)
+_GLOBAL_MAX_EFF_JSTD = 2.5
+
+# v58: soft-clip z outliers before _skew_post_shift in global pass
+_GLOBAL_SKEW_CLIP_Z  = 5.0
+
 
 def _df_from_ek(target_ek: float) -> float:
     """
@@ -342,6 +317,10 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
     reduce cubic distortion of the AR1 Hurst structure.
     The global post-topup pass in rolling_fit_generate uses clamp=0.30.
 
+    v58: caller must soft-clip z to ±_GLOBAL_SKEW_CLIP_Z before calling
+    this function in the global pass, to prevent cubic z^3 amplification
+    of topup-injected outliers from collapsing skew to -27.
+
     After each shift, re-normalise to (mean=0, std=1).
     """
     if len(z) < 4:
@@ -364,25 +343,39 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
 
 
 def _kurtosis_topup(
-    rets:       np.ndarray,
-    target_ek:  float,
-    jump_std:   float,
-    skew_raw:   float,
-    rng:        np.random.Generator,
-    topup_frac: float = 0.50,
-    max_jumps:  int   = 20,
+    rets:         np.ndarray,
+    target_ek:    float,
+    jump_std:     float,
+    skew_raw:     float,
+    rng:          np.random.Generator,
+    topup_frac:   float = 0.50,
+    max_jumps:    int   = 20,
+    max_eff_jstd: Optional[float] = None,
 ) -> np.ndarray:
     """
-    v54 Fix B: Additive jump injection to restore kurtosis.
+    Additive jump injection to restore kurtosis.
 
-    Used in BOTH per-window generate() AND the global post-concat pass
-    (v57: global pass restored to v54 logic).
+    Used in BOTH per-window generate() AND the global post-concat pass.
 
     Input rets should be in z-score space (std≈1).
+
+    Parameters
+    ----------
+    topup_frac : float
+        Trigger threshold fraction of target_ek.  Topup fires only when
+        realised_ek < topup_frac * target_ek.
+        Per-window default: 0.50.
+        Global pass (v58): 0.80 — only fire when ek is seriously deficient.
+
+    max_eff_jstd : float or None
+        Hard upper bound on eff_jstd in z-space.
+        Per-window: None (no extra clip beyond existing logic).
+        Global pass (v58): 2.5 — prevents ±3~6σ jumps from exploding kurtosis.
 
     The global pass caller must:
       - pass target_ek = mean_raw_target_ek (= mean(target_ek)/EK_OVERSAMPLE)
       - pass jump_std  = mean_jump_std_norm  (= mean(jump_std)/topup_std)
+      - pass topup_frac=0.80, max_eff_jstd=_GLOBAL_MAX_EFF_JSTD
     """
     if len(rets) < 4:
         return rets
@@ -399,6 +392,10 @@ def _kurtosis_topup(
 
     skew_bias  = float(np.clip(skew_raw * 0.3, -1.0, 1.0))
     eff_jstd   = float(max(jump_std, ret_std * 3.0))
+
+    # v58: apply global-pass ceiling if requested
+    if max_eff_jstd is not None:
+        eff_jstd = float(np.clip(eff_jstd, 0.0, max_eff_jstd))
 
     jump_draws = rng.normal(skew_bias * eff_jstd, eff_jstd, size=n_jumps)
 
@@ -1022,20 +1019,21 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v57: Global kurtosis + skew correction (restored to v54 logic)
+        # v58: Global kurtosis + skew correction
         #
         # Pipeline (all in z-score space, std≈1):
         #   1. Extract final_rets after drift alignment
         #   2. mean_raw_target_ek = mean(target_ek) / _EK_OVERSAMPLE
-        #      (correct: compare realised ek against RAW target, not oversampled)
         #   3. mean_jump_std_norm = mean(jump_std) / topup_std
-        #      (normalise jump_std to z-score units)
         #   4. Normalise final_rets → z-score space
-        #   5. _kurtosis_topup(z, target_ek=mean_raw_target_ek,
-        #                         jump_std=mean_jump_std_norm, ...)
-        #   6. _skew_post_shift(z, clamp=0.30)
-        #   7. Rescale back to raw scale
-        #   8. Post-fix std guard: pin std == real_global_std
+        #   5. _kurtosis_topup(z, topup_frac=0.80, max_eff_jstd=2.5)
+        #      v58: topup_frac raised to 0.80 (more conservative trigger)
+        #      v58: max_eff_jstd=2.5 prevents ±3~6σ jumps exploding kurtosis
+        #   6. Soft-clip z to ±5σ before _skew_post_shift
+        #      v58: prevents cubic z^3 term from amplifying topup outliers
+        #   7. _skew_post_shift(z, clamp=0.30)
+        #   8. Rescale back to raw scale
+        #   9. Post-fix std guard: pin std == real_global_std
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
@@ -1070,19 +1068,28 @@ def rolling_fit_generate(
 
         topup_rng = np.random.default_rng(seed + 9999 if seed is not None else 0)
 
+        # v58: topup_frac=0.80, max_eff_jstd=_GLOBAL_MAX_EFF_JSTD=2.5
         z_topup = _kurtosis_topup(
-            rets       = z_norm,
-            target_ek  = mean_raw_target_ek,
-            jump_std   = mean_jump_std_norm,
-            skew_raw   = global_skew_target,
-            rng        = topup_rng,
-            topup_frac = 0.50,
-            max_jumps  = 20,
+            rets         = z_norm,
+            target_ek    = mean_raw_target_ek,
+            jump_std     = mean_jump_std_norm,
+            skew_raw     = global_skew_target,
+            rng          = topup_rng,
+            topup_frac   = 0.80,
+            max_jumps    = 20,
+            max_eff_jstd = _GLOBAL_MAX_EFF_JSTD,
         )
+
+        # v58: soft-clip z outliers to ±_GLOBAL_SKEW_CLIP_Z before cubic shift
+        z_clipped = np.clip(z_topup, -_GLOBAL_SKEW_CLIP_Z, _GLOBAL_SKEW_CLIP_Z)
+        # re-standardise after clip so _skew_post_shift receives std≈1
+        z_clip_std = float(np.std(z_clipped))
+        if z_clip_std > 1e-10:
+            z_clipped = (z_clipped - float(np.mean(z_clipped))) / z_clip_std
 
         # Skew post-shift in z-score space (clamp=0.30 for global pass)
         z_shifted = _skew_post_shift(
-            z_topup,
+            z_clipped,
             target_skew=global_skew_target,
             clamp=0.30,
         )
