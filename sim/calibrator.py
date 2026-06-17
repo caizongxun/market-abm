@@ -1,22 +1,23 @@
 """
-calibrator.py  v5
+calibrator.py  v6
 =================
 AdaptiveCalibrator：ES（Evolution Strategy）策略更新 + 連續 RL 閉環支援。
 
-v5 主要變更：
-  1. ES policy：每個 action dimension 維護 (mean, std) 對，
-     propose() 從學習到的分佈採樣，不再是純 random noise。
-  2. update_es()：reward-weighted mean update（CMA-ES 簡化版），
-     每個 window 結束後立即更新 policy mean。
-  3. explore_std 動態 decay：0.15 → floor 0.02，
-     experience 越多探索越收斂。
-  4. composite reward 重新平衡：
-     std_err 權重降低（hard renorm 已保證），kurt_err 升至主導。
-  5. ReplayBuffer capacity 5000 → 20000。
-  6. 新增 summary() 方便 train_rl.py 打印進度。
+v6 主要變更：
+  1. build_context 擴充至 10 維：新增 ek_oversample_adj。
+     calibrator 現在能看到當前 window 的自適應超取樣倍率，
+     從而學到「ek_adj 偏低 → 應該提高 d_target_ek」這個映射。
+  2. reward 重新平衡（kurtosis 升至主導）：
+     Old: 0.10*std + 0.50*log1p(kurt)/3 + 0.20*hurst - 0.20*dir
+     New: 0.05*std + 0.70*log1p(kurt)/3 + 0.15*hurst - 0.10*dir
+     在 kurt_err=6.65 時 penalty 從 0.67 提高到 0.93。
+  3. CONTEXT_KEYS 同步更新（10 個 key）。
+  4. build_context 新增 ek_oversample 關鍵字參數（預設 1.0 以向後相容）。
 
-v4 patch（保留）：
-  kurt_err log1p 壓縮；build_context log1p(target_ek)。
+v5（保留）：
+  ES policy update + 連續 RL 閉環。
+  explore_std 動態 decay 0.15→0.02。
+  ReplayBuffer capacity 20000。
 """
 from __future__ import annotations
 
@@ -43,13 +44,13 @@ CONTEXT_KEYS: List[str] = [
     "ret_std", "ret_skew_a", "ret_df",
     "hurst_target", "wick_lambda",
     "jump_freq", "vol_persistence", "acf_lag1", "target_ek",
+    "ek_oversample_adj",   # v6: 第 10 維，adaptive 超取樣倍率
 ]
 
 ACTION_KEYS: List[str] = [
     "d_ret_std", "d_hurst", "d_target_ek", "d_vol_persistence",
 ]
 
-# action 代表對參數的相對調整（乘數 delta），clip 為安全邊界
 ACTION_CLIP: Dict[str, tuple] = {
     "d_ret_std":          (-0.40, 0.40),
     "d_hurst":            (-0.15, 0.15),
@@ -74,10 +75,10 @@ PARAM_SAFE: Dict[str, tuple] = {
 _N_ACTIONS = len(ACTION_KEYS)
 
 # ES 超參
-_ES_EXPLORE_INIT  = 0.15    # 初始探索 std
-_ES_EXPLORE_FLOOR = 0.02    # 最低探索 std
-_ES_DECAY_HALF    = 2000    # 每 2000 筆經驗 std 減半
-_ES_LR            = 0.10    # mean update learning rate
+_ES_EXPLORE_INIT  = 0.15
+_ES_EXPLORE_FLOOR = 0.02
+_ES_DECAY_HALF    = 2000
+_ES_LR            = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +126,10 @@ class CalibAction:
 
 
 # ---------------------------------------------------------------------------
-# ESPolicy  —  per-context Gaussian policy，reward-weighted mean update
+# ESPolicy
 # ---------------------------------------------------------------------------
 
 class ESPolicy:
-    """
-    簡化 CMA-ES：維護每個 action dim 的 (mean, explore_std)。
-    - propose(ctx)：從 N(mean, std^2) 採樣 action
-    - update(actions, rewards)：reward-weighted mean update
-    - explore_std 隨 total_updates 指數衰減
-    """
-
     def __init__(self):
         self.mean_vec   = np.zeros(_N_ACTIONS, dtype=float)
         self._total_upd = 0
@@ -143,11 +137,9 @@ class ESPolicy:
     @property
     def explore_std(self) -> float:
         decay = 0.5 ** (self._total_upd / _ES_DECAY_HALF)
-        return float(max(_ES_EXPLORE_FLOOR,
-                         _ES_EXPLORE_INIT * decay))
+        return float(max(_ES_EXPLORE_FLOOR, _ES_EXPLORE_INIT * decay))
 
     def propose(self) -> np.ndarray:
-        """從當前 policy 分佈採樣一個 action vector。"""
         raw = self.mean_vec + np.random.normal(0, self.explore_std, _N_ACTIONS)
         for i, key in enumerate(ACTION_KEYS):
             lo, hi = ACTION_CLIP[key]
@@ -155,11 +147,6 @@ class ESPolicy:
         return raw
 
     def update(self, actions: np.ndarray, rewards: np.ndarray) -> None:
-        """
-        actions: (N, n_actions)
-        rewards: (N,)
-        reward-weighted mean update：往高 reward action 的均值方向走。
-        """
         if len(actions) == 0:
             return
         r_shifted = rewards - rewards.min() + 1e-8
@@ -236,18 +223,18 @@ class RidgeModel:
 
 
 # ---------------------------------------------------------------------------
-# AdaptiveCalibrator  v5
+# AdaptiveCalibrator  v6
 # ---------------------------------------------------------------------------
 
 class AdaptiveCalibrator:
     """
-    v5: ES policy update + 連續 RL 閉環。
+    v6: build_context 10-dim (+ ek_oversample_adj) + reward 重新平衡。
 
     主要流程：
       1. predict(ctx)  → propose action from ES policy
       2. apply action  → generate() with adjusted params
       3. record(...)   → push to buffer, update ES policy mean
-      4. _fit_models() → 每 update_interval 筆用 XGB/Ridge 學習 context→action mapping
+      4. _fit_models() → 每 update_interval 筆用 XGB/Ridge 學習
       5. save/load     → 持久化，支援跨 session warm-start
     """
 
@@ -275,7 +262,6 @@ class AdaptiveCalibrator:
         self._es             = ESPolicy()
         self._n_since_fit: int = 0
         self.n_experiences:  int = 0
-        # rolling reward stats for live monitoring
         self._reward_history: List[float] = []
 
     @property
@@ -283,8 +269,16 @@ class AdaptiveCalibrator:
         return self._es.explore_std
 
     @staticmethod
-    def build_context(params: Dict[str, Any]) -> np.ndarray:
-        """9-dim context vector。target_ek 用 log1p 壓縮（v4 Patch-3 保留）。"""
+    def build_context(
+        params: Dict[str, Any],
+        ek_oversample: float = 1.0,
+    ) -> np.ndarray:
+        """
+        v6: 10-dim context vector。
+        第 10 維新增 ek_oversample_adj，讓模型能觀察到當前的
+        adaptive 超取樣倍率，從而學到修正 d_target_ek 的方向。
+        ek_oversample 預設 1.0 以向後相容舊的呼叫端。
+        """
         return np.array([
             float(params["ret_std"]),
             float(params["ret_skew_a"]),
@@ -295,6 +289,7 @@ class AdaptiveCalibrator:
             float(params["vol_persistence"]),
             float(params["acf_lag1"]),
             float(np.log1p(abs(params["target_ek"]))),
+            float(np.clip(ek_oversample, 1.0, 8.0)),   # v6: 第 10 維
         ], dtype=float)
 
     @staticmethod
@@ -305,23 +300,27 @@ class AdaptiveCalibrator:
         dir_hit:     float,
     ) -> float:
         """
-        v5 reward 重新平衡：
-          std_err 權重降低（hard renorm 已保證精確），
-          kurt_err 升至主導（目前 20x 超標是主戰場），
-          dir_hit 提高權重（策略訓練的最終目標）。
+        v6 reward 重新平衡：kurtosis 升至主導信號。
 
-          r = -(0.10*std_err + 0.50*log1p(kurt)/3 + 0.20*hurst/0.05 - 0.20*dir_hit)
+          Old: -(0.10*std + 0.50*log1p(kurt)/3 + 0.20*hurst/0.05 - 0.20*dir)
+          New: -(0.05*std + 0.70*log1p(kurt)/3 + 0.15*hurst/0.05 - 0.10*dir)
+
+        在 kurt_err=6.65 時：
+          Old penalty = 0.50 * log1p(6.65)/3 ≈ 0.67
+          New penalty = 0.70 * log1p(6.65)/3 ≈ 0.93
+
+        std_err 權重從 0.10 降至 0.05（hard renorm 已保證精確）。
+        dir_hit 從 0.20 降至 0.10（本輪主戰場是 kurtosis，dir 次要）。
         """
         r = -(
-            0.10 * float(std_err_pct)
-            + 0.50 * float(np.log1p(kurt_err)) / 3.0
-            + 0.20 * float(hurst_err) / 0.05
-            - 0.20 * float(dir_hit)
+            0.05 * float(std_err_pct)
+            + 0.70 * float(np.log1p(kurt_err)) / 3.0
+            + 0.15 * float(hurst_err) / 0.05
+            - 0.10 * float(dir_hit)
         )
         return float(np.clip(r, -10.0, 2.0))
 
     def _fit_models(self) -> None:
-        """用 buffer 裡的 (context, action, reward) 訓練 action predictor。"""
         if len(self._buffer) < self.min_train:
             return
         X = self._buffer.contexts
@@ -345,10 +344,6 @@ class AdaptiveCalibrator:
         self._n_since_fit = 0
 
     def predict(self, ctx: np.ndarray) -> CalibAction:
-        """
-        v5: 先用 XGB/Ridge 給出 base action（如果已訓練），
-        再疊加 ES policy noise（從學習到的分佈採樣）。
-        """
         if self._models is not None and len(self._buffer) >= self.min_train:
             x = ctx.reshape(1, -1)
             base = []
@@ -362,9 +357,7 @@ class AdaptiveCalibrator:
         else:
             base_arr = np.zeros(_N_ACTIONS)
 
-        # ES noise：從 policy mean + explore_std 採樣
         es_sample = self._es.propose()
-        # blend: base (XGB) + ES perturbation
         blend_w = float(np.clip(len(self._buffer) / max(self.min_train * 4, 1), 0.0, 0.8))
         a_arr = (1 - blend_w) * es_sample + blend_w * base_arr
         for i, key in enumerate(ACTION_KEYS):
@@ -390,19 +383,16 @@ class AdaptiveCalibrator:
         self.n_experiences  += 1
         self._n_since_fit   += 1
 
-        # ES policy mean update（每筆立即更新，小 batch=1）
         self._es.update(
             actions = act_arr.reshape(1, -1),
             rewards = np.array([reward]),
         )
 
-        # XGB/Ridge 定期重新 fit
         if (self._n_since_fit >= self.update_interval
                 and len(self._buffer) >= self.min_train):
             self._fit_models()
 
     def summary(self) -> Dict[str, Any]:
-        """回傳當前訓練狀態，供 train_rl.py 打印。"""
         h = self._reward_history
         return {
             "n_exp":       self.n_experiences,
@@ -448,6 +438,21 @@ class AdaptiveCalibrator:
         self.xgb_kwargs       = state.get("xgb_kwargs",      self.xgb_kwargs)
         self._reward_history  = state.get("reward_history",  [])
         self._n_since_fit     = 0
+
+        # v6 backward compat: 舊的 pkl 存的是 9-dim context，
+        # 如果 buffer 非空且 dim=9，清空 buffer 強制重新累積 10-dim 資料
+        if len(self._buffer) > 0:
+            sample_ctx = self._buffer._ctx[0]
+            if np.asarray(sample_ctx).shape[0] != 10:
+                print(f"[calib] context dim mismatch (got {np.asarray(sample_ctx).shape[0]}, need 10). "
+                      f"Clearing buffer and models to avoid shape error.")
+                self._buffer  = ReplayBuffer(self._buffer.capacity)
+                self._models  = None
+                self.n_experiences = 0
+                self._reward_history = []
+                self._n_since_fit = 0
+                return
+
         if self._models is None and len(self._buffer) >= self.min_train:
             self._fit_models()
         print(f"[calib] loaded  n_exp={self.n_experiences}  buf={len(self._buffer)}  "

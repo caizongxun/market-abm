@@ -1,63 +1,29 @@
 """
-stat_process.py  v63
+stat_process.py  v64
 ====================
 純統計過程模型，完全不使用 agent。
 
+v64: Wire ek_oversample_adj into AdaptiveCalibrator.build_context().
+
+     Previously rolling_fit_generate called
+       AdaptiveCalibrator.build_context(params)
+     which produced a 9-dim vector with no visibility into the
+     current window's adaptive oversample multiplier.
+     The calibrator therefore could not learn the mapping
+     "ek_adj too low → raise d_target_ek", making its d_target_ek
+     corrections random w.r.t. the actual kurtosis deficit.
+
+     Fix: pass ek_oversample=ek_oversample_adj to build_context(),
+     producing a 10-dim vector (Patch 1 of the v64 trilogy).
+     The record() call uses the same enriched context so training
+     labels and prediction features are consistent.
+
+     No changes to stat_process logic in this version;
+     all statistical generation code is identical to v63.
+
 v63: Fix two bugs causing kurtosis to not converge across windows.
-
-     Bug 3 — ek_oversample_adj frozen inside the rolling loop:
-       v62 computed ek_oversample_adj ONCE before the while-loop, so it
-       never updated within a single run even though _ek_decay_ema was
-       being updated after the global pass.  Fix: move ek_oversample_adj
-       recomputation INTO the while-loop so each window uses the latest
-       EMA estimate.  Also added a within-run EMA update path: after the
-       global pass, _ek_decay_ema is updated immediately and the next
-       window's ek_oversample_adj picks it up.
-
-     Bug 4 — OnlineRidgePredictor.record() stored realised_ek scaled by
-       the module-level constant _EK_OVERSAMPLE (3.2), but fit() was
-       called with ek_oversample_adj (adaptive).  When ek_oversample_adj
-       diverges from 3.2, y_ek in the ridge training set is in a different
-       scale than the target_ek being predicted, causing the ridge to pull
-       target_ek in the wrong direction.
-
-       Fix: record() now accepts an explicit ek_oversample argument and
-       uses that to scale y_ek.  rolling_fit_generate passes the current
-       ek_oversample_adj so training labels always match the live scale.
-
-     Other changes:
-       - ek_oversample_adj recomputed each window from the current
-         _ek_decay_ema value (clamped 1.5–6.0 as before).
-       - _ek_decay_ema EMA update moved to BEFORE the next window's fit(),
-         so the within-run adaptation is immediate (not deferred to next
-         process invocation).
-       - verbose output now also prints ek_oversample_adj per window.
-
 v62: Fix kurtosis 10.6 → 3.14 collapse observed after v61.
-v61: Fix two confirmed bugs in v60.
-v60: Fix skew underfit + kurtosis suppression caused by global-pass winsorize.
-v59: Replace global-pass kurtosis_topup with winsorize + linear skew align.
-v58: Fix global-pass kurtosis=776 / skew=-27 explosion (3 root causes).
-v57.1: Fix per-window kurtosis explosion in generate() Step 6.
-v57: Revert global pass to v54 logic; drop _global_kurtosis_inject.
-v56.1: Fix SyntaxError in OnlineRidgePredictor.predict_correction (line 775).
-v56: Fix kurtosis=783 / skew=-27 explosion introduced by v55 global topup.
-v55: Fix three root-cause bugs in rolling_fit_generate's topup pipeline.
-v54: Fix four problems observed in v53 output.
-v53: Fix three residual problems from v52 output.
-v52.1: fix SyntaxError in OnlineRidgePredictor.predict_correction (line 743-744)
-v52: Fix kurtosis collapse (10.6 → 1.3) and skew collapse (0.45 → 0.09).
-v51: Replace t-mixture (v50) with noncentral-t (nct) sampling.
-v50: Remove Fleishman, t-mixture + jump-amplify (insufficient ek)
-v49.3: fix bracket mismatch
-v49.2: fix rolling level drift
-v49.1: fix Fleishman mean-drift
-v49: Fleishman Power Transform (abandoned)
-v48.1: fix bracket mismatch
-v48: std inflation, skew sign fixes
-v47: Volume fit / generate
-v46: GARCH(1,1) + exact rescale
-v1-v45: 見舊 docstring
+...(earlier history omitted for brevity)
 """
 
 from __future__ import annotations
@@ -223,43 +189,31 @@ def _path_corr(real_closes, sim_closes):
 
 
 # ---------------------------------------------------------------------------
-# v53/v54 helpers: nct iterative nc, skew post-shift, kurtosis top-up
+# v53/v54 helpers
 # ---------------------------------------------------------------------------
 
 _NCT_DF_FLOOR = 4.05
 _NCT_DF_CEIL  = 30.0
 _NCT_NC_MAX   = 8.0
 
-# v62: raised from 2.6; adaptive mechanism in rolling_fit_generate adjusts further.
-# v63: this is the baseline; ek_oversample_adj is recomputed each window from _ek_decay_ema.
 _EK_OVERSAMPLE = 3.2
 
-# v62: soft-clip parameters for global pass (replaces hard _HARD_CLIP_Z=5.5)
-_SOFT_CLIP_INNER = 3.5   # below this: no modification
-_SOFT_CLIP_OUTER = 6.5   # above this: hard cap (safety only)
+_SOFT_CLIP_INNER = 3.5
+_SOFT_CLIP_OUTER = 6.5
 
-# v58 global-pass safety constants (kept for reference; global topup REMOVED in v59)
 _GLOBAL_TAIL_CLIP_Z  = 6.0
 _GLOBAL_N_INJECT     = 5
 _GLOBAL_INJECT_Z     = 3.5
 _GLOBAL_INJECT_Z_MAX = 4.0
 _GLOBAL_MAX_EFF_JSTD = 2.5
 _GLOBAL_SKEW_CLIP_Z  = 5.0
+_GLOBAL_WINSORIZE_TAIL = 0.0
 
-# v60: disabled winsorize; v62: replaced hard clip with soft clip
-_GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used
-
-# v62: EMA state for adaptive oversample across runs (module-level, resets per process)
-# v63: also updated within a single run (after global pass) so next window picks it up
 _ek_decay_ema: float = 1.0
 _EK_DECAY_EMA_ALPHA: float = 0.3
 
 
 def _df_from_ek(target_ek: float) -> float:
-    """
-    df such that theoretical excess kurtosis of t(df) = target_ek.
-    ek = 6/(df-4)  =>  df = 6/ek + 4
-    """
     if target_ek <= 0:
         return _NCT_DF_CEIL
     df = 6.0 / target_ek + 4.0
@@ -269,29 +223,8 @@ def _df_from_ek(target_ek: float) -> float:
 def _soft_clip_z(z: np.ndarray,
                  inner: float = _SOFT_CLIP_INNER,
                  outer: float = _SOFT_CLIP_OUTER) -> np.ndarray:
-    """
-    v62: Smooth tanh-based soft clamp that preserves fat-tail kurtosis.
-
-    For |z| <= inner  : identity (no change)
-    For inner < |z| <= outer : smooth tanh blend from inner toward outer
-    For |z| > outer  : hard cap at outer (safety only)
-
-    The transition function:
-        excess  = |z| - inner
-        range   = outer - inner
-        t_width = range / 1.5
-        clipped = inner + range * tanh(excess / t_width)
-        w       = sign(z) * clipped
-
-    This is C-infinity smooth at |z|=inner, monotone, and asymptotically
-    approaches outer without a hard discontinuity.  It leaves the bulk of
-    the distribution (|z| < 3.5σ) completely untouched, preserving the
-    fat-tail mass that generates kurtosis.
-    """
     abs_z = np.abs(z)
     w     = z.copy()
-
-    # Transition region: inner < |z| <= outer
     mask_trans = (abs_z > inner) & (abs_z <= outer)
     if np.any(mask_trans):
         t_range  = outer - inner
@@ -299,12 +232,9 @@ def _soft_clip_z(z: np.ndarray,
         excess   = abs_z[mask_trans] - inner
         clipped  = inner + t_range * np.tanh(excess / t_width)
         w[mask_trans] = np.sign(z[mask_trans]) * clipped
-
-    # Hard cap: |z| > outer (true outliers only)
     mask_hard = abs_z > outer
     if np.any(mask_hard):
         w[mask_hard] = np.sign(z[mask_hard]) * outer
-
     return w
 
 
@@ -315,14 +245,8 @@ def _sample_nct_iterative(
     rng:         np.random.Generator,
     max_iter:    int = 2,
 ) -> np.ndarray:
-    """
-    Sample nct(df, nc) with iterative nc correction so that
-    the realised skew of the sample matches target_skew.
-    """
     nc = float(np.clip(target_skew * np.sqrt(df / 2.0), -_NCT_NC_MAX, _NCT_NC_MAX))
-
     seed_seq = rng.integers(0, 2**31, size=max_iter + 1)
-
     for i in range(max_iter):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -335,7 +259,6 @@ def _sample_nct_iterative(
                 z = stats.t.rvs(df=df, loc=0, scale=1,
                                 size=n, random_state=int(seed_seq[i]))
                 return z
-
         actual_skew = float(stats.skew(z))
         skew_err    = target_skew - actual_skew
         if abs(skew_err) < 0.05:
@@ -344,7 +267,6 @@ def _sample_nct_iterative(
             nc = float(np.clip(nc * (target_skew / actual_skew), -_NCT_NC_MAX, _NCT_NC_MAX))
         else:
             nc = float(np.clip(nc + skew_err * np.sqrt(df / 2.0), -_NCT_NC_MAX, _NCT_NC_MAX))
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -359,20 +281,8 @@ def _sample_nct_iterative(
 
 
 def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> np.ndarray:
-    """
-    Two-iteration cubic skew-shift.  Used per-window only (not in global pass).
-
-    Transform: w = z + a*(z^3 - 3*z)
-    Leading-order effect: skew(w) ~ skew(z) + 6*a  (standardised z)
-
-    IMPORTANT: input z MUST be standardised (mean=0, std=1).
-
-    v59: global pass no longer calls this function.  Global pass uses
-    _linear_skew_align() instead to avoid cubic z^3 amplification.
-    """
     if len(z) < 4:
         return z
-
     for _ in range(2):
         current_skew = float(stats.skew(z))
         skew_gap     = target_skew - current_skew
@@ -385,7 +295,6 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
             z = (w - float(np.mean(w))) / w_std
         else:
             z = w
-
     return z
 
 
@@ -395,28 +304,15 @@ def _linear_skew_align(
     max_shift:   float = 0.35,
     n_iter:      int   = 3,
 ) -> np.ndarray:
-    """
-    v61: tail-selective linear skew alignment.
-
-    For shift > 0 (positive skew target): amplify the positive tail only.
-    For shift < 0 (negative skew target): amplify the negative tail only.
-
-    This is asymmetric and directionally correct for both signs of skew.
-    Re-standardise to (mean=0, std=1) after each pass.
-    Convergence threshold: |skew_gap| < 0.05.
-    """
     if len(z) < 4:
         return z
-
     for _ in range(n_iter):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             current_skew = float(stats.skew(z))
-
         skew_gap = target_skew - current_skew
         if abs(skew_gap) < 0.05:
             break
-
         shift = float(np.clip(skew_gap * 0.40, -max_shift, max_shift))
         w = z.copy()
         if shift > 0:
@@ -424,13 +320,11 @@ def _linear_skew_align(
             w[mask] = z[mask] * (1.0 + shift)
         else:
             mask = z < 0
-            w[mask] = z[mask] * (1.0 - shift)   # shift<0, 1-shift > 1 => amplify -tail
-
+            w[mask] = z[mask] * (1.0 - shift)
         w_std = float(np.std(w))
         if w_std > 1e-10:
             w = (w - float(np.mean(w))) / w_std
         z = w
-
     return z
 
 
@@ -444,39 +338,24 @@ def _kurtosis_topup(
     max_jumps:    int   = 20,
     max_eff_jstd: Optional[float] = None,
 ) -> np.ndarray:
-    """
-    Additive jump injection to restore kurtosis.
-
-    Used per-window in generate() (Step 6).
-    NOT used in the global pass as of v59.
-
-    Input rets should be in z-score space (std~1).
-    """
     if len(rets) < 4:
         return rets
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         realised_ek = float(stats.kurtosis(rets))
-
     if realised_ek >= topup_frac * target_ek:
         return rets
-
     ek_deficit = target_ek - realised_ek
     ret_std    = float(np.std(rets))
     n_jumps    = int(np.clip(np.ceil(ek_deficit * len(rets) / 20.0), 1, max_jumps))
-
     skew_bias  = float(np.clip(skew_raw * 0.3, -1.0, 1.0))
     eff_jstd   = float(max(jump_std, ret_std * 3.0))
-
     if max_eff_jstd is not None:
         eff_jstd = float(np.clip(eff_jstd, 0.0, max_eff_jstd))
-
     jump_draws = rng.normal(skew_bias * eff_jstd, eff_jstd, size=n_jumps)
-
     out      = rets.copy()
     large_ix = np.argsort(np.abs(out))[-n_jumps:]
     out[large_ix] += jump_draws
-
     return out
 
 
@@ -487,39 +366,8 @@ def _global_kurtosis_inject(
     rng:             np.random.Generator,
     trigger_frac:    float = 0.60,
 ) -> np.ndarray:
-    """
-    DEPRECATED (v57): this function is NOT called anywhere.
-    Kept for reference only.
-    """
-    if len(z) < 4:
-        return z
-
-    out = z.copy()
-
-    abs_z    = np.abs(out)
-    clip_ix  = np.where(abs_z > _GLOBAL_TAIL_CLIP_Z)[0]
-    if len(clip_ix) > 0:
-        jitter   = np.random.default_rng(0).uniform(1.0, 1.05, size=len(clip_ix))
-        out[clip_ix] = np.sign(out[clip_ix]) * _GLOBAL_TAIL_CLIP_Z * jitter
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        realised_ek = float(stats.kurtosis(out))
-
-    if realised_ek >= trigger_frac * true_target_ek:
-        return out
-
-    n_inject = _GLOBAL_N_INJECT
-    sign_val = float(np.sign(skew_target)) if abs(skew_target) > 0.1 else 1.0
-    signs    = np.array([sign_val * (1 if i % 2 == 0 else -1) for i in range(n_inject)])
-
-    inject_z = float(np.clip(_GLOBAL_INJECT_Z, 0.0, _GLOBAL_INJECT_Z_MAX))
-    large_ix = np.argsort(np.abs(out))[-n_inject:]
-    for k, ix in enumerate(large_ix):
-        new_val = float(np.sign(out[ix]) if abs(out[ix]) > 0.1 else signs[k]) * inject_z
-        out[ix] = float(np.clip(new_val, -_GLOBAL_INJECT_Z_MAX, _GLOBAL_INJECT_Z_MAX))
-
-    return out
+    """DEPRECATED (v57): not called anywhere. Kept for reference."""
+    return z
 
 
 # ---------------------------------------------------------------------------
@@ -529,14 +377,11 @@ def _global_kurtosis_inject(
 def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
     if "Volume" not in df_ohlc.columns:
         return 0.0, 1.0, 0.0, 0.0
-
     raw_vol = df_ohlc["Volume"].values.astype(float)
     raw_vol = np.maximum(raw_vol, 1.0)
     log_v   = np.log(raw_vol)
-
     vol_log_mean = float(np.mean(log_v))
     vol_log_std  = float(max(np.std(log_v, ddof=1), 1e-6))
-
     n_ret = len(log_rets)
     if n_ret >= 4 and len(log_v) > n_ret:
         lv_aligned = log_v[-n_ret:]
@@ -549,7 +394,6 @@ def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
             beta = 0.0
     else:
         beta = 0.0
-
     resid = log_v - vol_log_mean
     if len(resid) >= 4:
         with warnings.catch_warnings():
@@ -558,7 +402,6 @@ def _fit_volume_params(df_ohlc: pd.DataFrame, log_rets: np.ndarray):
         ar1 = float(np.clip(ar1 if np.isfinite(ar1) else 0.0, -0.9, 0.9))
     else:
         ar1 = 0.0
-
     return vol_log_mean, vol_log_std, beta, ar1
 
 
@@ -573,16 +416,13 @@ def _generate_volume(
     n = len(z_final)
     if n == 0:
         return np.array([], dtype=np.int64)
-
     u = rng.normal(0.0, vol_log_std, size=n)
     u = u + vol_ret_beta * np.abs(z_final)
-
     innov_sc = float(np.sqrt(max(1.0 - vol_ar1 ** 2, 0.0)))
     v = np.empty(n)
     v[0] = u[0]
     for i in range(1, n):
         v[i] = vol_ar1 * v[i - 1] + innov_sc * u[i]
-
     log_vol = vol_log_mean + v
     raw = np.exp(log_vol)
     raw = np.clip(raw, 1.0, 1e13)
@@ -606,34 +446,26 @@ def fit(
     log_rets = _log_returns(closes)
     if len(log_rets) < 5:
         raise ValueError(f"lookback too short ({len(log_rets)} bars), need >= 5.")
-
     ret_mu  = float(np.mean(log_rets))
     ret_std = float(np.std(log_rets, ddof=1))
-
     df_t               = _fit_df_scan(log_rets)
     skew_a, _, _       = _fit_skewnorm(log_rets)
     h                  = hurst_exponent(log_rets)
     wick_lam, atr_mean = _fit_wick_lambda(df_history)
-
     jump_freq, jump_std = _fit_jump_params(log_rets, ret_std)
     vol_persistence     = _fit_vol_persistence(log_rets, ret_mu)
     acf_lag1            = _fit_acf_lag1(log_rets)
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ek       = float(stats.kurtosis(log_rets))
         skew_raw = float(stats.skew(log_rets))
-
     raw_ek    = float(np.clip(ek, ek_global_floor, _TARGET_EK_MAX))
     target_ek = float(np.clip(raw_ek * ek_oversample, ek_global_floor, _TARGET_EK_MAX))
-
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
         trend_bias = float(np.sign(real_trend) * abs(ret_mu) * 0.3)
         ret_mu = ret_mu + trend_bias
-
     vol_log_mean, vol_log_std, vol_ret_beta, vol_ar1 = _fit_volume_params(df_history, log_rets)
-
     return StatParams(
         ret_mu          = ret_mu,
         ret_std         = ret_std,
@@ -657,17 +489,6 @@ def fit(
 
 # ---------------------------------------------------------------------------
 # 2. GENERATE
-#
-# Pipeline:
-#   Step 1  Sample nct with iterative nc correction
-#   Step 2  AR1 Hurst filter
-#   Step 3  ACF lag1 micro-adjust
-#   Step 4  GARCH(1,1) clip (0.5, 2.0)
-#   Step 5  Skew post-shift: 2-iter, clamp 0.20
-#   Step 6  Jump overlay  (v57.1: eff_std in z-score space; v60: cap 4.0->6.0)
-#   Step 7  Exact rescale -> (ret_mu, ret_std)
-#   Step 8  OHLC wick
-#   Step 9  Volume
 # ---------------------------------------------------------------------------
 
 _AR1_WARMUP = 50
@@ -681,7 +502,6 @@ def generate(
     drift_correction: float = 0.0,
 ) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-
     ret_mu          = params["ret_mu"] + drift_correction
     ret_std         = params["ret_std"]
     skew_raw        = float(params.get("ret_skew_raw", 0.0))
@@ -693,25 +513,18 @@ def generate(
     vol_persistence = params["vol_persistence"]
     acf_lag1        = params["acf_lag1"]
     target_ek       = params["target_ek"]
-
     vol_log_mean  = float(params.get("vol_log_mean", 0.0))
     vol_log_std   = float(params.get("vol_log_std",  1.0))
     vol_ret_beta  = float(params.get("vol_ret_beta", 0.0))
     vol_ar1       = float(params.get("vol_ar1",      0.0))
-
     total = n_bars + _AR1_WARMUP
 
-    # Step 1: Sample nct with iterative nc correction
+    # Step 1
     df_nct = _df_from_ek(target_ek)
-    z_raw  = _sample_nct_iterative(
-        df=df_nct,
-        target_skew=skew_raw,
-        n=total,
-        rng=rng,
-        max_iter=2,
-    )
+    z_raw  = _sample_nct_iterative(df=df_nct, target_skew=skew_raw,
+                                    n=total, rng=rng, max_iter=2)
 
-    # Step 2: AR1 Hurst
+    # Step 2
     rho = _ar1_hurst_rho(hurst)
     if abs(rho) > 1e-6:
         innov_sc    = float(np.sqrt(max(1.0 - rho ** 2, 0.0)))
@@ -723,7 +536,7 @@ def generate(
     else:
         z_ar = z_raw[_AR1_WARMUP:].copy()
 
-    # Step 3: ACF lag1 micro-adjust
+    # Step 3
     if abs(acf_lag1) > 0.05 and n_bars > 1:
         z_acf = z_ar.copy()
         for i in range(1, n_bars):
@@ -731,19 +544,17 @@ def generate(
         z_s  = float(np.std(z_acf))
         z_ar = z_acf / z_s if z_s > 1e-10 else z_acf
 
-    # Step 4: GARCH(1,1) — clip (0.5, 2.0)
+    # Step 4
     alpha = vol_persistence
     if alpha > 0.02 and n_bars > 1:
         beta_g   = float(np.clip(alpha * 0.8, 0.0, 0.89))
         alpha_s  = float(np.clip(alpha * 0.15, 0.01, 0.20))
         base_var = 1.0
         omega    = base_var * max(1.0 - beta_g - alpha_s, 0.01)
-
         h_t        = np.empty(n_bars)
         z_garch    = np.empty(n_bars)
         h_t[0]     = base_var
         z_garch[0] = z_ar[0]
-
         for i in range(1, n_bars):
             h_t[i]     = omega + beta_g * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
             h_t[i]     = max(h_t[i], base_var * 0.01)
@@ -752,10 +563,10 @@ def generate(
     else:
         z_garch = z_ar
 
-    # Step 5: Skew post-shift — 2-iter, clamp 0.20 per-window
+    # Step 5
     z_shifted = _skew_post_shift(z_garch, target_skew=skew_raw, clamp=0.20)
 
-    # Step 6: Jump overlay (v57.1: eff_std in z-score space; v60: cap 4.0->6.0)
+    # Step 6
     z_work = z_shifted.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
@@ -768,19 +579,18 @@ def generate(
             skew_b     = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
             z_work[jump_idx] += rng.normal(skew_b, eff_std, size=n_jumps)
 
-    # Step 7: Exact rescale -> (ret_mu, ret_std)
+    # Step 7
     z_std = float(np.std(z_work))
     if z_std > 1e-10:
         z_final = (z_work - float(np.mean(z_work))) / z_std * ret_std + ret_mu
     else:
         z_final = np.full(n_bars, ret_mu)
 
-    # Step 8: OHLC
+    # Step 8
     prices    = np.empty(n_bars + 1)
     prices[0] = start_price
     for i in range(n_bars):
         prices[i + 1] = prices[i] * np.exp(z_final[i])
-
     opens  = prices[:-1].copy()
     closes = prices[1:].copy()
     atr_adj = max(atr_mean, 1e-4)
@@ -789,26 +599,16 @@ def generate(
     highs   = np.maximum(opens, closes) + upper_w
     lows    = np.maximum(np.minimum(opens, closes) - lower_w, 1e-6)
 
-    # Step 9: Volume
+    # Step 9
     if vol_log_mean != 0.0 or vol_log_std != 1.0:
-        volume = _generate_volume(
-            z_final      = z_final,
-            vol_log_mean = vol_log_mean,
-            vol_log_std  = vol_log_std,
-            vol_ret_beta = vol_ret_beta,
-            vol_ar1      = vol_ar1,
-            rng          = rng,
-        )
+        volume = _generate_volume(z_final=z_final, vol_log_mean=vol_log_mean,
+                                   vol_log_std=vol_log_std, vol_ret_beta=vol_ret_beta,
+                                   vol_ar1=vol_ar1, rng=rng)
     else:
         volume = np.zeros(n_bars, dtype=np.int64)
 
-    return pd.DataFrame({
-        "Open":   opens,
-        "High":   highs,
-        "Low":    lows,
-        "Close":  closes,
-        "Volume": volume,
-    })
+    return pd.DataFrame({"Open": opens, "High": highs,
+                          "Low": lows, "Close": closes, "Volume": volume})
 
 
 # ---------------------------------------------------------------------------
@@ -816,21 +616,6 @@ def generate(
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
-    """
-    v63: Fix ridge y_ek scale mismatch (Bug 4).
-
-    record() now accepts an explicit ek_oversample argument.  The stored
-    y_ek label is realised_ek * ek_oversample (the same scale that was
-    used to compute params["target_ek"] for this window).
-
-    Previously record() always used the module-level constant _EK_OVERSAMPLE
-    (3.2), but fit() was called with the adaptive ek_oversample_adj, so y_ek
-    and target_ek were in different scales as ek_oversample_adj diverged from
-    3.2.  The ridge would then pull target_ek toward the wrong value.
-
-    v61: Fix EK scale mismatch.
-    """
-
     def __init__(self, min_train=10, max_blend=0.50):
         self.min_train = min_train
         self.max_blend = max_blend
@@ -842,11 +627,6 @@ class OnlineRidgePredictor:
 
     def record(self, params, realised_std, realised_skew, realised_hurst, realised_ek,
                ek_oversample: float = _EK_OVERSAMPLE):
-        """
-        ek_oversample: the value passed to fit() for this window.
-        y_ek is stored as realised_ek * ek_oversample so it matches the
-        scale of params["target_ek"] (which was computed as raw_ek * ek_oversample).
-        """
         feat = [
             params["ret_std"], params["ret_skew_a"],
             params["hurst_target"], params["target_ek"],
@@ -856,7 +636,6 @@ class OnlineRidgePredictor:
         self._y_std.append(realised_std)
         self._y_skew.append(realised_skew)
         self._y_hurst.append(realised_hurst)
-        # v63: use the actual ek_oversample used for this window, not the constant
         self._y_ek.append(realised_ek * ek_oversample)
 
     def _ridge_predict(self, X, y, x_new, alpha=1.0):
@@ -919,16 +698,12 @@ def rolling_fit_generate(
     all_dtw:   list[float] = []
     all_pcorr: list[float] = []
 
-    # v54 Fix A: compute global skew anchor from full price series
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         _global_log_rets = _log_returns(df_real["Close"].values)
         global_skew_target = float(stats.skew(_global_log_rets)) if len(_global_log_rets) > 3 else 0.0
 
     _SKEW_ANCHOR_BAND = 0.5
-
-    # v63 Bug 3 fix: ek_oversample_adj is recomputed INSIDE the while-loop each window.
-    # The initial value here is unused; see computation at the top of each iteration.
 
     while pos + lookback < n:
         window_idx += 1
@@ -941,9 +716,6 @@ def rolling_fit_generate(
         df_fit = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         df_fwd = df_real.iloc[fwd_start:fwd_end].copy().reset_index(drop=True)
 
-        # v63 Bug 3 fix: recompute ek_oversample_adj each window from the current EMA.
-        # This means windows after the global pass (next run) AND within a run both
-        # benefit from updated EMA values as soon as they are available.
         ek_oversample_adj = float(np.clip(
             _EK_OVERSAMPLE / max(_ek_decay_ema, 0.15),
             1.5, 6.0,
@@ -951,7 +723,6 @@ def rolling_fit_generate(
 
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
 
-        # v54 Fix A: soft-clip ret_skew_raw to global anchor band
         raw_skew_window = float(params["ret_skew_raw"])
         anchored_skew   = float(np.clip(
             raw_skew_window,
@@ -964,7 +735,8 @@ def rolling_fit_generate(
         calib_action = None
         if calibrator is not None:
             from sim.calibrator import AdaptiveCalibrator
-            ctx          = AdaptiveCalibrator.build_context(params)
+            # v64: pass ek_oversample_adj into build_context (10-dim)
+            ctx          = AdaptiveCalibrator.build_context(params, ek_oversample=ek_oversample_adj)
             calib_action = calibrator.predict(ctx)
             params_dict  = calib_action.apply(dict(params))
             params       = StatParams(**params_dict)
@@ -1009,6 +781,7 @@ def rolling_fit_generate(
 
         if calibrator is not None and calib_action is not None:
             if all(np.isfinite(v) for v in [std_err_pct, kurt_err, hurst_err, dir_hit]):
+                # v64: ctx already includes ek_oversample_adj (10-dim)
                 calibrator.record(
                     context     = ctx,
                     action      = calib_action,
@@ -1018,7 +791,6 @@ def rolling_fit_generate(
                     dir_hit     = dir_hit,
                 )
 
-        # v63 Bug 4 fix: pass ek_oversample_adj so y_ek is stored in the correct scale
         if predictor is not None and len(real_rets) > 3:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -1028,7 +800,7 @@ def rolling_fit_generate(
                     float(stats.skew(real_rets)),
                     float(hurst_exponent(real_rets)) if len(real_rets) > 10 else params["hurst_target"],
                     float(stats.kurtosis(real_rets)),
-                    ek_oversample=ek_oversample_adj,   # v63: was missing, used constant 3.2
+                    ek_oversample=ek_oversample_adj,
                 )
 
         real_c = float(df_fwd["Close"].iloc[-1])
@@ -1063,7 +835,7 @@ def rolling_fit_generate(
         pos += step
 
     # -----------------------------------------------------------------------
-    # Global std-rescale (v48) + drift alignment (v49.2)
+    # Global std-rescale + drift alignment
     # -----------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -1085,14 +857,12 @@ def rolling_fit_generate(
                 orig_opens  = df_result["Open"].values.astype(float)
                 orig_highs  = df_result["High"].values.astype(float)
                 orig_lows   = df_result["Low"].values.astype(float)
-
                 log_ret_sim = np.diff(np.log(np.maximum(orig_closes, 1e-10)))
                 scaled_rets = log_ret_sim * scale
                 new_closes  = np.empty(len(orig_closes))
                 new_closes[0] = orig_closes[0]
                 for i in range(1, len(new_closes)):
                     new_closes[i] = new_closes[i - 1] * np.exp(scaled_rets[i - 1])
-
                 price_ratio        = new_closes / np.maximum(orig_closes, 1e-10)
                 df_result          = df_result.copy()
                 df_result["Close"] = new_closes
@@ -1117,36 +887,22 @@ def rolling_fit_generate(
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
 
-        # ------------------------------------------------------------------
-        # v62 Global pass: soft-clip + skew align + std pin
-        # v63: EMA updated HERE so the module-level state is ready for the
-        #      next call to rolling_fit_generate.  Within a single run,
-        #      ek_oversample_adj is recomputed per-window from _ek_decay_ema
-        #      (Bug 3 fix), so the update also benefits the last few windows
-        #      if rolling_fit_generate is called multiple times in a session.
-        # ------------------------------------------------------------------
+        # Global pass: soft-clip + skew align + std pin
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
-
         topup_mu  = float(np.mean(final_rets))
         topup_std = float(np.std(final_rets))
         if topup_std < 1e-10:
             topup_std = 1e-10
-
         z_norm = (final_rets - topup_mu) / topup_std
 
-        # Step 2: measure ek_before
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             ek_before = float(stats.kurtosis(z_norm))
 
-        # Step 3: soft-clip (preserves fat-tail structure)
-        z_wins = _soft_clip_z(z_norm,
-                              inner=_SOFT_CLIP_INNER,
-                              outer=_SOFT_CLIP_OUTER)
+        z_wins = _soft_clip_z(z_norm, inner=_SOFT_CLIP_INNER, outer=_SOFT_CLIP_OUTER)
 
-        # Step 4: measure ek_after; update EMA for adaptive oversample
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             ek_after = float(stats.kurtosis(z_wins))
@@ -1167,13 +923,9 @@ def rolling_fit_generate(
                 f"  oversample_next={_EK_OVERSAMPLE/max(_ek_decay_ema,0.15):.2f}"
             )
 
-        # Step 5: linear skew alignment (v61 tail-selective, 3-iter)
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
-
-        # Rescale back to raw scale
         final_rets_fixed = z_aligned * topup_std + topup_mu
 
-        # Step 7: std pin to real_global_std
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
             std_scale = real_global_std / post_std
@@ -1181,7 +933,6 @@ def rolling_fit_generate(
                 post_mu          = float(np.mean(final_rets_fixed))
                 final_rets_fixed = (final_rets_fixed - post_mu) * std_scale + post_mu
 
-        # Rebuild price series if rets changed
         if not np.allclose(final_rets_fixed, final_rets, atol=1e-12):
             base_close  = df_result["Close"].values[0]
             new_closes  = np.empty(len(df_result))
