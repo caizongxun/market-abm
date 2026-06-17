@@ -1,15 +1,27 @@
 """
-calibrator.py  v6.1
+calibrator.py  v6.2
 ===================
 AdaptiveCalibrator：ES（Evolution Strategy）策略更新 + 連續 RL 閉環支援。
 
+v6.2 (方案B): kurt_err 加入樣本量折扣。
+  問題：
+    20-bar 窗口估出的 realised kurtosis 方差極大（Fisher kurtosis 需 ~100+ 樣本
+    才有合理精度）。calibrator 拿這個噪音當 signal 更新 d_target_ek，導致
+    UNH 等品種學錯方向，越調越偏。
+
+  修正：
+    _compute_reward() 新增 n_bars 參數。
+    kurt 的權重乘以 weight_k = min(n_bars, 120) / 120，
+    使 20-bar 窗口的 kurt 貢獻只有 120-bar 窗口的 1/6。
+    其餘指標（std, hurst, dir）不受影響。
+
+  調用方：
+    record() 新增 n_bars 關鍵字參數（預設 120 以向後相容，不傳等同舊行為）。
+    stat_process.rolling_fit_generate 傳入 fwd_bars。
+
 v6.1 (P1)：
   1. PARAM_SAFE["target_ek"] 上限 15.0 → 60.0，與 stat_process._TARGET_EK_MAX 同步。
-     原來 CalibAction.apply() 的安全邊界會把 calibrator 將 target_ek 調到 15 以上的
-     部分指令截掉，導致 UNH 等高 kurtosis 品種的修正完全失效。
   2. d_target_ek clip: (-0.50, 0.50) → (-0.30, 0.30)
-     每步 ±50% 的乘法幅度過大，對 ESPolicy mean_vec 的確定性學習造成帥擾。
-     縮小到 ±30%，同樣給 calibrator 更明確的梯度方向。
 
 v6 主要變更：
   1. build_context 擴充至 10 維：新增 ek_oversample_adj。
@@ -78,6 +90,9 @@ _ES_EXPLORE_INIT  = 0.15
 _ES_EXPLORE_FLOOR = 0.02
 _ES_DECAY_HALF    = 2000
 _ES_LR            = 0.10
+
+# v6.2: kurt discount normalisation base (bars)
+_KURT_N_BASE = 120
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +237,15 @@ class RidgeModel:
 
 
 # ---------------------------------------------------------------------------
-# AdaptiveCalibrator  v6.1
+# AdaptiveCalibrator  v6.2
 # ---------------------------------------------------------------------------
 
 class AdaptiveCalibrator:
     """
+    v6.2: kurt_err sample-size discount.
+      _compute_reward() accepts n_bars; kurt weight *= min(n_bars, 120) / 120.
+      record() accepts n_bars kwarg (default 120 = no discount).
+
     v6.1: PARAM_SAFE target_ek 15->60, d_target_ek clip +-0.50->+-0.30.
     v6:   build_context 10-dim (+ ek_oversample_adj) + reward rebalanced.
 
@@ -298,15 +317,21 @@ class AdaptiveCalibrator:
         kurt_err:    float,
         hurst_err:   float,
         dir_hit:     float,
+        n_bars:      int = _KURT_N_BASE,
     ) -> float:
         """
-        v6 reward: kurtosis elevated to primary signal.
+        v6.2: kurt weight discounted by sample size.
+          weight_k = min(n_bars, _KURT_N_BASE) / _KURT_N_BASE
+          At n_bars=20 (default step):  weight_k = 20/120 ≈ 0.167
+          At n_bars=120 (full lookback): weight_k = 1.0  (no discount)
 
+        v6 reward base:
           -(0.05*std + 0.70*log1p(kurt)/3 + 0.15*hurst/0.05 - 0.10*dir)
         """
+        weight_k = float(min(n_bars, _KURT_N_BASE)) / _KURT_N_BASE
         r = -(
             0.05 * float(std_err_pct)
-            + 0.70 * float(np.log1p(kurt_err)) / 3.0
+            + 0.70 * weight_k * float(np.log1p(kurt_err)) / 3.0
             + 0.15 * float(hurst_err) / 0.05
             - 0.10 * float(dir_hit)
         )
@@ -360,8 +385,10 @@ class AdaptiveCalibrator:
         kurt_err:    float,
         hurst_err:   float,
         dir_hit:     float,
+        n_bars:      int = _KURT_N_BASE,
     ) -> None:
-        reward = self._compute_reward(std_err_pct, kurt_err, hurst_err, dir_hit)
+        """v6.2: n_bars forwarded to _compute_reward for kurt discount."""
+        reward = self._compute_reward(std_err_pct, kurt_err, hurst_err, dir_hit, n_bars=n_bars)
         self._buffer.push(context, action.to_array(), reward)
         self._reward_history.append(reward)
         self.n_experiences += 1

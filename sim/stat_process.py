@@ -1,6 +1,14 @@
 """
-stat_process.py  v67
+stat_process.py  v68
 ====================
+v68: Pass fwd_bars to calibrator.record() for kurt sample-size discount (方案B).
+
+  calibrator.record() now receives n_bars=fwd_bars so that the kurt_err
+  signal is down-weighted by min(fwd_bars, 120) / 120.
+  For the default step=20 this gives a 0.167x discount, preventing the
+  calibrator from over-fitting d_target_ek to noisy short-window kurtosis
+  estimates (root cause of UNH kurt_err=18 and similar outliers).
+
 v67: Per-symbol dynamic soft_clip inner/outer based on median target_ek.
 
   Problem:
@@ -591,6 +599,7 @@ def rolling_fit_generate(
             params = StatParams(**{**dict(params), "ret_skew_raw": anchored_skew})
 
         calib_action = None
+        ek_oversample_init = ek_oversample_adj  # default if no calibrator
         if calibrator is not None:
             from sim.calibrator import AdaptiveCalibrator
 
@@ -658,6 +667,7 @@ def rolling_fit_generate(
                     kurt_err    = kurt_err,
                     hurst_err   = hurst_err,
                     dir_hit     = dir_hit,
+                    n_bars      = fwd_bars,   # v68: sample-size discount
                 )
 
         if predictor is not None and len(real_rets) > 3:
