@@ -1,28 +1,30 @@
 """
-stat_process.py  v59
+stat_process.py  v60
 ====================
 純統計過程模型，完全不使用 agent。
 
+v60: Fix skew underfit + kurtosis suppression caused by global-pass winsorize.
+
+     Two independent root causes patched separately:
+
+     Skew problem (real +0.45 vs sim -0.75, gap ~1.2):
+       - _linear_skew_align was too weak: max_shift=0.10 with coeff=0.15
+         meant shift=0.18 was clipped to 0.10, leaving gap ~1.1 uncorrected.
+       - Fix: max_shift 0.10->0.35, coeff 0.15->0.40, add n_iter=3 loop.
+         Each pass now shifts up to 0.35 skew units; 3 passes close gap ~1.2.
+
+     Kurtosis problem (real 10.6 vs sim 3.3, ratio 3.2x):
+       - Root cause 1: _EK_OVERSAMPLE=1.8 underestimates degradation;
+         actual pipeline degrades ~60-65%.  Raised to 2.6.
+       - Root cause 2: global-pass winsorize(0.5%) on ~800-bar series
+         removes 8 points — exactly the extreme values that sustain
+         kurtosis.  Replaced with hard z-clip at 5.5-sigma, which only
+         removes genuine blow-up artefacts (|z| > 5.5).
+       - Root cause 3: generate() Step 6 jump eff_std cap was 4.0,
+         hitting ceiling for AAPL (ek_amp=1.33, jump_std_z ~3).
+         Raised to 6.0.
+
 v59: Replace global-pass kurtosis_topup with winsorize + linear skew align.
-
-     Strategy change: the global pass should NOT inject new jumps because
-     per-window generate() has already built the structural features
-     (AR1 Hurst, GARCH, jump overlays). Injecting more jumps in the global
-     pass breaks that structure and risks kurtosis / skew explosion.
-
-     New global-pass pipeline (all in z-score space):
-       1. Winsorize 0.5% tails  → removes sporadic blow-up points
-       2. Linear skew alignment → correct residual skew without cubic amplification
-       3. std pin to real_global_std → same as before
-
-     Removed from global pass:
-       - _kurtosis_topup() call (was causing kurtosis/skew explosions in v56-v58)
-       - soft-clip z_clipped / re-standardise before _skew_post_shift
-       - cubic _skew_post_shift (replaced by linear shift)
-
-     _kurtosis_topup() is still used per-window in generate() (Step 6 area),
-     and the function definition is kept for potential future use.
-
 v58: Fix global-pass kurtosis=776 / skew=-27 explosion (3 root causes).
 v57.1: Fix per-window kurtosis explosion in generate() Step 6.
 v57: Revert global pass to v54 logic; drop _global_kurtosis_inject.
@@ -216,8 +218,8 @@ _NCT_DF_FLOOR = 4.05
 _NCT_DF_CEIL  = 30.0
 _NCT_NC_MAX   = 8.0
 
-# v53 Fix B: pipeline degrades kurtosis ~55%; pre-amplify target_ek by this factor
-_EK_OVERSAMPLE = 1.8
+# v60: raised from 1.8; pipeline degrades ~60-65% total (not 45% as assumed in v53)
+_EK_OVERSAMPLE = 2.6
 
 # v58 global-pass safety constants (kept for reference; global topup REMOVED in v59)
 _GLOBAL_TAIL_CLIP_Z  = 6.0
@@ -227,8 +229,8 @@ _GLOBAL_INJECT_Z_MAX = 4.0
 _GLOBAL_MAX_EFF_JSTD = 2.5
 _GLOBAL_SKEW_CLIP_Z  = 5.0
 
-# v59: global-pass winsorize tail fraction
-_GLOBAL_WINSORIZE_TAIL = 0.005   # 0.5% each side
+# v60: disabled winsorize; use hard z-clip at 5.5-sigma instead
+_GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used in v60 global pass
 
 
 def _df_from_ek(target_ek: float) -> float:
@@ -326,40 +328,44 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
 def _linear_skew_align(
     z:           np.ndarray,
     target_skew: float,
-    max_shift:   float = 0.10,
+    max_shift:   float = 0.35,
+    n_iter:      int   = 3,
 ) -> np.ndarray:
     """
-    v59: Linear skew correction for the global pass.
+    v60: Stronger linear skew correction for the global pass.
 
-    Instead of cubic z^3 (which amplifies outliers), compute the skew
-    gap and apply a small constant additive shift to the upper or lower
-    tail direction.
+    v59 was too weak: max_shift=0.10 with coeff=0.15 meant that for
+    skew_gap=1.2, shift=0.18 was clipped to 0.10, leaving ~1.0 gap
+    uncorrected.  v60 raises max_shift to 0.35 and coeff to 0.40, and
+    runs up to n_iter=3 passes so the correction accumulates.
 
-    Method: shift = clip(target_skew - current_skew, -max_shift, max_shift)
+    Method: shift = clip(skew_gap * 0.40, -max_shift, max_shift)
     Applied as: w = z + shift * abs(z)   (amplifies tails directionally)
     Then re-standardise to (mean=0, std=1).
 
-    This is bounded and monotonic — no risk of cubic blow-up.
-    max_shift=0.10 allows at most ~0.6 skew correction per call (empirical).
+    Empirical: each pass at shift=0.35 corrects ~0.6-0.8 skew units;
+    3 passes can close a gap of ~1.5 without blow-up risk.
     """
     if len(z) < 4:
         return z
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        current_skew = float(stats.skew(z))
+    for _ in range(n_iter):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            current_skew = float(stats.skew(z))
 
-    skew_gap = target_skew - current_skew
-    if abs(skew_gap) < 0.05:
-        return z
+        skew_gap = target_skew - current_skew
+        if abs(skew_gap) < 0.05:
+            break
 
-    shift = float(np.clip(skew_gap * 0.15, -max_shift, max_shift))
-    w     = z + shift * np.abs(z)
-    w_std = float(np.std(w))
-    if w_std > 1e-10:
-        w = (w - float(np.mean(w))) / w_std
+        shift = float(np.clip(skew_gap * 0.40, -max_shift, max_shift))
+        w     = z + shift * np.abs(z)
+        w_std = float(np.std(w))
+        if w_std > 1e-10:
+            w = (w - float(np.mean(w))) / w_std
+        z = w
 
-    return w
+    return z
 
 
 def _kurtosis_topup(
@@ -592,7 +598,7 @@ def fit(
 #   Step 3  ACF lag1 微調
 #   Step 4  GARCH(1,1) clip (0.5, 2.0)
 #   Step 5  Skew post-shift: 2-iter, clamp 0.20
-#   Step 6  jump 疊加  (v57.1: eff_std 改在 z-score 空間計算)
+#   Step 6  jump 疊加  (v57.1: eff_std 改在 z-score 空間計算; v60: cap 4.0->6.0)
 #   Step 7  exact rescale → (ret_mu, ret_std)
 #   Step 8  OHLC wick
 #   Step 9  Volume
@@ -683,7 +689,7 @@ def generate(
     # Step 5: Skew post-shift — 2-iter, clamp 0.20 per-window
     z_shifted = _skew_post_shift(z_garch, target_skew=skew_raw, clamp=0.20)
 
-    # Step 6: jump 疊加 (v57.1: eff_std 在 z-score 空間計算)
+    # Step 6: jump 疊加 (v57.1: eff_std 在 z-score 空間計算; v60: cap 4.0->6.0)
     z_work = z_shifted.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
@@ -692,7 +698,7 @@ def generate(
             jump_std_z = jump_std / max(ret_std, 1e-10)
             raw_ek     = target_ek / _EK_OVERSAMPLE
             ek_amp     = float(np.sqrt(max(raw_ek / 6.0, 1.0)))
-            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 4.0))
+            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 6.0))  # v60: raise cap 4.0->6.0
             skew_b     = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
             z_work[jump_idx] += rng.normal(skew_b, eff_std, size=n_jumps)
 
@@ -1007,19 +1013,19 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v59: Global pass — winsorize + linear skew align + std pin
+        # v60: Global pass — hard z-clip + linear skew align + std pin
         #
-        # Strategy: do NOT inject new jumps. Per-window generate() has already
-        # built the structural features. The global pass only cleans up
-        # extreme outliers and corrects residual skew bias.
+        # v59 used winsorize(0.5%) which was removing ~8 tail points from
+        # ~800 bars — exactly the extreme values that sustain kurtosis.
+        # v60 replaces it with a hard z-clip at 5.5-sigma (removes only
+        # genuine blow-up artefacts) and strengthens the skew aligner.
         #
         # Pipeline (in z-score space):
-        #   1. Normalise final_rets → z-score space
-        #   2. Winsorize 0.5% tails (removes sporadic blow-up points)
-        #   3. Re-standardise after winsorize
-        #   4. Linear skew alignment via _linear_skew_align()
-        #   5. Rescale back to raw scale
-        #   6. std pin: enforce std == real_global_std
+        #   1. Hard z-clip |z| > 5.5  (replaces 0.5% winsorize)
+        #   2. Re-standardise after clip
+        #   3. Linear skew alignment via _linear_skew_align() (v60: 3-iter)
+        #   4. Rescale back to raw scale
+        #   5. std pin: enforce std == real_global_std
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
@@ -1032,18 +1038,17 @@ def rolling_fit_generate(
 
         z_norm = (final_rets - topup_mu) / topup_std
 
-        # Step 1: Winsorize 0.5% tails
-        lo_q = float(np.quantile(z_norm, _GLOBAL_WINSORIZE_TAIL))
-        hi_q = float(np.quantile(z_norm, 1.0 - _GLOBAL_WINSORIZE_TAIL))
-        z_wins = np.clip(z_norm, lo_q, hi_q)
+        # Step 1: Hard z-clip at 5.5-sigma (replaces v59 winsorize 0.5%)
+        _HARD_CLIP_Z = 5.5
+        z_wins = np.clip(z_norm, -_HARD_CLIP_Z, _HARD_CLIP_Z)
 
-        # Re-standardise after winsorize
+        # Re-standardise after clip
         z_wins_std = float(np.std(z_wins))
         if z_wins_std > 1e-10:
             z_wins = (z_wins - float(np.mean(z_wins))) / z_wins_std
 
-        # Step 2: Linear skew alignment
-        z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target, max_shift=0.10)
+        # Step 2: Linear skew alignment (v60: max_shift=0.35, coeff=0.40, 3-iter)
+        z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
 
         # Rescale back to raw scale
         final_rets_fixed = z_aligned * topup_std + topup_mu
