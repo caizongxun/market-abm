@@ -12,6 +12,7 @@ run_sim.py
   # 統計過程模型（新）
   python run_sim.py --symbol AAPL --start 2023-01-01 --stat --plot
   python run_sim.py --symbol AAPL --start 2023-01-01 --stat --lookback 60 --step 20 --plot
+  python run_sim.py --symbol AAPL --start 2023-01-01 --stat --lookback 60 --step 20 --conditional --plot
 
 完整參數
 --------
@@ -22,6 +23,7 @@ run_sim.py
   --plot            產生比對圖
   --rolling         開啟 ABM rolling calibration 模式
   --stat            開啟統計過程模型 rolling 模式（Student-t + FBM + wick）
+  --conditional     stat 模式下改用 block-bootstrap conditional generator（v70）
   --lookback        Rolling 模式的回看窗口（預設 60）
   --step            Rolling 模式的步進大小（預設 20）
   --ema-alpha       ABM rolling EMA 平滑係數（預設 0.4）
@@ -65,6 +67,8 @@ def parse_args():
     # StatProcess
     p.add_argument("--stat",         action="store_true",
                    help="Enable StatProcess rolling mode (Student-t + FBM + wick)")
+    p.add_argument("--conditional",  action="store_true",
+                   help="Use block-bootstrap conditional generator (v70 Step2)")
     return p.parse_args()
 
 
@@ -225,11 +229,12 @@ def run_stat(args, df_real):
     print(f"[stat] estimated windows: {est_windows}")
 
     df_result, param_log = rolling_fit_generate(
-        df_real  = df_real,
-        lookback = args.lookback,
-        step     = args.step,
-        seed     = args.seed,
-        verbose  = True,
+        df_real          = df_real,
+        lookback         = args.lookback,
+        step             = args.step,
+        seed             = args.seed,
+        verbose          = True,
+        use_conditional  = args.conditional,
     )
     return df_result, param_log
 
@@ -250,10 +255,19 @@ def save_results_stat(symbol, df_result, param_log):
 
 
 def plot_stat(symbol, df_real, df_result, param_log):
+    """
+    param_log keys (v70 stat_process):
+      window, fit_start, fit_end,
+      ret_std, ret_skew_a, hurst, target_ek,
+      ek_oversample_adj, ek_oversample_init,
+      jump_freq, vol_persistence,
+      std_err_pct, kurt_err, hurst_err, dir_hit, c_err, use_conditional
+    """
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 8))
-    fig.suptitle(f"{symbol} - StatProcess Rolling vs Real", fontsize=13)
+    cond_tag = " [conditional]" if any(p.get("use_conditional") for p in param_log if "window" in p) else ""
+    fig.suptitle(f"{symbol} - StatProcess Rolling vs Real{cond_tag}", fontsize=13)
 
     n = len(df_result)
     real_tail = df_real.iloc[-n:].copy().reset_index(drop=True)
@@ -280,20 +294,32 @@ def plot_stat(symbol, df_real, df_result, param_log):
     axes[0, 2].set_title("Rolling Volatility")
     axes[0, 2].legend()
 
-    # 過濾掉 _summary 記錄，只保留有 window key 的 window 記錄
+    # filter to window records only (exclude _summary)
     window_params = [p for p in param_log if "window" in p]
 
-    # (1,0) Student-t df
-    windows = [p["window"]       for p in window_params]
-    df_vals = [p["ret_df"]       for p in window_params]
-    hurst_v = [p["hurst_target"] for p in window_params]
-    # v3: ret_std (was ret_sigma in v1/v2)
-    std_v   = [p.get("ret_std", p.get("ret_sigma", 0.0)) for p in window_params]
-    wick_v  = [p["wick_lambda"]  for p in window_params]
+    if not window_params:
+        plt.tight_layout()
+        out_png = f"results/{symbol}_stat.png"
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+        print(f"[plot] saved -> {out_png}")
+        return
 
-    axes[1, 0].plot(windows, df_vals, marker="o", ms=3, color="tab:red")
-    axes[1, 0].set_title("Student-t df  (low = fat tail)")
-    axes[1, 0].axhline(y=10, linestyle="--", alpha=0.4)
+    windows  = [p["window"]           for p in window_params]
+    # v70 param_log uses 'hurst' (not 'hurst_target')
+    hurst_v  = [p.get("hurst", p.get("hurst_target", 0.5))  for p in window_params]
+    std_v    = [p.get("ret_std", 0.0)       for p in window_params]
+    ek_v     = [p.get("target_ek", 0.0)     for p in window_params]
+    ek_adj_v = [p.get("ek_oversample_adj", 1.0) for p in window_params]
+    kurt_v   = [p.get("kurt_err") for p in window_params]
+    kurt_v   = [v if v is not None and np.isfinite(v) else np.nan for v in kurt_v]
+
+    # (1,0) target_ek per window
+    ax = axes[1, 0]
+    ax.plot(windows, ek_v, marker="o", ms=3, color="tab:red", label="target_ek")
+    ax.set_title("target_ek per window")
+    ax.axhline(y=3.0, linestyle="--", alpha=0.4, label="ek=3 (Gaussian)")
+    ax.legend(fontsize=8)
 
     # (1,1) Hurst
     axes[1, 1].plot(windows, hurst_v, marker="o", ms=3, color="tab:blue")
@@ -301,14 +327,14 @@ def plot_stat(symbol, df_real, df_result, param_log):
     axes[1, 1].set_title("Hurst Target")
     axes[1, 1].set_ylim(0.3, 0.8)
 
-    # (1,2) std + wick
+    # (1,2) ret_std + kurt_err
     ax = axes[1, 2]
     ax.plot(windows, std_v,  marker="o", ms=3, label="ret_std", color="tab:orange")
     ax.set_ylabel("ret_std", color="tab:orange")
     axr = ax.twinx()
-    axr.plot(windows, wick_v, marker="s", ms=3, label="wick_lambda", color="tab:green", alpha=0.7)
-    axr.set_ylabel("wick_lambda", color="tab:green")
-    ax.set_title("ret_std / wick_lambda")
+    axr.plot(windows, kurt_v, marker="s", ms=3, label="kurt_err", color="tab:purple", alpha=0.7)
+    axr.set_ylabel("kurt_err", color="tab:purple")
+    ax.set_title("ret_std / kurt_err per window")
 
     plt.tight_layout()
     out_png = f"results/{symbol}_stat.png"
