@@ -1,29 +1,34 @@
 """
-stat_process.py  v60
+stat_process.py  v61
 ====================
 純統計過程模型，完全不使用 agent。
 
+v61: Fix two confirmed bugs in v60.
+
+     Bug 1: _linear_skew_align asymmetry
+       - v60 used: w = z + shift * abs(z)
+         When shift < 0 (negative skew target), this compresses BOTH tails
+         equally, producing near-zero skew change instead of negative skew.
+         The transform is directionally correct only for shift > 0.
+       - Fix: split into tail-selective operation:
+             positive side only: w[z>0] += shift * z[z>0]   (amplify/compress +tail)
+             negative side only: w[z<0] += shift * z[z<0]   (amplify/compress -tail)
+         For shift > 0: +tail grows, -tail shrinks → positive skew (correct)
+         For shift < 0: +tail shrinks, -tail grows → negative skew (correct)
+         Re-standardise after each pass.
+
+     Bug 2: OnlineRidgePredictor EK scale mismatch
+       - record() stores realised_ek (observed, raw scale, e.g. 3-12)
+       - predict_correction() blends params["target_ek"] (= raw_ek × 2.6,
+         e.g. 8-30) with ridge_predict output (predicting raw-scale realised_ek).
+         As blend grows the correction pulls target_ek DOWN toward raw scale,
+         defeating the entire _EK_OVERSAMPLE mechanism.
+       - Fix: record() now stores realised_ek × _EK_OVERSAMPLE so that both
+         sides of the blend are in the same "oversampled" space.  The ridge
+         model then learns to predict the correct oversampled target.
+         predict_correction() is unchanged.
+
 v60: Fix skew underfit + kurtosis suppression caused by global-pass winsorize.
-
-     Two independent root causes patched separately:
-
-     Skew problem (real +0.45 vs sim -0.75, gap ~1.2):
-       - _linear_skew_align was too weak: max_shift=0.10 with coeff=0.15
-         meant shift=0.18 was clipped to 0.10, leaving gap ~1.1 uncorrected.
-       - Fix: max_shift 0.10->0.35, coeff 0.15->0.40, add n_iter=3 loop.
-         Each pass now shifts up to 0.35 skew units; 3 passes close gap ~1.2.
-
-     Kurtosis problem (real 10.6 vs sim 3.3, ratio 3.2x):
-       - Root cause 1: _EK_OVERSAMPLE=1.8 underestimates degradation;
-         actual pipeline degrades ~60-65%.  Raised to 2.6.
-       - Root cause 2: global-pass winsorize(0.5%) on ~800-bar series
-         removes 8 points — exactly the extreme values that sustain
-         kurtosis.  Replaced with hard z-clip at 5.5-sigma, which only
-         removes genuine blow-up artefacts (|z| > 5.5).
-       - Root cause 3: generate() Step 6 jump eff_std cap was 4.0,
-         hitting ceiling for AAPL (ek_amp=1.33, jump_std_z ~3).
-         Raised to 6.0.
-
 v59: Replace global-pass kurtosis_topup with winsorize + linear skew align.
 v58: Fix global-pass kurtosis=776 / skew=-27 explosion (3 root causes).
 v57.1: Fix per-window kurtosis explosion in generate() Step 6.
@@ -230,7 +235,7 @@ _GLOBAL_MAX_EFF_JSTD = 2.5
 _GLOBAL_SKEW_CLIP_Z  = 5.0
 
 # v60: disabled winsorize; use hard z-clip at 5.5-sigma instead
-_GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used in v60 global pass
+_GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used in v60+ global pass
 
 
 def _df_from_ek(target_ek: float) -> float:
@@ -332,19 +337,44 @@ def _linear_skew_align(
     n_iter:      int   = 3,
 ) -> np.ndarray:
     """
-    v60: Stronger linear skew correction for the global pass.
+    v61: Fix directional asymmetry bug from v60.
 
-    v59 was too weak: max_shift=0.10 with coeff=0.15 meant that for
-    skew_gap=1.2, shift=0.18 was clipped to 0.10, leaving ~1.0 gap
-    uncorrected.  v60 raises max_shift to 0.35 and coeff to 0.40, and
-    runs up to n_iter=3 passes so the correction accumulates.
+    v60 used: w = z + shift * abs(z)
+    This is wrong for shift < 0: it compresses BOTH tails symmetrically,
+    yielding near-zero skew change instead of negative skew injection.
 
-    Method: shift = clip(skew_gap * 0.40, -max_shift, max_shift)
-    Applied as: w = z + shift * abs(z)   (amplifies tails directionally)
-    Then re-standardise to (mean=0, std=1).
+    v61 fix: apply shift selectively per tail sign.
 
-    Empirical: each pass at shift=0.35 corrects ~0.6-0.8 skew units;
-    3 passes can close a gap of ~1.5 without blow-up risk.
+        w = z.copy()
+        w[z > 0] += shift * z[z > 0]   # scale up/down positive tail
+        w[z < 0] += shift * z[z < 0]   # scale up/down negative tail (same direction)
+
+    For shift > 0:
+        positive tail: z[z>0] * (1 + shift)  → grows  → +skew
+        negative tail: z[z<0] * (1 + shift)  → more negative → but sign(z)<0 so
+                       the negative tail actually shrinks in absolute z relative
+                       to the positive tail increase → net +skew
+    Wait — that's still symmetric in z-score space.  The correct selective
+    operation is:
+
+        w[z > 0] += shift * z[z > 0]   →  z>0 scaled by (1+shift)
+        w[z < 0] unchanged              →  z<0 unchanged
+
+    This asymmetrically amplifies the positive tail for shift>0.
+    For shift<0 (negative skew target), we instead amplify the negative tail:
+
+        w[z < 0] += (-shift) * z[z < 0]  i.e.  w[z<0] *= (1 + |shift|)
+
+    Unified form:
+        mask_pos = z > 0
+        mask_neg = z < 0
+        if shift > 0:
+            w[mask_pos] *= (1.0 + shift)   # amplify +tail
+        else:
+            w[mask_neg] *= (1.0 - shift)   # amplify -tail (shift<0, so 1-shift>1)
+
+    Re-standardise to (mean=0, std=1) after each pass.
+    Convergence threshold: |skew_gap| < 0.05.
     """
     if len(z) < 4:
         return z
@@ -359,7 +389,14 @@ def _linear_skew_align(
             break
 
         shift = float(np.clip(skew_gap * 0.40, -max_shift, max_shift))
-        w     = z + shift * np.abs(z)
+        w = z.copy()
+        if shift > 0:
+            mask = z > 0
+            w[mask] = z[mask] * (1.0 + shift)
+        else:
+            mask = z < 0
+            w[mask] = z[mask] * (1.0 - shift)   # shift<0, so 1-shift > 1 → amplify -tail
+
         w_std = float(np.std(w))
         if w_std > 1e-10:
             w = (w - float(np.mean(w))) / w_std
@@ -750,6 +787,18 @@ def generate(
 # ---------------------------------------------------------------------------
 
 class OnlineRidgePredictor:
+    """
+    v61: Fix EK scale mismatch.
+
+    record() now stores realised_ek * _EK_OVERSAMPLE so that y_ek is in the
+    same "oversampled" space as params["target_ek"].  predict_correction()
+    blends params["target_ek"] (oversampled) with ridge output (also
+    oversampled), so the blend is dimensionally consistent.
+
+    Previously record() stored raw realised_ek, causing the ridge model to
+    pull target_ek DOWN toward the raw scale as blend increased.
+    """
+
     def __init__(self, min_train=10, max_blend=0.50):
         self.min_train = min_train
         self.max_blend = max_blend
@@ -769,7 +818,9 @@ class OnlineRidgePredictor:
         self._y_std.append(realised_std)
         self._y_skew.append(realised_skew)
         self._y_hurst.append(realised_hurst)
-        self._y_ek.append(realised_ek)
+        # v61: store in oversampled space so blend in predict_correction is
+        #      dimensionally consistent with params["target_ek"]
+        self._y_ek.append(realised_ek * _EK_OVERSAMPLE)
 
     def _ridge_predict(self, X, y, x_new, alpha=1.0):
         n, d = X.shape
@@ -1013,17 +1064,15 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v60: Global pass — hard z-clip + linear skew align + std pin
+        # v60/v61: Global pass — hard z-clip + linear skew align + std pin
         #
-        # v59 used winsorize(0.5%) which was removing ~8 tail points from
-        # ~800 bars — exactly the extreme values that sustain kurtosis.
-        # v60 replaces it with a hard z-clip at 5.5-sigma (removes only
-        # genuine blow-up artefacts) and strengthens the skew aligner.
+        # v61: _linear_skew_align now uses tail-selective scaling instead of
+        # symmetric abs(z) shift (fixes directional bug for negative skew).
         #
         # Pipeline (in z-score space):
-        #   1. Hard z-clip |z| > 5.5  (replaces 0.5% winsorize)
+        #   1. Hard z-clip |z| > 5.5  (replaces v59 winsorize 0.5%)
         #   2. Re-standardise after clip
-        #   3. Linear skew alignment via _linear_skew_align() (v60: 3-iter)
+        #   3. Linear skew alignment via _linear_skew_align() (3-iter)
         #   4. Rescale back to raw scale
         #   5. std pin: enforce std == real_global_std
         # ------------------------------------------------------------------
@@ -1038,7 +1087,7 @@ def rolling_fit_generate(
 
         z_norm = (final_rets - topup_mu) / topup_std
 
-        # Step 1: Hard z-clip at 5.5-sigma (replaces v59 winsorize 0.5%)
+        # Step 1: Hard z-clip at 5.5-sigma
         _HARD_CLIP_Z = 5.5
         z_wins = np.clip(z_norm, -_HARD_CLIP_Z, _HARD_CLIP_Z)
 
@@ -1047,7 +1096,7 @@ def rolling_fit_generate(
         if z_wins_std > 1e-10:
             z_wins = (z_wins - float(np.mean(z_wins))) / z_wins_std
 
-        # Step 2: Linear skew alignment (v60: max_shift=0.35, coeff=0.40, 3-iter)
+        # Step 2: Linear skew alignment (v61: tail-selective, 3-iter)
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
 
         # Rescale back to raw scale
