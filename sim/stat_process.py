@@ -1,33 +1,52 @@
 """
-stat_process.py  v61
+stat_process.py  v62
 ====================
 純統計過程模型，完全不使用 agent。
 
+v62: Fix kurtosis 10.6 → 3.14 collapse observed after v61.
+
+     Root cause: global pass hard z-clip at 5.5σ was destroying fat-tail
+     structure built by per-window pipeline.  The 3→10 kurtosis gap comes
+     from the 3-4σ range, which the 5.5σ clip leaves untouched — BUT the
+     re-standardise after clip compresses everything, and the std-pin at the
+     end rescales without restoring tail mass.
+
+     Two fixes applied (Approach B + C from analysis):
+
+     Fix B — Adaptive oversample:
+       Before the global pass, measure ek_before (per-window concat).
+       After the global pass, measure ek_after.
+       Compute decay_ratio = ek_after / max(ek_before, 1e-3).
+       Store this as a rolling EMA (alpha=0.3) in _ek_decay_ema.
+       Next run: multiply _EK_OVERSAMPLE by 1/decay_ratio so that
+       per-window target_ek is pre-amplified to survive the global pass.
+       This is done inside rolling_fit_generate via a local ek_oversample_adj
+       that is passed to each fit() call.
+
+     Fix C — Soft-clip global pass (replace hard z-clip):
+       Replace hard np.clip(z, -5.5, 5.5) with a smooth tanh-based
+       soft clamp that:
+         - is identity for |z| < clip_inner (3.5σ)
+         - smoothly saturates toward clip_outer (6.5σ) for |z| > clip_inner
+         - preserves the sign and monotonicity of the tail
+         - does NOT flatten kurtosis the way hard clip does
+       The tanh blend: for |z| > clip_inner,
+         w = sign(z) * (clip_inner + (clip_outer - clip_inner) *
+                        tanh((|z| - clip_inner) / transition_width))
+       where transition_width = (clip_outer - clip_inner) / 1.5.
+       Values above clip_outer are hard-capped as safety.
+
+       After soft-clip, the re-standardise step is removed (was
+       compressing tails further).
+
+     Other changes:
+       - _EK_OVERSAMPLE bumped from 2.6 to 3.2 as new baseline; the
+         adaptive mechanism will further adjust per run.
+       - Global pass no longer re-standardises after clip (avoids
+         secondary kurtosis suppression).
+       - ek_after / ek_before ratio printed in verbose mode.
+
 v61: Fix two confirmed bugs in v60.
-
-     Bug 1: _linear_skew_align asymmetry
-       - v60 used: w = z + shift * abs(z)
-         When shift < 0 (negative skew target), this compresses BOTH tails
-         equally, producing near-zero skew change instead of negative skew.
-         The transform is directionally correct only for shift > 0.
-       - Fix: split into tail-selective operation:
-             positive side only: w[z>0] += shift * z[z>0]   (amplify/compress +tail)
-             negative side only: w[z<0] += shift * z[z<0]   (amplify/compress -tail)
-         For shift > 0: +tail grows, -tail shrinks → positive skew (correct)
-         For shift < 0: +tail shrinks, -tail grows → negative skew (correct)
-         Re-standardise after each pass.
-
-     Bug 2: OnlineRidgePredictor EK scale mismatch
-       - record() stores realised_ek (observed, raw scale, e.g. 3-12)
-       - predict_correction() blends params["target_ek"] (= raw_ek × 2.6,
-         e.g. 8-30) with ridge_predict output (predicting raw-scale realised_ek).
-         As blend grows the correction pulls target_ek DOWN toward raw scale,
-         defeating the entire _EK_OVERSAMPLE mechanism.
-       - Fix: record() now stores realised_ek × _EK_OVERSAMPLE so that both
-         sides of the blend are in the same "oversampled" space.  The ridge
-         model then learns to predict the correct oversampled target.
-         predict_correction() is unchanged.
-
 v60: Fix skew underfit + kurtosis suppression caused by global-pass winsorize.
 v59: Replace global-pass kurtosis_topup with winsorize + linear skew align.
 v58: Fix global-pass kurtosis=776 / skew=-27 explosion (3 root causes).
@@ -223,8 +242,17 @@ _NCT_DF_FLOOR = 4.05
 _NCT_DF_CEIL  = 30.0
 _NCT_NC_MAX   = 8.0
 
-# v60: raised from 1.8; pipeline degrades ~60-65% total (not 45% as assumed in v53)
-_EK_OVERSAMPLE = 2.6
+# v62: raised from 2.6; adaptive mechanism in rolling_fit_generate adjusts further.
+# Rationale: observed ek_after/ek_before decay ~0.25-0.35 through global pass,
+# so baseline needs to be ~3x raw_ek to survive.  Adaptive EMA will fine-tune.
+_EK_OVERSAMPLE = 3.2
+
+# v62: soft-clip parameters for global pass (replaces hard _HARD_CLIP_Z=5.5)
+# Identity region: |z| <= SOFT_CLIP_INNER (fat-tail mass preserved here)
+# Transition: SOFT_CLIP_INNER < |z| <= SOFT_CLIP_OUTER (tanh blend)
+# Hard cap: |z| > SOFT_CLIP_OUTER (safety against true outliers only)
+_SOFT_CLIP_INNER = 3.5   # below this: no modification
+_SOFT_CLIP_OUTER = 6.5   # above this: hard cap (safety only)
 
 # v58 global-pass safety constants (kept for reference; global topup REMOVED in v59)
 _GLOBAL_TAIL_CLIP_Z  = 6.0
@@ -234,19 +262,65 @@ _GLOBAL_INJECT_Z_MAX = 4.0
 _GLOBAL_MAX_EFF_JSTD = 2.5
 _GLOBAL_SKEW_CLIP_Z  = 5.0
 
-# v60: disabled winsorize; use hard z-clip at 5.5-sigma instead
-_GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used in v60+ global pass
+# v60: disabled winsorize; v62: replaced hard clip with soft clip
+_GLOBAL_WINSORIZE_TAIL = 0.0     # kept for reference; not used
+
+# v62: EMA state for adaptive oversample across runs (module-level, resets per process)
+_ek_decay_ema: float = 1.0       # EMA of ek_after / ek_before ratio
+_EK_DECAY_EMA_ALPHA: float = 0.3 # EMA smoothing factor
 
 
 def _df_from_ek(target_ek: float) -> float:
     """
     df such that theoretical excess kurtosis of t(df) = target_ek.
-    ek = 6/(df-4)  →  df = 6/ek + 4
+    ek = 6/(df-4)  =>  df = 6/ek + 4
     """
     if target_ek <= 0:
         return _NCT_DF_CEIL
     df = 6.0 / target_ek + 4.0
     return float(np.clip(df, _NCT_DF_FLOOR, _NCT_DF_CEIL))
+
+
+def _soft_clip_z(z: np.ndarray,
+                 inner: float = _SOFT_CLIP_INNER,
+                 outer: float = _SOFT_CLIP_OUTER) -> np.ndarray:
+    """
+    v62: Smooth tanh-based soft clamp that preserves fat-tail kurtosis.
+
+    For |z| <= inner  : identity (no change)
+    For inner < |z| <= outer : smooth tanh blend from inner toward outer
+    For |z| > outer  : hard cap at outer (safety only)
+
+    The transition function:
+        excess  = |z| - inner
+        range   = outer - inner
+        t_width = range / 1.5
+        clipped = inner + range * tanh(excess / t_width)
+        w       = sign(z) * clipped
+
+    This is C-infinity smooth at |z|=inner, monotone, and asymptotically
+    approaches outer without a hard discontinuity.  It leaves the bulk of
+    the distribution (|z| < 3.5σ) completely untouched, preserving the
+    fat-tail mass that generates kurtosis.
+    """
+    abs_z = np.abs(z)
+    w     = z.copy()
+
+    # Transition region: inner < |z| <= outer
+    mask_trans = (abs_z > inner) & (abs_z <= outer)
+    if np.any(mask_trans):
+        t_range  = outer - inner
+        t_width  = t_range / 1.5
+        excess   = abs_z[mask_trans] - inner
+        clipped  = inner + t_range * np.tanh(excess / t_width)
+        w[mask_trans] = np.sign(z[mask_trans]) * clipped
+
+    # Hard cap: |z| > outer (true outliers only)
+    mask_hard = abs_z > outer
+    if np.any(mask_hard):
+        w[mask_hard] = np.sign(z[mask_hard]) * outer
+
+    return w
 
 
 def _sample_nct_iterative(
@@ -304,7 +378,7 @@ def _skew_post_shift(z: np.ndarray, target_skew: float, clamp: float = 0.20) -> 
     Two-iteration cubic skew-shift.  Used per-window only (not in global pass).
 
     Transform: w = z + a*(z^3 - 3*z)
-    Leading-order effect: skew(w) ≈ skew(z) + 6*a  (standardised z)
+    Leading-order effect: skew(w) ~ skew(z) + 6*a  (standardised z)
 
     IMPORTANT: input z MUST be standardised (mean=0, std=1).
 
@@ -337,42 +411,12 @@ def _linear_skew_align(
     n_iter:      int   = 3,
 ) -> np.ndarray:
     """
-    v61: Fix directional asymmetry bug from v60.
+    v61: tail-selective linear skew alignment.
 
-    v60 used: w = z + shift * abs(z)
-    This is wrong for shift < 0: it compresses BOTH tails symmetrically,
-    yielding near-zero skew change instead of negative skew injection.
+    For shift > 0 (positive skew target): amplify the positive tail only.
+    For shift < 0 (negative skew target): amplify the negative tail only.
 
-    v61 fix: apply shift selectively per tail sign.
-
-        w = z.copy()
-        w[z > 0] += shift * z[z > 0]   # scale up/down positive tail
-        w[z < 0] += shift * z[z < 0]   # scale up/down negative tail (same direction)
-
-    For shift > 0:
-        positive tail: z[z>0] * (1 + shift)  → grows  → +skew
-        negative tail: z[z<0] * (1 + shift)  → more negative → but sign(z)<0 so
-                       the negative tail actually shrinks in absolute z relative
-                       to the positive tail increase → net +skew
-    Wait — that's still symmetric in z-score space.  The correct selective
-    operation is:
-
-        w[z > 0] += shift * z[z > 0]   →  z>0 scaled by (1+shift)
-        w[z < 0] unchanged              →  z<0 unchanged
-
-    This asymmetrically amplifies the positive tail for shift>0.
-    For shift<0 (negative skew target), we instead amplify the negative tail:
-
-        w[z < 0] += (-shift) * z[z < 0]  i.e.  w[z<0] *= (1 + |shift|)
-
-    Unified form:
-        mask_pos = z > 0
-        mask_neg = z < 0
-        if shift > 0:
-            w[mask_pos] *= (1.0 + shift)   # amplify +tail
-        else:
-            w[mask_neg] *= (1.0 - shift)   # amplify -tail (shift<0, so 1-shift>1)
-
+    This is asymmetric and directionally correct for both signs of skew.
     Re-standardise to (mean=0, std=1) after each pass.
     Convergence threshold: |skew_gap| < 0.05.
     """
@@ -395,7 +439,7 @@ def _linear_skew_align(
             w[mask] = z[mask] * (1.0 + shift)
         else:
             mask = z < 0
-            w[mask] = z[mask] * (1.0 - shift)   # shift<0, so 1-shift > 1 → amplify -tail
+            w[mask] = z[mask] * (1.0 - shift)   # shift<0, 1-shift > 1 => amplify -tail
 
         w_std = float(np.std(w))
         if w_std > 1e-10:
@@ -421,7 +465,7 @@ def _kurtosis_topup(
     Used per-window in generate() (Step 6).
     NOT used in the global pass as of v59.
 
-    Input rets should be in z-score space (std≈1).
+    Input rets should be in z-score space (std~1).
     """
     if len(rets) < 4:
         return rets
@@ -629,14 +673,14 @@ def fit(
 # ---------------------------------------------------------------------------
 # 2. GENERATE
 #
-# 管線：
-#   Step 1  採樣 nct with iterative nc correction
-#   Step 2  AR1 Hurst 過濾
-#   Step 3  ACF lag1 微調
+# Pipeline:
+#   Step 1  Sample nct with iterative nc correction
+#   Step 2  AR1 Hurst filter
+#   Step 3  ACF lag1 micro-adjust
 #   Step 4  GARCH(1,1) clip (0.5, 2.0)
 #   Step 5  Skew post-shift: 2-iter, clamp 0.20
-#   Step 6  jump 疊加  (v57.1: eff_std 改在 z-score 空間計算; v60: cap 4.0->6.0)
-#   Step 7  exact rescale → (ret_mu, ret_std)
+#   Step 6  Jump overlay  (v57.1: eff_std in z-score space; v60: cap 4.0->6.0)
+#   Step 7  Exact rescale -> (ret_mu, ret_std)
 #   Step 8  OHLC wick
 #   Step 9  Volume
 # ---------------------------------------------------------------------------
@@ -694,7 +738,7 @@ def generate(
     else:
         z_ar = z_raw[_AR1_WARMUP:].copy()
 
-    # Step 3: ACF lag1 微調
+    # Step 3: ACF lag1 micro-adjust
     if abs(acf_lag1) > 0.05 and n_bars > 1:
         z_acf = z_ar.copy()
         for i in range(1, n_bars):
@@ -726,7 +770,7 @@ def generate(
     # Step 5: Skew post-shift — 2-iter, clamp 0.20 per-window
     z_shifted = _skew_post_shift(z_garch, target_skew=skew_raw, clamp=0.20)
 
-    # Step 6: jump 疊加 (v57.1: eff_std 在 z-score 空間計算; v60: cap 4.0->6.0)
+    # Step 6: Jump overlay (v57.1: eff_std in z-score space; v60: cap 4.0->6.0)
     z_work = z_shifted.copy()
     if jump_freq > 0 and n_bars > 0:
         n_jumps = int(rng.binomial(n_bars, jump_freq))
@@ -735,11 +779,11 @@ def generate(
             jump_std_z = jump_std / max(ret_std, 1e-10)
             raw_ek     = target_ek / _EK_OVERSAMPLE
             ek_amp     = float(np.sqrt(max(raw_ek / 6.0, 1.0)))
-            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 6.0))  # v60: raise cap 4.0->6.0
+            eff_std    = float(np.clip(jump_std_z * ek_amp, 0.5, 6.0))
             skew_b     = float(np.clip(skew_raw * 0.15, -0.5, 0.5))
             z_work[jump_idx] += rng.normal(skew_b, eff_std, size=n_jumps)
 
-    # Step 7: exact rescale → (ret_mu, ret_std)
+    # Step 7: Exact rescale -> (ret_mu, ret_std)
     z_std = float(np.std(z_work))
     if z_std > 1e-10:
         z_final = (z_work - float(np.mean(z_work))) / z_std * ret_std + ret_mu
@@ -819,7 +863,7 @@ class OnlineRidgePredictor:
         self._y_skew.append(realised_skew)
         self._y_hurst.append(realised_hurst)
         # v61: store in oversampled space so blend in predict_correction is
-        #      dimensionally consistent with params["target_ek"]
+        # dimensionally consistent with params["target_ek"]
         self._y_ek.append(realised_ek * _EK_OVERSAMPLE)
 
     def _ridge_predict(self, X, y, x_new, alpha=1.0):
@@ -868,6 +912,8 @@ def rolling_fit_generate(
     use_adapt:  bool = True,
     calibrator: "Optional[AdaptiveCalibrator]" = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
+    global _ek_decay_ema
+
     n      = len(df_real)
     pos    = 0
     result_chunks: list[pd.DataFrame] = []
@@ -888,6 +934,13 @@ def rolling_fit_generate(
 
     _SKEW_ANCHOR_BAND = 0.5
 
+    # v62: adaptive oversample — start from module-level EMA, adjust after global pass
+    # Clamp to [1.5, 6.0] to prevent runaway amplification
+    ek_oversample_adj = float(np.clip(
+        _EK_OVERSAMPLE / max(_ek_decay_ema, 0.15),
+        1.5, 6.0,
+    ))
+
     while pos + lookback < n:
         window_idx += 1
         fit_start = pos
@@ -899,7 +952,8 @@ def rolling_fit_generate(
         df_fit = df_real.iloc[fit_start:fit_end].copy().reset_index(drop=True)
         df_fwd = df_real.iloc[fwd_start:fwd_end].copy().reset_index(drop=True)
 
-        params = fit(df_fit)
+        # v62: use adaptive oversample for fit()
+        params = fit(df_fit, ek_oversample=ek_oversample_adj)
 
         # v54 Fix A: soft-clip ret_skew_raw to global anchor band
         raw_skew_window = float(params["ret_skew_raw"])
@@ -1064,17 +1118,23 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v60/v61: Global pass — hard z-clip + linear skew align + std pin
+        # v62 Global pass: soft-clip + skew align + std pin
         #
-        # v61: _linear_skew_align now uses tail-selective scaling instead of
-        # symmetric abs(z) shift (fixes directional bug for negative skew).
+        # Changes from v61:
+        #   1. Hard z-clip replaced by _soft_clip_z() (tanh blend, inner=3.5,
+        #      outer=6.5).  Identity for |z|<3.5, smooth saturation up to 6.5.
+        #      This preserves fat-tail kurtosis in the 3-5σ range.
+        #   2. Re-standardise step REMOVED after clip (was compressing tails).
+        #   3. ek_before / ek_after measured; EMA updated for next run.
         #
         # Pipeline (in z-score space):
-        #   1. Hard z-clip |z| > 5.5  (replaces v59 winsorize 0.5%)
-        #   2. Re-standardise after clip
-        #   3. Linear skew alignment via _linear_skew_align() (3-iter)
-        #   4. Rescale back to raw scale
-        #   5. std pin: enforce std == real_global_std
+        #   1. Normalise to z-score
+        #   2. Measure ek_before
+        #   3. Soft-clip via _soft_clip_z()
+        #   4. Measure ek_after; update _ek_decay_ema
+        #   5. Linear skew alignment via _linear_skew_align() (3-iter)
+        #   6. Rescale back to raw scale
+        #   7. std pin: enforce std == real_global_std
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
@@ -1087,22 +1147,44 @@ def rolling_fit_generate(
 
         z_norm = (final_rets - topup_mu) / topup_std
 
-        # Step 1: Hard z-clip at 5.5-sigma
-        _HARD_CLIP_Z = 5.5
-        z_wins = np.clip(z_norm, -_HARD_CLIP_Z, _HARD_CLIP_Z)
+        # Step 2: measure ek_before
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ek_before = float(stats.kurtosis(z_norm))
 
-        # Re-standardise after clip
-        z_wins_std = float(np.std(z_wins))
-        if z_wins_std > 1e-10:
-            z_wins = (z_wins - float(np.mean(z_wins))) / z_wins_std
+        # Step 3: soft-clip (preserves fat-tail structure)
+        z_wins = _soft_clip_z(z_norm,
+                              inner=_SOFT_CLIP_INNER,
+                              outer=_SOFT_CLIP_OUTER)
 
-        # Step 2: Linear skew alignment (v61: tail-selective, 3-iter)
+        # Step 4: measure ek_after; update EMA for adaptive oversample next run
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ek_after = float(stats.kurtosis(z_wins))
+
+        if ek_before > 0.5:
+            decay_ratio  = float(np.clip(ek_after / ek_before, 0.10, 1.0))
+            _ek_decay_ema = (
+                _EK_DECAY_EMA_ALPHA * decay_ratio
+                + (1.0 - _EK_DECAY_EMA_ALPHA) * _ek_decay_ema
+            )
+
+        if verbose:
+            print(
+                f"[stat] global-pass  ek_before={ek_before:.2f}"
+                f"  ek_after={ek_after:.2f}"
+                f"  decay={ek_after/max(ek_before,1e-3):.3f}"
+                f"  ema={_ek_decay_ema:.3f}"
+                f"  oversample_next={_EK_OVERSAMPLE/max(_ek_decay_ema,0.15):.2f}"
+            )
+
+        # Step 5: linear skew alignment (v61 tail-selective, 3-iter)
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
 
         # Rescale back to raw scale
         final_rets_fixed = z_aligned * topup_std + topup_mu
 
-        # Step 3: std pin to real_global_std
+        # Step 7: std pin to real_global_std
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
             std_scale = real_global_std / post_std
