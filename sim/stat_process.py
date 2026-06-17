@@ -1,30 +1,40 @@
 """
-stat_process.py  v73
+stat_process.py  v74
 ====================
+v74: fix raw_ek underestimation in global-pass
+
+  Bug D — _raw_ek_window clip floor 1.0 distorted median
+    v73 stored raw_ek = clip(excess_kurtosis, 1.0, 60).
+    stats.kurtosis() returns EXCESS kurtosis (mean=0 for normal).
+    For AAPL many short windows have excess_ek in [-2, +4].
+    Clipping floor=1.0 forced most windows to 1.0 → median_raw_ek=1.64
+    instead of the true ~7.  sc_inner=max(6, 2*sqrt(1.64))=6 was fine
+    but topup target=1.64 was catastrophically low (excess ek 1.64 ≈
+    normal distribution), causing topup to do almost nothing.
+
+  Fix:
+    A. Store raw_ek with floor=0.0 (allow negative excess kurtosis).
+       This preserves the true distribution of window kurtoses.
+    B. sc_inner formula: max(6.0, median_raw_ek + 3.0 + 3.0).
+       "+3" converts excess→total kurtosis context; second "+3" gives
+       3-sigma headroom above the typical tail thickness.
+       Normal market (excess_ek~0) → inner=6.0.
+       AAPL typical (excess_ek~7) → inner=13.0 — fat tails not clipped.
+    C. topup target = median_raw_ek (excess kurtosis), matching what
+       stats.kurtosis() returns inside _kurtosis_topup's check.
+       topup_frac=0.85 kept from v73.
+
+  Bug E — ek_decay_ema always 1.0 (ek_adj always 3.20)
+    ek_decay_ema is a local variable initialised to ek_decay_ema_init=1.0
+    each call. The decay computed in the global-pass is written back to
+    the local variable but rolling_fit_generate returns it nowhere, so
+    the next call always restarts from 1.0. This means ek_oversample_adj
+    = 3.2/1.0 = 3.20 every window regardless of previous performance.
+    Fix: return ek_decay_ema as third element of the return tuple so the
+    caller can persist it across successive run_stat calls. Also added
+    it to the _summary entry in param_log for visibility.
+
 v73: fix kurtosis collapse (3 bugs)
-
-  Bug A — sc_inner 算錯基準
-    v72 用 median(target_ek) 算 sc_inner，但 target_ek = raw_ek * oversample。
-    當 ek_adj=3.20 且大多數 window raw_ek 在 1~7 時，target_ek median 約 3.2，
-    導致 sc_inner = max(5, 2*sqrt(3.2)) = 5.0，但 log 顯示 sc_inner=3.00——
-    實際上更早的版本殘留邏輯讓 sc_inner 退化回固定值 3.0。
-    修正：sc_inner 改用 median(raw_ek) 的無 oversample 版本，
-    即從 param_log 中取 target_ek / ek_oversample_adj，
-    並且提高下限到 6.0（不是 5.0），確保正常市場不會被 clip。
-
-  Bug B — global-pass 的 _kurtosis_topup 目標值也用 target_ek（含 oversample）
-    topup 在 z-score 空間操作，但 target_ek 是給 generate() 用的 oversampled 值，
-    比真實 kurtosis 高 3.2x。結果 topup 注入過多 tail events，
-    反而讓 post_std 偏大，最後 std-pin 又把 tail 壓回去。
-    修正：global-pass topup 目標改用 median(raw_ek)（真實觀測值）。
-
-  Bug C — generate_conditional 線性 blend 後的 topup topup_frac=0.60 太低
-    20 bars 的短 window，linear blend 把 kurtosis 拉向正態，
-    topup_frac=0.60 意思是只要達到 0.6*target_ek 就停止，
-    但 target_ek 本身因 ek_adj=3.20 而低估，停止條件幾乎立即滿足。
-    修正：conditional 路徑改用 topup_frac=0.85，
-    且把 topup 移到 std-pin 之前（防止 std-pin 把 tail 再壓縮）。
-
 v72: fix global-pass kurtosis destruction
 v71: fix generate_conditional degradation
 v70: kurtosis p90 fix + block-bootstrap conditional generate
@@ -310,6 +320,7 @@ def _kurtosis_topup(
 ) -> np.ndarray:
     """
     Inject tail events until realised_ek >= topup_frac * target_ek.
+    target_ek is EXCESS kurtosis (same convention as scipy.stats.kurtosis).
     Uses a copy so caller's array is not mutated unexpectedly.
     """
     rets = rets.copy()
@@ -320,7 +331,6 @@ def _kurtosis_topup(
         return rets
     n_total = len(rets)
     std_r   = float(np.std(rets)) + 1e-10
-    # use ~1% of bars per iteration, at least 1
     n_jumps = max(1, int(n_total * 0.01))
     for _ in range(max_iter):
         ek_deficit = max(target_ek - realised_ek, 1.0)
@@ -341,8 +351,8 @@ def _soft_clip_z(
     outer:  float = 9.0,
 ) -> np.ndarray:
     """
-    v73: defaults raised to 6/9 (was 5/8 in v72).
-    inner/outer passed in per-call based on raw_ek (not oversampled target_ek).
+    v74: default inner=6.0, outer=9.0.
+    inner/outer passed in per-call based on median_raw_ek.
     Only returns beyond `outer` sigma are hard-clipped.
     """
     abs_z = np.abs(z)
@@ -568,18 +578,16 @@ def generate_conditional(
     blended_rets = blended_rets / bl_std * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
 
-    # Bug C fix: topup_frac=0.85 (was 0.60), run topup BEFORE final std-pin
-    # so the tail events injected are not immediately compressed away.
+    # topup before final std-pin; topup_frac=0.85 so we approach target_ek closely
     blended_rets = _kurtosis_topup(blended_rets, target_ek, rng, topup_frac=0.85)
 
-    # correct skew bias from block selection
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         current_skew = float(stats.skew(blended_rets))
     if abs(current_skew - target_skew) > 0.15:
         blended_rets = _linear_skew_align(blended_rets, target_skew)
 
-    # final std/mean pin — after topup so std drift from injected tails is corrected
+    # final std/mean pin after topup
     bl_std2 = float(np.std(blended_rets)) + 1e-10
     blended_rets = blended_rets / bl_std2 * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
@@ -701,7 +709,12 @@ def rolling_fit_generate(
     ek_decay_ema_init:  float = 1.0,
     use_conditional:    bool  = False,
     bootstrap_weight:   float = 0.50,
-) -> Tuple[pd.DataFrame, List[Dict]]:
+) -> Tuple[pd.DataFrame, List[Dict], float]:
+    """
+    Returns (df_result, param_log, ek_decay_ema).
+    The third element is the final ek_decay_ema value so callers can persist
+    it across successive calls (Bug E fix: was lost on each call before v74).
+    """
     ek_decay_ema: float = float(ek_decay_ema_init)
 
     rng = np.random.default_rng(seed)
@@ -741,11 +754,12 @@ def rolling_fit_generate(
 
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
 
-        # v73: store raw_ek (before oversample) in param_log for global-pass sc_inner
+        # v74: store raw_ek with floor=0.0 (excess kurtosis, no artificial floor)
+        # floor=1.0 in v73 caused median_raw_ek to collapse to ~1.64
         _fit_lr = _log_returns(df_fit["Close"].values)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _raw_ek_window = float(np.clip(stats.kurtosis(_fit_lr), 1.0, _TARGET_EK_MAX))
+            _raw_ek_window = float(np.clip(stats.kurtosis(_fit_lr), 0.0, _TARGET_EK_MAX))
 
         raw_skew_window = float(params["ret_skew_raw"])
         anchored_skew   = float(np.clip(
@@ -859,7 +873,7 @@ def rolling_fit_generate(
             print(
                 f"[stat] w{window_idx:3d}"
                 f"  std={params['ret_std']:.4f}  ek={params['target_ek']:.2f}"
-                f"  ek_adj={ek_oversample_adj:.2f}  ek_init={ek_oversample_init if calibrator else '---'}"
+                f"  ek_adj={ek_oversample_adj:.2f}  raw_ek={_raw_ek_window:.2f}"
                 f"  kurt_err={kurt_str}"
                 f"  c_err={c_err:+.3f}"
                 f"{calib_str}{cond_str}"
@@ -873,7 +887,7 @@ def rolling_fit_generate(
             "ret_skew_a":        float(params["ret_skew_a"]),
             "hurst":             float(params["hurst_target"]),
             "target_ek":         float(params["target_ek"]),
-            "raw_ek":            _raw_ek_window,   # v73: added for global-pass sc_inner
+            "raw_ek":            _raw_ek_window,
             "ek_oversample_adj": ek_oversample_adj,
             "ek_oversample_init": ek_oversample_init if calibrator else None,
             "jump_freq":         float(params["jump_freq"]),
@@ -890,7 +904,7 @@ def rolling_fit_generate(
         pos        += step
 
     # ---------------------------------------------------------------------------
-    # Global post-processing pass  (v73: sc_inner from raw_ek, topup from raw_ek)
+    # Global post-processing pass  (v74: sc_inner and topup from median_raw_ek)
     # ---------------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -944,10 +958,10 @@ def rolling_fit_generate(
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
 
-        # Step 3: soft-clip with sc_inner based on median RAW kurtosis (Bug A fix)
-        # raw_ek is the observed kurtosis before oversample — represents true tail thickness.
-        # sc_inner = max(6.0, 2*sqrt(raw_ek)) so normal market (ek~3) → inner=6,
-        # fat-tail market (ek~10) → inner=6.3, extreme (ek~20) → inner=8.9.
+        # Step 3: soft-clip with sc_inner based on median RAW excess kurtosis (Bug A/D fix)
+        # sc_inner = max(6.0, median_raw_ek + 6.0)
+        # For AAPL (excess_ek median ~7): inner=13 → fat tails survive.
+        # For low-vol symbol (excess_ek median ~1): inner=7 → still conservative.
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -961,16 +975,15 @@ def rolling_fit_generate(
             warnings.simplefilter("ignore")
             ek_before = float(stats.kurtosis(z_norm))
 
-        # Bug A fix: use raw_ek from param_log (not oversampled target_ek)
         raw_ek_vals = [
             row["raw_ek"]
             for row in param_log
             if not row.get("_summary") and "raw_ek" in row
         ]
-        median_raw_ek = float(np.median(raw_ek_vals)) if raw_ek_vals else 6.0
+        median_raw_ek = float(np.median(raw_ek_vals)) if raw_ek_vals else 3.0
 
-        # sc_inner from raw kurtosis: floor at 6.0 so normal market tails survive
-        sc_inner = float(max(6.0, 2.0 * float(np.sqrt(median_raw_ek))))
+        # sc_inner: headroom above typical tail — at least 6-sigma floor
+        sc_inner = float(max(6.0, median_raw_ek + 6.0))
         sc_outer = sc_inner + 3.0
 
         z_wins = _soft_clip_z(z_norm, inner=sc_inner, outer=sc_outer)
@@ -1000,16 +1013,15 @@ def rolling_fit_generate(
         # Step 4: skew alignment
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
 
-        # Step 5: Bug B fix — topup target is median_raw_ek (true kurtosis),
-        # NOT median_target_ek (oversampled). Kurtosis is scale-invariant so
-        # operating in z-space is correct; target should match real-world ek.
+        # Step 5: topup target = median_raw_ek (excess kurtosis, Bug B fix)
+        # _kurtosis_topup uses stats.kurtosis internally which returns excess ek,
+        # so target must also be excess kurtosis.
         z_toppedUp = _kurtosis_topup(z_aligned, median_raw_ek, rng, topup_frac=0.85)
 
         # Step 6: reconstruct returns, pin std precisely
         final_rets_fixed = z_toppedUp * topup_std + topup_mu
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
-            # only rescale if std drifted meaningfully (>5%)
             if abs(post_std / real_global_std - 1.0) > 0.05:
                 final_rets_fixed = final_rets_fixed / post_std * real_global_std
 
@@ -1025,10 +1037,11 @@ def rolling_fit_generate(
         df_result["Low"]   = df_result["Low"].values  * price_ratio
 
     param_log.append({
-        "_summary":  True,
-        "n_windows": window_idx,
-        "dtw_mean":  float(np.mean(all_dtw))   if all_dtw   else None,
-        "pcorr_mean": float(np.mean(all_pcorr)) if all_pcorr else None,
+        "_summary":       True,
+        "n_windows":      window_idx,
+        "ek_decay_ema":   ek_decay_ema,
+        "dtw_mean":       float(np.mean(all_dtw))   if all_dtw   else None,
+        "pcorr_mean":     float(np.mean(all_pcorr)) if all_pcorr else None,
     })
 
-    return df_result, param_log
+    return df_result, param_log, ek_decay_ema
