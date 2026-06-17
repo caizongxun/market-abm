@@ -37,6 +37,9 @@ v52: Fix kurtosis collapse (10.6 → 1.3) and skew collapse (0.45 → 0.09).
 
      All other stages (AR1 Hurst, ACF, volume, OHLC wick) unchanged from v51.
 
+v52.1: fix SyntaxError in OnlineRidgePredictor.predict_correction (line 743-744)
+       stray quote in self._y_hurst\"] and missing ) in self._y_ek]
+
 v51: Replace t-mixture (v50) with noncentral-t (nct) sampling.
 v50: Remove Fleishman, t-mixture + jump-amplify (insufficient ek)
 v49.3: fix bracket mismatch
@@ -740,8 +743,8 @@ class OnlineRidgePredictor:
         ], dtype=float)
         new_std   = float(np.clip((1-blend)*params["ret_std"]      + blend*self._ridge_predict(X, np.array(self._y_std),   x_new), params["ret_std"]*0.3, params["ret_std"]*3.0))
         new_skew  = float(np.clip((1-blend)*params["ret_skew_a"]   + blend*self._ridge_predict(X, np.array(self._y_skew),  x_new), -10.0, 10.0))
-        new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst"], x_new), 0.3, 0.69))
-        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek],    x_new), 1.0, _TARGET_EK_MAX))
+        new_hurst = float(np.clip((1-blend)*params["hurst_target"] + blend*self._ridge_predict(X, np.array(self._y_hurst), x_new), 0.3, 0.69))
+        new_ek    = float(np.clip((1-blend)*params["target_ek"]    + blend*self._ridge_predict(X, np.array(self._y_ek),    x_new), 1.0, _TARGET_EK_MAX))
         corrected = dict(params)
         corrected.update({"ret_std": new_std, "ret_skew_a": new_skew,
                           "hurst_target": new_hurst, "target_ek": new_ek})
