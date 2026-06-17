@@ -1,6 +1,14 @@
 """
-stat_process.py  v70
+stat_process.py  v71
 ====================
+v71: fix generate_conditional degradation
+  - After linear blend, apply _kurtosis_topup() to recover peak kurtosis
+    (linear blend of two low-corr series destroys kurtosis by construction)
+  - Pin ret_mu precisely after every rescale step
+  - Reduce default bootstrap_weight 0.60 -> 0.50
+  - Add _linear_skew_align after blend to prevent skew accumulation
+  - Clamp blended mean within 2x ret_mu
+
 v70:
   Step 1 — kurtosis p90 fix:
     - _kurtosis_topup: max_iter 3->6, topup_frac 0.8->0.6
@@ -228,7 +236,6 @@ def fit(
 
     # v70 Step1: boost ek_oversample for high-kurtosis windows
     if raw_ek > _HIGH_KURT_THRESHOLD:
-        # linearly ramp from 1.0x at threshold to 1.5x at 3x threshold
         boost = 1.0 + 0.5 * float(np.clip((raw_ek - _HIGH_KURT_THRESHOLD) / (2 * _HIGH_KURT_THRESHOLD), 0.0, 1.0))
         ek_oversample = ek_oversample * boost
 
@@ -430,18 +437,10 @@ def generate(
 
 
 # ---------------------------------------------------------------------------
-# 2b. GENERATE_CONDITIONAL  (v70 Step 2: block-bootstrap)
+# 2b. GENERATE_CONDITIONAL  (v70 Step 2: block-bootstrap, v71 fix)
 # ---------------------------------------------------------------------------
 
 def _detect_regime(log_rets: np.ndarray, n_recent: int = 10) -> Dict[str, Any]:
-    """
-    Characterise recent regime for block matching.
-    Returns a dict with:
-      - hurst: float
-      - vol_ratio: recent_vol / global_vol  (>1 = vol expansion)
-      - momentum: sign of recent cumulative return  (+1/-1)
-      - vol_level: recent vol (absolute)
-    """
     if len(log_rets) < n_recent + 5:
         return {"hurst": 0.5, "vol_ratio": 1.0, "momentum": 0, "vol_level": float(np.std(log_rets))}
     recent = log_rets[-n_recent:]
@@ -460,10 +459,6 @@ def _score_block_regime_match(
     block_rets: np.ndarray,
     target_regime: Dict[str, Any],
 ) -> float:
-    """
-    Score how well a candidate block matches the target regime.
-    Lower = better match. Returns a non-negative distance.
-    """
     if len(block_rets) < 3:
         return 1e9
     h_block    = hurst_exponent(block_rets, min_len=4) if len(block_rets) >= 8 else 0.5
@@ -471,7 +466,7 @@ def _score_block_regime_match(
     mom_block  = int(np.sign(float(np.sum(block_rets))))
     vol_target = float(target_regime["vol_level"]) + 1e-10
 
-    d_hurst = abs(h_block - float(target_regime["hurst"])) / 0.4          # normalise by hurst range
+    d_hurst = abs(h_block - float(target_regime["hurst"])) / 0.4
     d_vol   = abs(vol_block / vol_target - float(target_regime["vol_ratio"])) / 1.0
     d_mom   = 0.0 if mom_block == int(target_regime["momentum"]) or target_regime["momentum"] == 0 else 0.5
     return d_hurst + 0.5 * d_vol + 0.3 * d_mom
@@ -485,20 +480,19 @@ def generate_conditional(
     rng:         Optional[np.random.Generator] = None,
     block_size:  int   = 10,
     n_candidates: int  = 30,
-    bootstrap_weight: float = 0.60,
+    bootstrap_weight: float = 0.50,   # v71: 0.60 -> 0.50
     regime_window: int = 15,
 ) -> pd.DataFrame:
     """
-    v70 Step 2: Regime-conditioned block-bootstrap generator.
+    v71: Regime-conditioned block-bootstrap generator (fixed).
 
-    Algorithm:
-      1. Detect regime from the last `regime_window` bars of df_history.
-      2. Slide a window of size `block_size` across all of df_history;
-         score each candidate block by regime match.
-      3. Sample blocks proportionally to match quality (soft-min weighting).
-      4. Stitch bootstrap path + rescale to match params.ret_std.
-      5. Blend with parametric generate() at ratio bootstrap_weight:(1-bootstrap_weight).
-      6. Rescale blended path to start_price and match ret_std.
+    Key fixes vs v70:
+      - After linear blend, run _kurtosis_topup() to recover peak kurtosis.
+        (Linear blend of two low-corr series destroys kurtosis by construction;
+         blending 60% bootstrap + 40% parametric yields ~gaussian tails.)
+      - Pin ret_mu precisely after every rescale step.
+      - Apply _linear_skew_align to prevent skew accumulation from block selection.
+      - Reduce bootstrap_weight 0.60 -> 0.50 to limit noise dominance.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -508,12 +502,8 @@ def generate_conditional(
 
     regime = _detect_regime(hist_rets, n_recent=regime_window)
 
-    # --- collect candidate blocks and score ---
     n_hist = len(hist_rets)
-    min_blocks_needed = max(n_bars // block_size + 1, 3)
-
     if n_hist < block_size + 2:
-        # fallback: not enough history for block bootstrap
         return generate(params, n_bars, start_price=start_price, rng=rng)
 
     scores: List[float] = []
@@ -528,12 +518,9 @@ def generate_conditional(
         return generate(params, n_bars, start_price=start_price, rng=rng)
 
     scores_arr = np.array(scores, dtype=float)
-    # convert distance -> weight: lower score = higher weight
-    # use softmin: w_i = exp(-score_i) / sum
-    inv_scores = np.exp(-scores_arr * 3.0)  # temperature=1/3
+    inv_scores = np.exp(-scores_arr * 3.0)
     inv_scores = inv_scores / (inv_scores.sum() + 1e-10)
 
-    # --- bootstrap blocks to fill n_bars ---
     n_blocks_needed = n_bars // block_size + 2
     chosen_starts = rng.choice(
         len(block_starts),
@@ -545,31 +532,50 @@ def generate_conditional(
         [hist_rets[block_starts[k]:block_starts[k] + block_size] for k in chosen_starts]
     )[:n_bars]
 
-    # rescale bootstrapped rets to match params.ret_std
-    bs_std = float(np.std(bootstrap_rets)) + 1e-10
     target_std = float(params["ret_std"])
-    bootstrap_rets = bootstrap_rets / bs_std * target_std
-    # centre around params.ret_mu
-    bootstrap_rets = bootstrap_rets - float(np.mean(bootstrap_rets)) + float(params["ret_mu"])
+    target_mu  = float(params["ret_mu"])
+    target_ek  = float(params["target_ek"])
+    target_skew = float(params["ret_skew_raw"])
 
-    # --- parametric path ---
+    # rescale bootstrap to match ret_std, pin mean
+    bs_std = float(np.std(bootstrap_rets)) + 1e-10
+    bootstrap_rets = bootstrap_rets / bs_std * target_std
+    bootstrap_rets = bootstrap_rets - float(np.mean(bootstrap_rets)) + target_mu
+
+    # parametric path
     df_param = generate(params, n_bars, start_price=start_price, rng=rng)
     param_closes = df_param["Close"].values.astype(float)
     param_rets   = _log_returns(param_closes)
     if len(param_rets) < n_bars:
         param_rets = np.pad(param_rets, (0, n_bars - len(param_rets)), mode="edge")
 
-    # --- blend ---
+    # linear blend
     w_b = bootstrap_weight
     w_p = 1.0 - bootstrap_weight
     blended_rets = w_b * bootstrap_rets + w_p * param_rets[:n_bars]
 
-    # --- rescale blended to target_std ---
+    # rescale to target_std, pin mean precisely
     bl_std = float(np.std(blended_rets)) + 1e-10
     blended_rets = blended_rets / bl_std * target_std
-    blended_rets = blended_rets - float(np.mean(blended_rets)) + float(params["ret_mu"])
+    blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
 
-    # --- reconstruct price path ---
+    # v71: recover kurtosis lost by linear blend
+    blended_rets = _kurtosis_topup(blended_rets, target_ek, rng)
+
+    # v71: correct skew accumulated from block selection bias
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        current_skew = float(stats.skew(blended_rets))
+    skew_diff = current_skew - target_skew
+    if abs(skew_diff) > 0.15:
+        blended_rets = _linear_skew_align(blended_rets, target_skew)
+
+    # v71: final std/mean pin after topup and skew correction
+    bl_std2 = float(np.std(blended_rets)) + 1e-10
+    blended_rets = blended_rets / bl_std2 * target_std
+    blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
+
+    # reconstruct price path
     prices = np.empty(n_bars + 1)
     prices[0] = start_price
     for i in range(n_bars):
@@ -579,7 +585,6 @@ def generate_conditional(
     opens  = prices[:-1]
     closes = prices[1:]
 
-    # reuse param df for OHLV structure (highs/lows/volumes already computed)
     price_ratio = closes / np.maximum(param_closes[:n_bars], 1e-10)
     highs   = df_param["High"].values[:n_bars].astype(float)   * price_ratio
     lows    = df_param["Low"].values[:n_bars].astype(float)    * price_ratio
@@ -710,7 +715,7 @@ def rolling_fit_generate(
     predictor           = None,
     ek_decay_ema_init:  float = 1.0,
     use_conditional:    bool  = False,   # v70 Step2: opt-in block-bootstrap
-    bootstrap_weight:   float = 0.60,    # blend ratio for generate_conditional
+    bootstrap_weight:   float = 0.50,    # v71: default 0.60 -> 0.50
 ) -> Tuple[pd.DataFrame, List[Dict]]:
     # v69: ek_decay_ema is local — no cross-trial state leak
     ek_decay_ema: float = float(ek_decay_ema_init)
