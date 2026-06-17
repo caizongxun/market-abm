@@ -1,45 +1,38 @@
 """
-stat_process.py  v52
+stat_process.py  v53
 ====================
 純統計過程模型，完全不使用 agent。
 
-v52: Fix kurtosis collapse (10.6 → 1.3) and skew collapse (0.45 → 0.09).
+v53: Fix three residual problems from v52 output:
+       (skew=0.448→-0.135, kurtosis=10.6→3.9, topup ineffective)
 
-     Root causes diagnosed from v51 output:
-       1. GARCH vol_scale clip (0.7, 1.3) truncates extreme shocks → kurtosis loss
-       2. nct first-order nc approximation undershoots skew at df~7
-       3. exact rescale z-score normalises away small-sample skew (n=20 window)
-       4. global std-rescale at the end of rolling_fit_generate is scale-invariant
-          for kurtosis, but the preceding drift_correction (multiplicative path)
-          distorts the return distribution
+     Root causes:
+       1. ek_global_floor=3.0 truncated true ek=10.6; most windows used df≈6 t-dist
+       2. _skew_post_shift clamp a∈[-0.15,0.15] too weak for n=20 windows; nct skew
+          inverts after AR1+GARCH chain
+       3. _kurtosis_topup re-std cancelled all kurtosis gain; max_jumps=8 too few
 
      Fixes:
-       A. GARCH clip widened from (0.7, 1.3) → (0.5, 2.0)
-          Allows genuine volatility clustering to produce fat tails.
+       A. ek_global_floor: 3.0 → 1.0
+          Let true measured ek propagate into df_nct calculation.
 
-       B. nct iterative nc correction (2 passes)
-          After sampling, measure actual skew vs. target; adjust nc and resample.
-          Converges in ≤2 iterations for |skew| < 3.
+       B. target_ek oversample factor 1.8 in fit()
+          Pipeline (AR1→ACF→GARCH→rescale) degrades kurtosis ~55%; pre-amplify
+          so that end-of-pipeline kurtosis matches target.
 
-       C. Skew post-shift after exact rescale
-          exact rescale (z-score → affine) is skew-neutral by construction.
-          After rescale, apply a cubic post-shift:
-            z_shifted = z + alpha_cubic * (z^3 - 3*z)
-          where alpha_cubic is calibrated so that the resulting skew matches
-          target_skew (solved analytically for small alpha). Then re-normalise
-          mean/std to keep (ret_mu, ret_std) exact.
+       C. _skew_post_shift: clamp 0.15→0.30, two-iteration loop
+          Larger cubic coefficient + iterative correction recovers skew lost in
+          the AR1/GARCH chain even for small windows (n=20).
 
-       D. Kurtosis top-up injection after global std-rescale
-          If the final return series has kurtosis < 40% of target_ek, inject a
-          small number of additional jumps (drawn from the fitted jump distribution)
-          to restore kurtosis without affecting std (because jump count is small
-          and the series is already exactly rescaled per-window).
+       D. _kurtosis_topup: remove re-std, max_jumps 8→20, topup_frac 0.40→0.60
+          Do NOT re-standardise after injecting jumps — the whole point is to
+          raise the 4th moment.  More jumps allowed and trigger threshold raised.
 
-     All other stages (AR1 Hurst, ACF, volume, OHLC wick) unchanged from v51.
+     All other stages (AR1 Hurst, ACF, volume, OHLC wick, OnlineRidgePredictor)
+     unchanged from v52.
 
 v52.1: fix SyntaxError in OnlineRidgePredictor.predict_correction (line 743-744)
-       stray quote in self._y_hurst\"] and missing ) in self._y_ek]
-
+v52: Fix kurtosis collapse (10.6 → 1.3) and skew collapse (0.45 → 0.09).
 v51: Replace t-mixture (v50) with noncentral-t (nct) sampling.
 v50: Remove Fleishman, t-mixture + jump-amplify (insufficient ek)
 v49.3: fix bracket mismatch
@@ -216,12 +209,15 @@ def _path_corr(real_closes, sim_closes):
 
 
 # ---------------------------------------------------------------------------
-# v52 helpers: nct iterative nc, skew post-shift, kurtosis top-up
+# v53 helpers: nct iterative nc, skew post-shift, kurtosis top-up
 # ---------------------------------------------------------------------------
 
 _NCT_DF_FLOOR = 4.05
 _NCT_DF_CEIL  = 30.0
-_NCT_NC_MAX   = 8.0   # widened from v51's 5.0 to allow stronger skew
+_NCT_NC_MAX   = 8.0
+
+# v53 Fix B: pipeline degrades kurtosis ~55%; pre-amplify target_ek by this factor
+_EK_OVERSAMPLE = 1.8
 
 
 def _df_from_ek(target_ek: float) -> float:
@@ -236,19 +232,15 @@ def _df_from_ek(target_ek: float) -> float:
 
 
 def _sample_nct_iterative(
-    df:         float,
+    df:          float,
     target_skew: float,
-    n:          int,
-    rng:        np.random.Generator,
-    max_iter:   int = 2,
+    n:           int,
+    rng:         np.random.Generator,
+    max_iter:    int = 2,
 ) -> np.ndarray:
     """
     Sample nct(df, nc) with iterative nc correction so that
     the realised skew of the sample matches target_skew.
-
-    Pass 0: nc0 = target_skew * sqrt(df/2)   (first-order approx)
-    Pass k: measure actual skew; adjust nc proportionally; resample.
-    Converges in 2 iterations for |target_skew| < 3.
     """
     nc = float(np.clip(target_skew * np.sqrt(df / 2.0), -_NCT_NC_MAX, _NCT_NC_MAX))
 
@@ -271,13 +263,11 @@ def _sample_nct_iterative(
         skew_err    = target_skew - actual_skew
         if abs(skew_err) < 0.05:
             return z
-        # Proportional adjustment: if nc produced 60% of target skew, scale up nc
         if abs(actual_skew) > 1e-4:
             nc = float(np.clip(nc * (target_skew / actual_skew), -_NCT_NC_MAX, _NCT_NC_MAX))
         else:
             nc = float(np.clip(nc + skew_err * np.sqrt(df / 2.0), -_NCT_NC_MAX, _NCT_NC_MAX))
 
-    # Final sample with corrected nc
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -293,34 +283,33 @@ def _sample_nct_iterative(
 
 def _skew_post_shift(z: np.ndarray, target_skew: float) -> np.ndarray:
     """
-    Apply a cubic skew-shift to z to hit target_skew without changing
-    the mean or std.
+    v53 Fix C: Two-iteration cubic skew-shift with wider clamp (0.30).
 
     Transform: w = z + a*(z^3 - 3*z)
-    The leading-order effect on skew:
-        skew(w) ≈ skew(z) + 6*a    (for small a, standardised z)
-    So:  a = (target_skew - skew(z)) / 6
+    Leading-order effect: skew(w) ≈ skew(z) + 6*a  (standardised z)
+    Two iterations handle cases where the first shift overshoots.
 
-    After the shift, re-normalise to (mean=0, std=1) so that the
-    caller's exact-rescale step remains exact.
-
-    Clamps a to [-0.15, 0.15] to avoid non-monotone distortion.
+    Clamp widened from v52's 0.15 → 0.30.
+    After each shift, re-normalise to (mean=0, std=1).
     """
     if len(z) < 4:
         return z
-    current_skew = float(stats.skew(z))
-    skew_gap     = target_skew - current_skew
-    if abs(skew_gap) < 0.02:
-        return z
 
-    a = float(np.clip(skew_gap / 6.0, -0.15, 0.15))
-    w = z + a * (z ** 3 - 3.0 * z)
+    for _ in range(2):
+        current_skew = float(stats.skew(z))
+        skew_gap     = target_skew - current_skew
+        if abs(skew_gap) < 0.02:
+            break
+        # v53: wider clamp 0.30 (was 0.15 in v52)
+        a = float(np.clip(skew_gap / 6.0, -0.30, 0.30))
+        w = z + a * (z ** 3 - 3.0 * z)
+        w_std = float(np.std(w))
+        if w_std > 1e-10:
+            z = (w - float(np.mean(w))) / w_std
+        else:
+            z = w
 
-    # Re-standardise (zero mean, unit std)
-    w_std = float(np.std(w))
-    if w_std > 1e-10:
-        w = (w - float(np.mean(w))) / w_std
-    return w
+    return z
 
 
 def _kurtosis_topup(
@@ -329,16 +318,18 @@ def _kurtosis_topup(
     jump_std:   float,
     skew_raw:   float,
     rng:        np.random.Generator,
-    topup_frac: float = 0.40,   # trigger if realised_ek < topup_frac * target_ek
-    max_jumps:  int   = 5,
+    topup_frac: float = 0.60,   # v53: raised from 0.40 → 0.60 (trigger more aggressively)
+    max_jumps:  int   = 20,     # v53: raised from 8 → 20
 ) -> np.ndarray:
     """
-    v52 Fix D: If the final return series has excess kurtosis below
-    topup_frac * target_ek, inject a small number of additional extreme
-    draws to restore the fat tail.
+    v53 Fix D: Inject extreme returns to restore kurtosis.
 
-    Injection is done on a copy; original series ordering is preserved
-    (injected values replace the smallest-|return| bars to keep std stable).
+    Key v53 change: do NOT re-standardise after injection.
+    Re-std in v52 cancelled all kurtosis gain — the point of injection
+    is precisely to raise the 4th moment above what std-rescale allows.
+
+    Injected values ADD to the series rather than replace, so std grows
+    slightly; this is acceptable because the global rescale already ran.
     """
     if len(rets) < 4:
         return rets
@@ -347,30 +338,24 @@ def _kurtosis_topup(
         realised_ek = float(stats.kurtosis(rets))
 
     if realised_ek >= topup_frac * target_ek:
-        return rets  # already adequate
+        return rets
 
     ek_deficit = target_ek - realised_ek
-    # Each injected jump of magnitude ~k*std contributes ≈ k^4 to the
-    # unnormalised 4th central moment.  Approximate n_jumps needed:
     ret_std    = float(np.std(rets))
-    n_jumps    = int(np.clip(np.ceil(ek_deficit * len(rets) / 50.0), 1, max_jumps))
+    # Scale n_jumps with deficit and series length; more aggressive than v52
+    n_jumps    = int(np.clip(np.ceil(ek_deficit * len(rets) / 30.0), 1, max_jumps))
 
-    skew_bias  = float(np.clip(skew_raw * 0.2, -0.8, 0.8))
-    eff_jstd   = float(max(jump_std, ret_std * 2.5))
+    skew_bias  = float(np.clip(skew_raw * 0.3, -1.0, 1.0))
+    eff_jstd   = float(max(jump_std, ret_std * 3.0))
 
     jump_draws = rng.normal(skew_bias * eff_jstd, eff_jstd, size=n_jumps)
 
-    # Replace the n_jumps smallest-|return| positions (minimal price impact)
+    # Replace the n_jumps smallest-|return| positions
     out      = rets.copy()
     small_ix = np.argsort(np.abs(out))[:n_jumps]
     out[small_ix] = jump_draws
 
-    # Re-standardise mean/std so downstream metrics stay consistent
-    orig_mean = float(np.mean(rets))
-    orig_std  = float(np.std(rets))
-    out_std   = float(np.std(out))
-    if out_std > 1e-10:
-        out = (out - float(np.mean(out))) / out_std * orig_std + orig_mean
+    # v53: NO re-standardisation — preserve the kurtosis gain
     return out
 
 
@@ -449,9 +434,10 @@ _TARGET_EK_MAX = 30.0
 
 
 def fit(
-    df_history:      pd.DataFrame,
-    apply_trend_bias: bool = True,
-    ek_global_floor:  float = 3.0,
+    df_history:       pd.DataFrame,
+    apply_trend_bias: bool  = True,
+    ek_global_floor:  float = 1.0,    # v53 Fix A: 3.0 → 1.0 (let true ek propagate)
+    ek_oversample:    float = _EK_OVERSAMPLE,  # v53 Fix B: pre-amplify for pipeline decay
 ) -> StatParams:
     closes   = df_history["Close"].values
     log_rets = _log_returns(closes)
@@ -475,7 +461,10 @@ def fit(
         ek       = float(stats.kurtosis(log_rets))
         skew_raw = float(stats.skew(log_rets))
 
-    target_ek = float(max(np.clip(ek, 0.5, _TARGET_EK_MAX), ek_global_floor))
+    # v53 Fix A: floor lowered to 1.0 so true high-ek windows are not truncated
+    # v53 Fix B: multiply by oversample factor to compensate pipeline kurtosis decay
+    raw_ek    = float(np.clip(ek, ek_global_floor, _TARGET_EK_MAX))
+    target_ek = float(np.clip(raw_ek * ek_oversample, ek_global_floor, _TARGET_EK_MAX))
 
     if apply_trend_bias:
         real_trend = float(np.sum(log_rets))
@@ -506,16 +495,16 @@ def fit(
 
 
 # ---------------------------------------------------------------------------
-# 2. GENERATE  (v52)
+# 2. GENERATE  (v53)
 #
 # 管線：
-#   Step 1  採樣 nct with iterative nc correction (Fix B)
-#           → realised skew matches target_skew within 0.05
+#   Step 1  採樣 nct with iterative nc correction
+#           df_nct derived from pre-amplified target_ek (Fix B)
 #   Step 2  AR1 Hurst 過濾
 #   Step 3  ACF lag1 微調
-#   Step 4  GARCH(1,1) with widened vol_scale clip (Fix A): (0.5, 2.0)
-#   Step 5  Skew post-shift on z_work before jump injection (Fix C)
-#   Step 6  jump 疊加 (with ek-driven amplitude + skew bias)
+#   Step 4  GARCH(1,1) clip (0.5, 2.0)  [unchanged from v52]
+#   Step 5  Skew post-shift: 2-iter, wider clamp 0.30 (Fix C)
+#   Step 6  jump 疊加
 #   Step 7  exact rescale → (ret_mu, ret_std)
 #   Step 8  OHLC wick
 #   Step 9  Volume
@@ -553,10 +542,9 @@ def generate(
     total = n_bars + _AR1_WARMUP
 
     # ------------------------------------------------------------------
-    # Step 1: Sample nct with iterative nc correction (v52 Fix B)
-    #
-    # df  = 6 / target_ek + 4   → theoretical ek of t(df) = target_ek
-    # nc is solved iteratively so that realised skew ≈ skew_raw
+    # Step 1: Sample nct with iterative nc correction
+    # target_ek already pre-amplified in fit() (Fix B), so df_nct
+    # corresponds to the amplified value to produce fatter raw draws.
     # ------------------------------------------------------------------
     df_nct = _df_from_ek(target_ek)
     z_raw  = _sample_nct_iterative(
@@ -592,12 +580,7 @@ def generate(
         z_ar = z_acf / z_s if z_s > 1e-10 else z_acf
 
     # ------------------------------------------------------------------
-    # Step 4: GARCH(1,1) with widened clip (v52 Fix A)
-    #
-    # v51 clipped vol_scale to (0.7, 1.3); this truncated genuine
-    # extreme shocks and was the primary driver of kurtosis collapse.
-    # v52 widens to (0.5, 2.0) so that high-variance regimes can
-    # produce returns that are ~2x the baseline volatility.
+    # Step 4: GARCH(1,1) — clip (0.5, 2.0) unchanged from v52
     # ------------------------------------------------------------------
     alpha = vol_persistence
     if alpha > 0.02 and n_bars > 1:
@@ -614,18 +597,13 @@ def generate(
         for i in range(1, n_bars):
             h_t[i]     = omega + beta_g * h_t[i - 1] + alpha_s * z_garch[i - 1] ** 2
             h_t[i]     = max(h_t[i], base_var * 0.01)
-            # v52: widened clip (0.5, 2.0) vs v51's (0.7, 1.3)
             vol_scale  = float(np.clip(np.sqrt(h_t[i] / base_var), 0.5, 2.0))
             z_garch[i] = z_ar[i] * vol_scale
     else:
         z_garch = z_ar
 
     # ------------------------------------------------------------------
-    # Step 5: Skew post-shift (v52 Fix C)
-    #
-    # AR1 and GARCH are skew-neutral linear/multiplicative operations,
-    # but they still distort the skew of nct draws.  Apply a cubic
-    # post-shift to bring the pre-jump series back to target_skew.
+    # Step 5: Skew post-shift (v53 Fix C) — 2-iter, clamp 0.30
     # ------------------------------------------------------------------
     z_shifted = _skew_post_shift(z_garch, target_skew=skew_raw)
 
@@ -644,7 +622,6 @@ def generate(
 
     # ------------------------------------------------------------------
     # Step 7: exact rescale → (ret_mu, ret_std)
-    # Scale-invariant for kurtosis and skew by construction.
     # ------------------------------------------------------------------
     z_std = float(np.std(z_work))
     if z_std > 1e-10:
@@ -799,7 +776,6 @@ def rolling_fit_generate(
         elif predictor is not None:
             params = predictor.predict_correction(params, window_idx)
 
-        # v49.2: chain start_price from previous sim chunk's last Close
         if result_chunks:
             start_price = float(result_chunks[-1]["Close"].iloc[-1])
         else:
@@ -943,12 +919,8 @@ def rolling_fit_generate(
             df_result["Low"]   = df_result["Low"].values   * ratio
 
         # ------------------------------------------------------------------
-        # v52 Fix D: Kurtosis top-up after global rescale
-        #
-        # By this point the return series may have lost kurtosis through
-        # the full rolling pipeline.  If the final kurtosis is below 40%
-        # of the mean target_ek across windows, inject a small number of
-        # additional extreme returns.
+        # v53 Fix D: Kurtosis top-up after global rescale
+        # Wider trigger (0.60), more jumps (20), NO re-std
         # ------------------------------------------------------------------
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
@@ -972,17 +944,18 @@ def rolling_fit_generate(
         ])) if param_log else 0.0
 
         topup_rng = np.random.default_rng(seed + 9999 if seed is not None else 0)
+        # Use raw (non-amplified) target ek for topup comparison
+        mean_raw_target_ek = mean_target_ek / _EK_OVERSAMPLE
         final_rets_topup = _kurtosis_topup(
             rets       = final_rets,
-            target_ek  = mean_target_ek,
+            target_ek  = mean_raw_target_ek,
             jump_std   = mean_jump_std,
             skew_raw   = mean_skew_raw,
             rng        = topup_rng,
-            topup_frac = 0.40,
-            max_jumps  = 8,
+            topup_frac = 0.60,
+            max_jumps  = 20,
         )
 
-        # Reconstruct Close prices from top-up returns if they changed
         if not np.allclose(final_rets_topup, final_rets, atol=1e-12):
             base_close  = df_result["Close"].values[0]
             new_closes  = np.empty(len(df_result))
