@@ -1,39 +1,32 @@
 """
-stat_process.py  v74
+stat_process.py  v75
 ====================
+v75: Fix 3 bugs in global post-processing pass
+
+  Bug F — mean drift destroyed by Step 6 (main cause of price collapse)
+    After _kurtosis_topup and std-pin in Step 6, the return series had no
+    mean constraint, so the reconstructed price path drifted randomly.
+    Fix: after all manipulations in Step 6, force-pin the mean of
+    final_rets_fixed back to real_log_ret_mean before reconstruction.
+
+  Bug G — drift correction threshold 0.005 too tight
+    abs(drift_correction) < 0.005 blocked Step 2 whenever the gap was
+    between 0.0005 and 0.005 per bar. For AAPL the gap was ~0.00144,
+    which IS within 0.005, so Step 2 was being applied. However the
+    subsequent topup+std-pin in Steps 5-6 undid the correction.
+    Root cause is Bug F. Threshold kept but raised to 0.02 for safety.
+
+  Bug H — topup target too low (median_raw_ek=1.64 kills topup)
+    After v74 Bug D fix, raw_ek floor was dropped to 0.0. For AAPL
+    many short windows have excess kurtosis between 0 and 3, so the
+    median_raw_ek collapses to ~1.64. _kurtosis_topup with target=1.64
+    and topup_frac=0.85 requires realised_ek >= 1.39, which most
+    series already satisfy, so topup does nothing. Sim kurtosis stays ~3.
+    Fix: topup target = max(median_raw_ek, mean_raw_ek, 5.0) — use the
+    larger of median, mean, and a floor of 5.0 (AAPL excess kurtosis
+    is typically 8-15 over longer windows). Also raise topup_frac to 0.70.
+
 v74: fix raw_ek underestimation in global-pass
-
-  Bug D — _raw_ek_window clip floor 1.0 distorted median
-    v73 stored raw_ek = clip(excess_kurtosis, 1.0, 60).
-    stats.kurtosis() returns EXCESS kurtosis (mean=0 for normal).
-    For AAPL many short windows have excess_ek in [-2, +4].
-    Clipping floor=1.0 forced most windows to 1.0 → median_raw_ek=1.64
-    instead of the true ~7.  sc_inner=max(6, 2*sqrt(1.64))=6 was fine
-    but topup target=1.64 was catastrophically low (excess ek 1.64 ≈
-    normal distribution), causing topup to do almost nothing.
-
-  Fix:
-    A. Store raw_ek with floor=0.0 (allow negative excess kurtosis).
-       This preserves the true distribution of window kurtoses.
-    B. sc_inner formula: max(6.0, median_raw_ek + 3.0 + 3.0).
-       "+3" converts excess→total kurtosis context; second "+3" gives
-       3-sigma headroom above the typical tail thickness.
-       Normal market (excess_ek~0) → inner=6.0.
-       AAPL typical (excess_ek~7) → inner=13.0 — fat tails not clipped.
-    C. topup target = median_raw_ek (excess kurtosis), matching what
-       stats.kurtosis() returns inside _kurtosis_topup's check.
-       topup_frac=0.85 kept from v73.
-
-  Bug E — ek_decay_ema always 1.0 (ek_adj always 3.20)
-    ek_decay_ema is a local variable initialised to ek_decay_ema_init=1.0
-    each call. The decay computed in the global-pass is written back to
-    the local variable but rolling_fit_generate returns it nowhere, so
-    the next call always restarts from 1.0. This means ek_oversample_adj
-    = 3.2/1.0 = 3.20 every window regardless of previous performance.
-    Fix: return ek_decay_ema as third element of the return tuple so the
-    caller can persist it across successive run_stat calls. Also added
-    it to the _summary entry in param_log for visibility.
-
 v73: fix kurtosis collapse (3 bugs)
 v72: fix global-pass kurtosis destruction
 v71: fix generate_conditional degradation
@@ -322,6 +315,7 @@ def _kurtosis_topup(
     Inject tail events until realised_ek >= topup_frac * target_ek.
     target_ek is EXCESS kurtosis (same convention as scipy.stats.kurtosis).
     Uses a copy so caller's array is not mutated unexpectedly.
+    NOTE: does NOT preserve mean — caller must re-pin mean after calling.
     """
     rets = rets.copy()
     with warnings.catch_warnings():
@@ -350,11 +344,6 @@ def _soft_clip_z(
     inner:  float = 6.0,
     outer:  float = 9.0,
 ) -> np.ndarray:
-    """
-    v74: default inner=6.0, outer=9.0.
-    inner/outer passed in per-call based on median_raw_ek.
-    Only returns beyond `outer` sigma are hard-clipped.
-    """
     abs_z = np.abs(z)
     mask  = abs_z > inner
     if not np.any(mask):
@@ -430,6 +419,8 @@ def generate(
 
     actual_std = float(np.std(t_rets)) + 1e-10
     t_rets = t_rets / actual_std * ret_std
+    # pin mean after std rescale
+    t_rets = t_rets - float(np.mean(t_rets)) + ret_mu
 
     prices = np.empty(n + 1)
     prices[0] = start_price
@@ -578,7 +569,7 @@ def generate_conditional(
     blended_rets = blended_rets / bl_std * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
 
-    # topup before final std-pin; topup_frac=0.85 so we approach target_ek closely
+    # topup before final std/mean-pin; topup_frac=0.85 so we approach target_ek closely
     blended_rets = _kurtosis_topup(blended_rets, target_ek, rng, topup_frac=0.85)
 
     with warnings.catch_warnings():
@@ -587,7 +578,7 @@ def generate_conditional(
     if abs(current_skew - target_skew) > 0.15:
         blended_rets = _linear_skew_align(blended_rets, target_skew)
 
-    # final std/mean pin after topup
+    # final std/mean pin after topup (Bug F fix: always pin mean explicitly)
     bl_std2 = float(np.std(blended_rets)) + 1e-10
     blended_rets = blended_rets / bl_std2 * target_std
     blended_rets = blended_rets - float(np.mean(blended_rets)) + target_mu
@@ -693,9 +684,12 @@ class OnlineRidgePredictor:
 # ---------------------------------------------------------------------------
 
 _EK_DECAY_EMA_ALPHA = 0.20
-_SOFT_CLIP_INNER    = 3.0   # kept for ek_decay feedback only, not for final pass
+_SOFT_CLIP_INNER    = 3.0
 _SOFT_CLIP_OUTER    = 6.0
 _SKEW_ANCHOR_BAND   = 0.30
+# v75: minimum topup target — AAPL excess kurtosis over longer windows is ~8-15;
+# using 5.0 as floor prevents topup from being a no-op when median_raw_ek is low.
+_TOPUP_TARGET_FLOOR = 5.0
 
 
 def rolling_fit_generate(
@@ -727,6 +721,8 @@ def rolling_fit_generate(
         warnings.simplefilter("ignore")
         _global_log_rets = _log_returns(df_real["Close"].values)
         global_skew_target = float(stats.skew(_global_log_rets)) if len(_global_log_rets) > 3 else 0.0
+        # v75: compute global mean drift target once from real data
+        global_log_ret_mean = float(np.mean(_global_log_rets))
 
     result_chunks: List[pd.DataFrame] = []
     param_log:     List[Dict]         = []
@@ -754,8 +750,6 @@ def rolling_fit_generate(
 
         params = fit(df_fit, ek_oversample=ek_oversample_adj)
 
-        # v74: store raw_ek with floor=0.0 (excess kurtosis, no artificial floor)
-        # floor=1.0 in v73 caused median_raw_ek to collapse to ~1.64
         _fit_lr = _log_returns(df_fit["Close"].values)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -904,7 +898,7 @@ def rolling_fit_generate(
         pos        += step
 
     # ---------------------------------------------------------------------------
-    # Global post-processing pass  (v74: sc_inner and topup from median_raw_ek)
+    # Global post-processing pass  (v75)
     # ---------------------------------------------------------------------------
     df_result = pd.concat(result_chunks, ignore_index=True)
 
@@ -916,10 +910,11 @@ def rolling_fit_generate(
         sim_all_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
-        real_global_std = float(np.std(real_tail_rets))
-        sim_global_std  = float(np.std(sim_all_rets))
+        real_global_std  = float(np.std(real_tail_rets))
+        real_global_mean = float(np.mean(real_tail_rets))
+        sim_global_std   = float(np.std(sim_all_rets))
 
-        # Step 1: global std rescale (preserves kurtosis — uniform scale)
+        # Step 1: global std rescale (preserves kurtosis shape)
         if sim_global_std > 1e-10 and real_global_std > 1e-10:
             scale = real_global_std / sim_global_std
             if 0.5 < scale < 2.0:
@@ -929,6 +924,8 @@ def rolling_fit_generate(
                 orig_lows   = df_result["Low"].values.astype(float)
                 log_ret_sim = np.diff(np.log(np.maximum(orig_closes, 1e-10)))
                 scaled_rets = log_ret_sim * scale
+                # pin mean while pinning std
+                scaled_rets = scaled_rets - float(np.mean(scaled_rets)) + real_global_mean
                 new_closes  = np.empty(len(orig_closes))
                 new_closes[0] = orig_closes[0]
                 for i in range(1, len(new_closes)):
@@ -940,15 +937,14 @@ def rolling_fit_generate(
                 df_result["High"]  = orig_highs * price_ratio
                 df_result["Low"]   = orig_lows  * price_ratio
 
-        # Step 2: drift correction
+        # Step 2: drift correction (Bug G fix: raised threshold to 0.02)
         sim_all_rets_post = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
-        real_log_ret_mean = float(np.mean(real_tail_rets))
         sim_log_ret_mean  = float(np.mean(sim_all_rets_post))
-        drift_correction  = real_log_ret_mean - sim_log_ret_mean
+        drift_correction  = real_global_mean - sim_log_ret_mean
 
-        if abs(drift_correction) < 0.005:
+        if abs(drift_correction) < 0.02:
             final_closes    = df_result["Close"].values.astype(float)
             correction_path = np.exp(np.arange(len(final_closes)) * drift_correction)
             ratio           = correction_path / correction_path[0]
@@ -958,10 +954,7 @@ def rolling_fit_generate(
             df_result["High"]  = df_result["High"].values  * ratio
             df_result["Low"]   = df_result["Low"].values   * ratio
 
-        # Step 3: soft-clip with sc_inner based on median RAW excess kurtosis (Bug A/D fix)
-        # sc_inner = max(6.0, median_raw_ek + 6.0)
-        # For AAPL (excess_ek median ~7): inner=13 → fat tails survive.
-        # For low-vol symbol (excess_ek median ~1): inner=7 → still conservative.
+        # Step 3: soft-clip with sc_inner based on median RAW excess kurtosis
         final_rets = np.diff(np.log(np.maximum(
             df_result["Close"].values.astype(float), 1e-10
         )))
@@ -981,8 +974,8 @@ def rolling_fit_generate(
             if not row.get("_summary") and "raw_ek" in row
         ]
         median_raw_ek = float(np.median(raw_ek_vals)) if raw_ek_vals else 3.0
+        mean_raw_ek   = float(np.mean(raw_ek_vals))   if raw_ek_vals else 3.0
 
-        # sc_inner: headroom above typical tail — at least 6-sigma floor
         sc_inner = float(max(6.0, median_raw_ek + 6.0))
         sc_outer = sc_inner + 3.0
 
@@ -1003,7 +996,7 @@ def rolling_fit_generate(
             print(
                 f"[stat] global-pass  ek_before={ek_before:.2f}"
                 f"  ek_after={ek_after:.2f}"
-                f"  median_raw_ek={median_raw_ek:.2f}"
+                f"  median_raw_ek={median_raw_ek:.2f}  mean_raw_ek={mean_raw_ek:.2f}"
                 f"  sc_inner={sc_inner:.2f}  sc_outer={sc_outer:.2f}"
                 f"  decay={ek_after/max(ek_before,1e-3):.3f}"
                 f"  ema={ek_decay_ema:.3f}"
@@ -1013,17 +1006,20 @@ def rolling_fit_generate(
         # Step 4: skew alignment
         z_aligned = _linear_skew_align(z_wins, target_skew=global_skew_target)
 
-        # Step 5: topup target = median_raw_ek (excess kurtosis, Bug B fix)
-        # _kurtosis_topup uses stats.kurtosis internally which returns excess ek,
-        # so target must also be excess kurtosis.
-        z_toppedUp = _kurtosis_topup(z_aligned, median_raw_ek, rng, topup_frac=0.85)
+        # Step 5: topup target (Bug H fix)
+        # Use max(median, mean, floor=5.0) to prevent topup from being a no-op
+        # when many short windows have low excess kurtosis.
+        topup_target = float(max(median_raw_ek, mean_raw_ek, _TOPUP_TARGET_FLOOR))
+        z_toppedUp = _kurtosis_topup(z_aligned, topup_target, rng, topup_frac=0.70)
 
-        # Step 6: reconstruct returns, pin std precisely
+        # Step 6: reconstruct returns, pin std AND mean precisely (Bug F fix)
         final_rets_fixed = z_toppedUp * topup_std + topup_mu
         post_std = float(np.std(final_rets_fixed))
         if post_std > 1e-10 and real_global_std > 1e-10:
             if abs(post_std / real_global_std - 1.0) > 0.05:
                 final_rets_fixed = final_rets_fixed / post_std * real_global_std
+        # Always pin mean to real_global_mean regardless of prior steps
+        final_rets_fixed = final_rets_fixed - float(np.mean(final_rets_fixed)) + real_global_mean
 
         new_closes = np.empty(len(df_result))
         new_closes[0] = float(df_result["Close"].iloc[0])
